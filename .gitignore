@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editor
+.idea/
+.vscode/
+
+# Local environment
+.env
+.venv/
+
+# DGNav large data and generated artifacts
+/habitat-lab/DGNav/pretrain_src/datasets/
+/habitat-lab/DGNav/precompute_img_features/
+/habitat-lab/DGNav/pretrained/
+/habitat-lab/DGNav/assets/
