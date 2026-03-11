@@ -15,13 +15,26 @@ def extract_instruction_tokens(
     """Extracts instruction tokens from an instruction sensor if the tokens
     exist and are in a dict structure."""
     if instruction_sensor_uuid not in observations[0]:
+        #如果观测中没有指令这个字段，就直接返回，如果有，接下来处理观测指令字段的内容
         return observations
+    
     for i in range(len(observations)):
+        #有多少个环境数量就循环多少次
+
+        '''
+        observations[i]["instruction"] = {
+            "text": "walk past the chair",
+            "tokens": [12, 45, 98, ...]
+}
+        '''
         if (
             isinstance(observations[i][instruction_sensor_uuid], dict)
             and tokens_uuid in observations[i][instruction_sensor_uuid]
         ):
+            #将token做一次截断
             token = observations[i][instruction_sensor_uuid]["tokens"][:max_length]
+
+            #如果长度没有达到最长长度，就补足pad，使长度达到统一
             if len(token) < max_length:
                 token += [pad_id] * (max_length - len(token))
             observations[i][instruction_sensor_uuid] = token

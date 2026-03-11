@@ -55,7 +55,7 @@ from ..utils import (
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=FutureWarning)
-    import tensorflow as tf  # noqa: F401
+    # import tensorflow as tf  # noqa: F401
 
 
 class BaseVLNCETrainer(BaseILTrainer):
@@ -557,14 +557,14 @@ class BaseVLNCETrainer(BaseILTrainer):
                 metric = {}
                 metric['steps_taken'] = info['steps_taken']
                 ep_id = str(envs.current_episodes()[i].episode_id)
-                gt_path = np.array(self.gt_data[ep_id]['locations']).astype(np.float)
+                gt_path = np.array(self.gt_data[ep_id]['locations']).astype(np.float64)
                 if 'current_path' in envs.current_episodes()[i].info.keys():
-                    positions_ = np.array(envs.current_episodes()[i].info['current_path']).astype(np.float)
+                    positions_ = np.array(envs.current_episodes()[i].info['current_path']).astype(np.float64)
                     collisions_ = np.array(envs.current_episodes()[i].info['collisions'])
                     assert collisions_.shape[0] == positions_.shape[0] - 1
                 else:
-                    positions_ = np.array(dis_to_con(np.array(info['position']['position']))).astype(np.float)
-                distance = np.array(info['position']['distance']).astype(np.float)
+                    positions_ = np.array(dis_to_con(np.array(info['position']['position']))).astype(np.float64)
+                distance = np.array(info['position']['distance']).astype(np.float64)
                 metric['distance_to_goal'] = distance[-1]
                 metric['success'] = 1. if distance[-1] <= 3. and env_actions[i]['action']['action'] == 0 else 0.
                 metric['oracle_success'] = 1. if (distance <= 3.).any() else 0.
@@ -579,7 +579,7 @@ class BaseVLNCETrainer(BaseILTrainer):
                 metric['spl'] = metric['success']*gt_length/max(gt_length,metric['path_length'])
 
                 act_con_path = positions_
-                gt_con_path = np.array(dis_to_con(gt_path)).astype(np.float)
+                gt_con_path = np.array(dis_to_con(gt_path)).astype(np.float64)
                 dtw_distance = fastdtw(act_con_path, gt_con_path, dist=NDTW.euclidean_distance)[0]
                 nDTW = np.exp(-dtw_distance / (len(gt_con_path) * config.TASK_CONFIG.TASK.SUCCESS_DISTANCE))
 

@@ -681,13 +681,13 @@ class GraphLXRTXLayer(nn.Module):
             if self.use_dynamic_graph:
                 # Note: always pass original graph_sprels (real distance)
                 # Dropout logic is handled inside compute_dynamic_edges, ensuring MLP can see real distance
+                #这里返回的是动态拓扑边，已经融合了语义信息。
                 graph_sprels = self.compute_dynamic_edges(
                     visn_feats, lang_feats, graph_sprels, lang_attention_mask
                 )
-            visn_attention_mask = visn_attention_mask + graph_sprels
-        visn_att_output = self.visn_self_att(visn_att_output, visn_attention_mask)[0]
-
-        visn_inter_output = self.visn_inter(visn_att_output)
+            visn_attention_mask = visn_attention_mask + graph_sprels    #把动态图边权注入到 self-attention 里。
+        visn_att_output = self.visn_self_att(visn_att_output, visn_attention_mask)[0]   #对图节点特征做 self-attention。输出是带图结构约束的节点上下文化表示
+        visn_inter_output = self.visn_inter(visn_att_output)    #对 attention 之后的特征做非线性变换
         visn_output = self.visn_output(visn_inter_output, visn_att_output)
 
         return visn_output
@@ -985,11 +985,20 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
     def forward_panorama(
         self, rgb_fts, dep_fts, loc_fts, nav_types, view_lens
     ):
+        #rgb_ftsRGB 视觉特征序列
+        #dep_ftsDepth 视觉特征序列。
+        #loc_fts每个视角的位置/方向特征
+        #nav_types每个视角 token 的类型标记
+        #view_lens=12,每个环境这条视角序列的实际长度
+
         device = rgb_fts.device
 
+        #先将RGB 特征维度转换成模型内部统一的 hidden size，再进行LayerNorm
         rgb_embeds = self.img_embeddings.img_layer_norm(
             self.img_embeddings.img_linear(rgb_fts)
         )
+
+        #根据配置文件选择是否添加深度信息，不添加就单纯的rgb特征
         if self.img_embeddings.dep_linear is not None:
             dep_embeds = self.img_embeddings.dep_layer_norm(
                 self.img_embeddings.dep_linear(dep_fts)
@@ -998,19 +1007,26 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         else:
             img_embeds = rgb_embeds
 
+        #全景编码=视觉编码+位置\角度编码+类型编码+标记
         pano_embeds = img_embeds + \
                       self.img_embeddings.loc_layer_norm(self.img_embeddings.loc_linear(loc_fts)) + \
                       self.img_embeddings.nav_type_embedding(nav_types) + \
                       self.embeddings.token_type_embeddings(torch.ones(1, 1).long().to(device))
+        
+        #做一层归一化与dropout操作
         pano_embeds = self.img_embeddings.layer_norm(pano_embeds)
         pano_embeds = self.img_embeddings.dropout(pano_embeds)
 
-        pano_lens = view_lens
+        pano_lens = view_lens   #=12
         pano_masks = gen_seq_masks(pano_lens)
+
+        #添加上mask，再进一步进行pano_encoder，一个 2 层 Transformer panorama encoder
         if self.img_embeddings.pano_encoder is not None:
             pano_embeds = self.img_embeddings.pano_encoder(
                 pano_embeds, src_key_padding_mask=pano_masks.logical_not()
             )
+
+        #最终返回的是经过上下文融合之后的全景编码，包括角度、位置、深度、rgb等信息，形状为[B, L, 768]
         return pano_embeds, pano_masks
 
     def forward_navigation(
@@ -1019,7 +1035,14 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_img_fts, gmap_pos_fts, 
         gmap_masks, gmap_visited_masks, gmap_pair_dists,
     ):
-        # global branch
+        #txt_embeds，指令文本的 token 级 embedding
+        #gmap_vpids 每个环境图里所有点的 id 列表
+        #gmap_step_ids每个图点对应的时间步编号
+        #gmap_img_fts 每个图点的视觉特征
+        #gmap_pos_fts每个图点相对当前 agent 的位置特征
+        #gmap_masks图节点序列的有效 mask
+        #gmap_visited_masks标记哪些图点已经访问过
+        #gmap_pair_dists图中任意两点之间的 pairwise 距离矩阵
         gmap_embeds = gmap_img_fts + \
                       self.global_encoder.gmap_step_embeddings(gmap_step_ids) + \
                       self.global_encoder.gmap_pos_embeddings(gmap_pos_fts)
@@ -1029,7 +1052,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 gmap_pair_dists.unsqueeze(3)).squeeze(3).unsqueeze(1)
         else:
             graph_sprels = None
-
+        #通过图编码器进行编码
         gmap_embeds = self.global_encoder.encoder(
             txt_embeds, txt_masks, gmap_embeds, gmap_masks,
             graph_sprels=graph_sprels
@@ -1039,8 +1062,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
 
         outs = {
-            'gmap_embeds': gmap_embeds,
-            'global_logits': global_logits,
+            'gmap_embeds': gmap_embeds, #经过全局图导航编码器更新后的图节点表示[B, L, H]
+            'global_logits': global_logits, # 对图中每个可选节点的打分[B, L]
         }
         return outs
 

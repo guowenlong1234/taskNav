@@ -183,9 +183,18 @@ class GraphMap(object):
     def identify_node(self, cur_pos, cur_ori, cand_ang, cand_dis):
         # assume no repeated node
         # since action is restricted to ghosts
+        #“当前节点”和“当前时刻预测出的候选节点”生成图里的临时 ID，并把候选点从相对极坐标转换成估计的三维位置。
+        #给当前真实所在位置生成一个新的 node id
         cur_vp = str(len(self.node_pos))
+        #给当前节点发散出来的每个候选 waypoint 生成一个候选 id。
         cand_vp = [f'{cur_vp}_{str(i)}' for i in range(len(cand_ang))]
+        #把候选 waypoint 的相对几何信息变成估计的绝对位置
         cand_pos = [p for p in estimate_cand_pos(cur_pos, cur_ori, cand_ang, cand_dis)]
+
+        #cur_vp当前节点的 id
+        # cand_vp当前时刻所有候选点的 id 列表
+        # cand_pos当前时刻所有候选点的估计位置列表
+
         return cur_vp, cand_vp, cand_pos
 
     def delete_ghost(self, vp):
@@ -204,42 +213,61 @@ class GraphMap(object):
         Args:
             loc_noise: Dynamic loc_noise value, if provided use this value; otherwise use self.loc_noise
         """
+        # prev_vp[i]上一个真实节点 id
+        # stepk + 1当前是第几步
+        # cur_vp[i]当前真实节点 id
+        # cur_pos[i]当前真实位置
+        # cur_embeds当前节点 embedding
+        # cand_vp[i]当前所有候选点 id
+        # cand_pos[i]当前所有候选点估计位置
+        # cand_embeds当前所有候选点对应的视觉特征
+        # cand_real_pos[i]候选点真实位置，训练/可视化时可能用来监督
+        # loc_noise=loc_noise_to_use当前步用于节点/ghost 合并判断的容差阈值
+        
         # 1. connect prev_vp
         self.graph_nx.add_node(cur_vp)
+
+        #如果上一步有节点
         if prev_vp is not None:
-            prev_pos = self.node_pos[prev_vp]
-            dis = calc_position_distance(prev_pos, cur_pos)
-            self.graph_nx.add_edge(prev_vp, cur_vp, weight=dis)
+            prev_pos = self.node_pos[prev_vp]   #找到上一步的真实位置
+            dis = calc_position_distance(prev_pos, cur_pos) #计算到上一步的真实距离
+            self.graph_nx.add_edge(prev_vp, cur_vp, weight=dis) #添加一条边，从上一个节点到下一个节点，边的值是距离
 
         # 2. update node & ghost info
-        self.node_pos[cur_vp] = cur_pos
-        self.node_embeds[cur_vp] = cur_embeds
-        self.node_stepId[cur_vp] = step_id
+        self.node_pos[cur_vp] = cur_pos #记录节点的空间位置
+        self.node_embeds[cur_vp] = cur_embeds# 记录节点的视觉全景特征表示
+        self.node_stepId[cur_vp] = step_id  #记录节点的步数
+
         # If dynamic loc_noise is provided, update self.loc_noise (for subsequent _localize calls)
         if loc_noise is not None:
             self.loc_noise = loc_noise
+
         for i, (cvp, cpos, cembeds) in enumerate(zip(cand_vp, cand_pos, cand_embeds)):
-            localized_nvp = self._localize(cpos, self.node_pos, loc_noise=loc_noise)
+            #这里是在遍历当前步所有候选点，并把三类信息同步取出来，当前候选点的候选 id，当前候选点估计出来的空间位置，当前候选点对应的视觉特征
+
+            #判断是不是一个新节点，标准与阈值就是loc_noise
+            localized_nvp = self._localize(cpos, self.node_pos, loc_noise=loc_noise)    #候选点 cpos 在当前图里最近且足够近的那个 node 的 id，如果没有任何已有 node 足够近，返回：None
+
             # cand overlap with node, connect cur_vp with localized_nvp
             if localized_nvp is not None :
                 dis = calc_position_distance(cur_pos, self.node_pos[localized_nvp])
                 self.graph_nx.add_edge(cur_vp, localized_nvp, weight=dis)
             # cand not overlap with node, create/update ghost
             else:
-                if self.merge_ghost:
-                    localized_gvp = self._localize(cpos, self.ghost_mean_pos, loc_noise=loc_noise)
+                if self.merge_ghost:    #允许把相近的 ghost 合并
+                    localized_gvp = self._localize(cpos, self.ghost_mean_pos, loc_noise=loc_noise)  #cpos 去和已有所有 ghost 的平均位置 self.ghost_mean_pos 比较。
                     # create ghost
-                    if localized_gvp is None:
-                        gvp = f'g{str(self.ghost_cnt)}'
-                        self.ghost_cnt += 1
-                        self.ghost_pos[gvp] = [cpos]
-                        self.ghost_mean_pos[gvp] = cpos
-                        self.ghost_embeds[gvp] = [cembeds, 1]
-                        self.ghost_fronts[gvp] = [cur_vp]
-                        if self.has_real_pos:
+                    if localized_gvp is None:   #如果没有匹配到已有 ghost，就新建 ghost
+                        gvp = f'g{str(self.ghost_cnt)}' #生成一个新的 ghost id，比如 g0, g1, g2
+                        self.ghost_cnt += 1     #
+                        self.ghost_pos[gvp] = [cpos]    #记录它的观测位置列表
+                        self.ghost_mean_pos[gvp] = cpos #初始化它的平均位置 ghost_mean_pos
+                        self.ghost_embeds[gvp] = [cembeds, 1]   #记录它的 embedding 和计数 ghost_embeds = [特征和, 数量]，当前候选方向对应的上下文化 panorama token 特征
+                        self.ghost_fronts[gvp] = [cur_vp]       #记录这个 ghost 是从哪个当前节点 cur_vp 看到的 ghost_fronts
+                        if self.has_real_pos:   #如果保存真实位置，还把真实位置记下来
                             self.ghost_real_pos[gvp] = [cand_real_pos[i]]
                     # update ghost
-                    else:
+                    else:   #如果不是一个新的ghost，就合并进去，并且更新合并之后的各种信息
                         gvp = localized_gvp
                         self.ghost_pos[gvp].append(cpos)
                         self.ghost_mean_pos[gvp] = np.mean(self.ghost_pos[gvp], axis=0)
@@ -258,16 +286,16 @@ class GraphMap(object):
                     if self.has_real_pos:
                         self.ghost_real_pos[gvp] = [cand_real_pos[i]]
         
-        self.ghost_aug_pos = deepcopy(self.ghost_mean_pos)
-        if self.ghost_aug != 0:
+        self.ghost_aug_pos = deepcopy(self.ghost_mean_pos)  #ghost_mean_pos存的是每个 ghost 的“平均位置”#self.ghost_aug_pos前实际拿来参与后续图计算的 ghost 位置
+        if self.ghost_aug != 0: #如过有扰动，就在平均位置上加上一些扰动，如果没有扰动，就直接使用当前的平均位置    
             for gvp, gpos in self.ghost_aug_pos.items():
                 gpos_noise = np.random.normal(loc=(0,0,0), scale=(self.ghost_aug,0,self.ghost_aug), size=(3,))
                 gpos_noise[gpos_noise < -self.ghost_aug] = -self.ghost_aug
                 gpos_noise[gpos_noise >  self.ghost_aug] =  self.ghost_aug
                 self.ghost_aug_pos[gvp] = gpos + gpos_noise
 
-        self.shortest_path = dict(nx.all_pairs_dijkstra_path(self.graph_nx))
-        self.shortest_dist = dict(nx.all_pairs_dijkstra_path_length(self.graph_nx))
+        self.shortest_path = dict(nx.all_pairs_dijkstra_path(self.graph_nx))    #任意两个节点之间“最短路径经过哪些节点”
+        self.shortest_dist = dict(nx.all_pairs_dijkstra_path_length(self.graph_nx)) #任意两个节点之间“最短路径总长度”
 
     def front_to_ghost_dist(self, ghost_vp):
         # assume the nearest front

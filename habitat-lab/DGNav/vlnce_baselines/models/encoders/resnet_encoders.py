@@ -255,15 +255,17 @@ class CLIPEncoder(nn.Module):
         self, device,
     ):
         super().__init__()
+        #加载模型，设置推理模式
         self.model, _ = clip.load("ViT-B/32", device=device)
         for param in self.model.parameters():
             param.requires_grad_(False)
         self.model.eval()
 
         from torchvision import transforms
+        #定义进入网络之前的预处理
         self.rgb_transform = torch.nn.Sequential(
-            transforms.ConvertImageDtype(torch.float),
-            transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+            transforms.ConvertImageDtype(torch.float),#把输入图像转成浮点型张量，一般是从 uint8 变成 float32
+            transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),#按通道做标准化，也就是对 RGB 三个通道分别做
             )
 
     def forward(self, observations):
@@ -271,8 +273,9 @@ class CLIPEncoder(nn.Module):
         on ImageNet. Sends through fully connected layer, activates, and
         returns final embedding.
         """
-        rgb_observations = observations["rgb"].permute(0, 3, 1, 2)
+        rgb_observations = observations["rgb"].permute(0, 3, 1, 2)  #[B, H, W, C]->[B, C, H, W]
         rgb_observations = self.rgb_transform(rgb_observations)
+        
         output = self.model.encode_image(rgb_observations.contiguous())
 
         return output.float() # to fp32

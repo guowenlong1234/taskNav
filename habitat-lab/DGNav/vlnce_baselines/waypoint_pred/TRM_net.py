@@ -7,6 +7,9 @@ from .transformer.waypoint_bert import WaypointBert
 from pytorch_transformers import BertConfig
 
 class BinaryDistPredictor_TRM(nn.Module):
+    '''
+    当前代码的路点预测核心类
+    '''
     def __init__(self, hidden_dim=768, n_classes=12, device=None):
         super(BinaryDistPredictor_TRM, self).__init__()
 
@@ -15,9 +18,9 @@ class BinaryDistPredictor_TRM(nn.Module):
         self.num_angles = 120
         self.num_imgs = 12
         self.n_classes = 12  # num of distances
-        self.TRM_LAYER = 2
-        self.TRM_NEIGHBOR = 1
-        self.HEATMAP_OFFSET = 5
+        self.TRM_LAYER = 2  #表示 waypoint predictor 里 Transformer 的层数。
+        self.TRM_NEIGHBOR = 1   #表示 attention mask 里每个视角能关注的邻居范围
+        self.HEATMAP_OFFSET = 5 #表示 heatmap 的角度索引偏移量
 
         # self.visual_fc_rgb = nn.Sequential(
         #     nn.Flatten(),
@@ -43,7 +46,8 @@ class BinaryDistPredictor_TRM(nn.Module):
         config.num_hidden_layers = self.TRM_LAYER
         self.waypoint_TRM = WaypointBert(config=config)
 
-        layer_norm_eps = config.layer_norm_eps
+        layer_norm_eps = config.layer_norm_eps  #数值稳定控制常数，防止除0导致的数值爆炸
+
         self.mergefeats_LayerNorm = BertLayerNorm(
             hidden_dim,
             eps=layer_norm_eps
@@ -60,7 +64,9 @@ class BinaryDistPredictor_TRM(nn.Module):
         )
 
     def forward(self, rgb_feats, depth_feats):
+
         bsi = rgb_feats.size(0) // self.num_imgs
+        #获取真实的batch长度
 
         # rgb_x = self.visual_fc_rgb(rgb_feats).reshape(
         #     bsi, self.num_imgs, -1)
@@ -72,15 +78,20 @@ class BinaryDistPredictor_TRM(nn.Module):
         vis_x = depth_x
 
         attention_mask = self.mask.repeat(bsi,1,1,1)
+
+        #把 vis_x 送进一个专门做 waypoint 关系建模的 Transformer 里，得到“带上下文关系的视角特征”。[B, 12, 768]
         vis_rel_x = self.waypoint_TRM(
             vis_x, attention_mask=attention_mask
         )
 
         vis_logits = self.vis_classifier(vis_rel_x)
+
+        #三个线性输出层分类头进行分类
         vis_logits = vis_logits.reshape(
             bsi, self.num_angles, self.n_classes)
 
         # heatmap offset (each image is pointing at the middle)
+        #这段代码是在把 heatmap 沿角度维循环平移 5 个 bin，用来修正相机视角中心和角度 bin 编号之间的偏移。
         vis_logits = torch.cat(
             (vis_logits[:,self.HEATMAP_OFFSET:,:], vis_logits[:,:self.HEATMAP_OFFSET,:]),
             dim=1)

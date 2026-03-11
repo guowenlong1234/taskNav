@@ -47,7 +47,7 @@ from fastdtw import fastdtw
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=FutureWarning)
-    import tensorflow as tf  # noqa: F401
+    # import tensorflow as tf  # noqa: F401
 
 import torch.distributed as distr
 import gzip
@@ -487,14 +487,31 @@ class RLTrainer(BaseVLNCETrainer):
                     raise NotImplementedError
        
         return torch.tensor(teacher_actions).cuda()
+    
+
 
     def _vp_feature_variable(self, obs):
+            # obs = {
+            #     'cand_rgb': cand_rgb,               # [K x 2048]，对应路点的视觉特征向量
+            #     'cand_depth': cand_depth,           # [K x 128]，对应路点的深度特征向量
+            #     'cand_angle_fts': cand_angle_fts,   # [K x 4]，对应路点的角度特征向量
+            #     'cand_img_idxes': cand_img_idxes,   # [K]，对应路点的视觉图片索引
+            #     'cand_angles': cand_angles,         # [K]，对应路点的逆时针角度（弧度值）
+            #     'cand_distances': cand_distances,   # [K]，对应路点的真实距离（m）
+
+            #     'pano_rgb': pano_rgb,               # B x 12 x 512，全景照片的特征向量
+            #     'pano_depth': pano_depth,           # B x 12 x 128，全景照片的维度向量
+            #     'pano_angle_fts': pano_angle_fts,   # 12 x 4，全景照片每个角度特征
+            #     'pano_img_idxes': pano_img_idxes,   # 12 ，0-11的标号，照片索引数组。
+            # }
+            # 输出一组相对位置，极坐标表示形式
+
         batch_rgb_fts, batch_dep_fts, batch_loc_fts = [], [], []
         batch_nav_types, batch_view_lens = [], []
 
-        for i in range(self.envs.num_envs):
+        for i in range(self.envs.num_envs): #对于每个环境循环
             rgb_fts, dep_fts, loc_fts , nav_types = [], [], [], []
-            cand_idxes = np.zeros(12, dtype=np.bool)
+            cand_idxes = np.zeros(12, dtype=bool)
             cand_idxes[obs['cand_img_idxes'][i]] = True
             # cand
             rgb_fts.append(obs['cand_rgb'][i])
@@ -502,17 +519,22 @@ class RLTrainer(BaseVLNCETrainer):
             loc_fts.append(obs['cand_angle_fts'][i])
             nav_types += [1] * len(obs['cand_angles'][i])
             # non-cand
-            rgb_fts.append(obs['pano_rgb'][i][~cand_idxes])
+            rgb_fts.append(obs['pano_rgb'][i][~cand_idxes]) #对布尔数组取反
             dep_fts.append(obs['pano_depth'][i][~cand_idxes])
             loc_fts.append(obs['pano_angle_fts'][~cand_idxes])
+
+            #nav_types 1 表示 candidate view，0 表示 non-candidate view
             nav_types += [0] * (12-np.sum(cand_idxes))
             
+            #合成一个完整的视角张量，前K个是有候选路点的方向，后面的是非候选的
             batch_rgb_fts.append(torch.cat(rgb_fts, dim=0))
             batch_dep_fts.append(torch.cat(dep_fts, dim=0))
             batch_loc_fts.append(torch.cat(loc_fts, dim=0))
-            batch_nav_types.append(torch.LongTensor(nav_types))
-            batch_view_lens.append(len(nav_types))
+
+            batch_nav_types.append(torch.LongTensor(nav_types))     #把当前环境的 nav_types 从 Python list 变成 LongTensor
+            batch_view_lens.append(len(nav_types))                  #记录当前的视角数量
         # collate
+        #把一个由不同长度 tensor 组成的 list，padding 到同样长度，再 stack 成一个 batch tensor
         batch_rgb_fts = pad_tensors_wgrad(batch_rgb_fts)
         batch_dep_fts = pad_tensors_wgrad(batch_dep_fts)
         batch_loc_fts = pad_tensors_wgrad(batch_loc_fts).cuda()
@@ -525,6 +547,7 @@ class RLTrainer(BaseVLNCETrainer):
         }
         
     def _nav_gmap_variable(self, cur_vp, cur_pos, cur_ori):
+        #cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
         batch_gmap_vp_ids, batch_gmap_step_ids, batch_gmap_lens = [], [], []
         batch_gmap_img_fts, batch_gmap_pos_fts = [], []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
@@ -593,10 +616,14 @@ class RLTrainer(BaseVLNCETrainer):
         gmap_pair_dists = gmap_pair_dists.cuda()
 
         return {
-            'gmap_vp_ids': batch_gmap_vp_ids, 'gmap_step_ids': batch_gmap_step_ids,
-            'gmap_img_fts': batch_gmap_img_fts, 'gmap_pos_fts': batch_gmap_pos_fts, 
-            'gmap_masks': batch_gmap_masks, 'gmap_visited_masks': batch_gmap_visited_masks, 'gmap_pair_dists': gmap_pair_dists,
-            'no_vp_left': batch_no_vp_left,
+            'gmap_vp_ids': batch_gmap_vp_ids, #图里有哪些点
+            'gmap_step_ids': batch_gmap_step_ids,   #这些点什么时候来的
+            'gmap_img_fts': batch_gmap_img_fts,     #这些点长什么样
+            'gmap_pos_fts': batch_gmap_pos_fts,     #这些点相对我在哪
+            'gmap_masks': batch_gmap_masks,         #哪些点有效
+            'gmap_visited_masks': batch_gmap_visited_masks,     #哪些点已访问
+            'gmap_pair_dists': gmap_pair_dists,     #点和点之间有多远
+            'no_vp_left': batch_no_vp_left,         #还有没有可探索 ghost
         }
 
     def _history_variable(self, obs):
@@ -668,25 +695,38 @@ class RLTrainer(BaseVLNCETrainer):
                     self.save_dynamic_graph_weights(cur_iter)
         
     def _train_interval(self, interval, ml_weight, sample_ratio):
+        #切换到训练模式
         self.policy.train()
+
+        #如果是多线程的，有包装
         if self.world_size > 1:
             self.policy.net.module.rgb_encoder.eval()
             self.policy.net.module.depth_encoder.eval()
         else:
+        #单线程的，没有包装，将深度编码器和rgb编码器冻结，切换为验证模式
             self.policy.net.rgb_encoder.eval()
             self.policy.net.depth_encoder.eval()
+
+        #路点模块切换为验证模式
         self.waypoint_predictor.eval()
 
+        #主进程显示进度条
         if self.local_rank < 1:
             pbar = tqdm.trange(interval, leave=False, dynamic_ncols=True)
         else:
             pbar = range(interval)
+
+        #前这段训练区间里的标量日志收集器
         self.logs = defaultdict(list)
 
+        #对于每一个循环
         for idx in pbar:
+
+            #清空损失和梯度累积
             self.optimizer.zero_grad()
             self.loss = 0.
 
+            #自动混合精度反向传播
             with autocast():
                 self.rollout('train', ml_weight, sample_ratio)
             self.scaler.scale(self.loss).backward() # self.loss.backward()
@@ -698,6 +738,7 @@ class RLTrainer(BaseVLNCETrainer):
                 self._record_dynamic_graph_weights()
 
             if self.local_rank < 1:
+                #主进程显示训练进度
                 pbar.set_postfix({'iter': f'{idx+1}/{interval}'})
             
         return deepcopy(self.logs)
@@ -973,12 +1014,15 @@ class RLTrainer(BaseVLNCETrainer):
         # If needed, can be saved separately, but according to user requirements, mainly focus on eval mode stats_ep file
 
     def get_pos_ori(self):
+        #这个函数是在从所有并行环境里取出当前 agent 的位置和朝向
         pos_ori = self.envs.call(['get_pos_ori']*self.envs.num_envs)
         pos = [x[0] for x in pos_ori]
         ori = [x[1] for x in pos_ori]
         return pos, ori
 
     def rollout(self, mode, ml_weight=None, sample_ratio=None):
+        #真正的训练循环与环境交互
+
         if mode == 'train':
             feedback = 'sample'
         elif mode == 'eval' or mode == 'infer':
@@ -986,15 +1030,25 @@ class RLTrainer(BaseVLNCETrainer):
         else:
             raise NotImplementedError
 
+        #重新设置所有环境
         self.envs.resume_all()
         observations = self.envs.reset()
+
+        #设置最长步长
         instr_max_len = self.config.IL.max_text_len # r2r 80, rxr 200
+
+        #设置不同的pad_id
         instr_pad_id = 1 if self.config.MODEL.task_type == 'rxr' else 0
+
+        #把观测中的指令字段进行处理，过长的截断，不足的补足pad，是指令长度与维度统一。
         observations = extract_instruction_tokens(observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
                                                   max_length=instr_max_len, pad_id=instr_pad_id)
+        
+        #abitat Baselines 提供的通用数据处理工具，将原始数据转化成batchtensor，放在指定的GPU上
         batch = batch_obs(observations, self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
         
+        #验证模式和推理模式使用
         if mode == 'eval':
             curr_eps = self.envs.current_episodes()
             # Record start time of new episode
@@ -1019,7 +1073,7 @@ class RLTrainer(BaseVLNCETrainer):
                     k = curr_eps[i].instruction.instruction_id
                     self.inst_ids[ep_id] = int(k)
 
-        # encode instructions
+        # encode instructions编码指令
         all_txt_ids = batch['instruction']
         all_txt_masks = (all_txt_ids != instr_pad_id)
         all_txt_embeds = self.policy.net(
@@ -1030,42 +1084,81 @@ class RLTrainer(BaseVLNCETrainer):
 
         loss = 0.
         total_actions = 0.
+
+        #生成一个环境序列，记录哪些环境还没有停止
         not_done_index = list(range(self.envs.num_envs))
 
+        #如果开启了视频或者是训练模式，就获取真实位置信息
         have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION)
         ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
-        self.gmaps = [GraphMap(have_real_pos, 
-                               self.config.IL.loc_noise, 
-                               self.config.MODEL.merge_ghost,
-                               ghost_aug) for _ in range(self.envs.num_envs)]
+
+        #为每一个环境创建一个拓扑图对象
+        self.gmaps = [GraphMap(have_real_pos,   #是否有真实位置
+                               self.config.IL.loc_noise,    #位置匹配时候的容忍半径
+                               self.config.MODEL.merge_ghost,   #是否把接近的合并
+                               ghost_aug) for _ in range(self.envs.num_envs)]   #ghost 位置扰动强度
+        
+        #初始化每个环境上一时刻所在 viewpoint
         prev_vp = [None] * self.envs.num_envs
 
+        #对于每一个时间步K
         for stepk in range(self.max_len):
             total_actions += self.envs.num_envs
+
+            #只取出还没有停止的环境的对应指令和编码
             txt_masks = all_txt_masks[not_done_index]
             txt_embeds = all_txt_embeds[not_done_index]
             
             # cand waypoint prediction
+            '''
+            outputs = {
+                'cand_rgb': cand_rgb,               # [K x 2048]，对应路点的视觉特征向量
+                'cand_depth': cand_depth,           # [K x 128]，对应路点的深度特征向量
+                'cand_angle_fts': cand_angle_fts,   # [K x 4]，对应路点的角度特征向量
+                'cand_img_idxes': cand_img_idxes,   # [K]，对应路点的视觉图片索引
+                'cand_angles': cand_angles,         # [K]，对应路点的逆时针角度（弧度值）
+                'cand_distances': cand_distances,   # [K]，对应路点的真实距离（m）
+
+                'pano_rgb': pano_rgb,               # B x 12 x 512，全景照片的特征向量
+                'pano_depth': pano_depth,           # B x 12 x 128，全景照片的维度向量
+                'pano_angle_fts': pano_angle_fts,   # 12 x 4，全景照片每个角度特征
+                'pano_img_idxes': pano_img_idxes,   # 12 ，0-11的标号，照片索引数组。
+            }
+            输出一组相对位置，极坐标表示形式
+            '''
             wp_outputs = self.policy.net(
                 mode = "waypoint",
                 waypoint_predictor = self.waypoint_predictor,
                 observations = batch,
+                #config.IL.waypoint_aug是否进行采样增强，训练的时候按照概率再nms周围选出一定的点
                 in_train = (mode == 'train' and self.config.IL.waypoint_aug),
             )
 
             # pano encoder
             vp_inputs = self._vp_feature_variable(wp_outputs)
+            #将这里面的都pad到相同长度，组织成batch，转换成tensor
+            #             return {
+            #     'rgb_fts': batch_rgb_fts, 'dep_fts': batch_dep_fts, 'loc_fts': batch_loc_fts,
+            #     'nav_types': batch_nav_types, 'view_lens': batch_view_lens,
+            # }
+            #向字典里新增或者覆盖一个键值对
             vp_inputs.update({
                 'mode': 'panorama',
             })
+            #进入forward()执行，
+            #最终返回的是经过上下文融合之后的全景编码，包括角度、位置、深度、rgb等信息，形状为[B, L, 768]。还有一个mask
             pano_embeds, pano_masks = self.policy.net(**vp_inputs)
+
+            #这一步是在把一整圈全景视角 token，压缩成“当前节点的单个全景摘要表示”。[B, L, H] -> [B, H],将12个视角特征进行融合
             avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
                               torch.sum(pano_masks, 1, keepdim=True)
 
             # get vp_id, vp_pos of cur_node and cand_ndoe
-            cur_pos, cur_ori = self.get_pos_ori()
+            cur_pos, cur_ori = self.get_pos_ori()   #批量读取当前 agent 的位置和朝向，并分别整理成两个列表返回
             cur_vp, cand_vp, cand_pos = [], [], []
+
             for i in range(self.envs.num_envs):
+                # cur_vp，当前节点的 id；cand_vp当前时刻所有候选点的 id 列表，cand_pos当前时刻所有候选点的估计位置列表
                 cur_vp_i, cand_vp_i, cand_pos_i = self.gmaps[i].identify_node(
                     cur_pos[i], cur_ori[i], wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i]
                 )
@@ -1074,6 +1167,7 @@ class RLTrainer(BaseVLNCETrainer):
                 cand_pos.append(cand_pos_i)
             
             if mode == 'train' or self.config.VIDEO_OPTION:
+                #获取真实的位置和朝向
                 cand_real_pos = []
                 for i in range(self.envs.num_envs):
                     cand_real_pos_i = [
@@ -1085,8 +1179,8 @@ class RLTrainer(BaseVLNCETrainer):
                 cand_real_pos = [None] * self.envs.num_envs
 
             # Calculate loc_noise (priority: dynamic > random > fixed)
-            use_dynamic_loc_noise = getattr(self.config.IL, 'use_dynamic_loc_noise', False)
-            use_random_loc_noise = getattr(self.config.IL, 'use_random_loc_noise', False)
+            use_dynamic_loc_noise = getattr(self.config.IL, 'use_dynamic_loc_noise', False) #是否启用“动态 loc_noise”
+            use_random_loc_noise = getattr(self.config.IL, 'use_random_loc_noise', False)   #是否启用“随机 loc_noise”
             loc_noise_values = [None] * self.envs.num_envs
             
             if use_dynamic_loc_noise:
@@ -1095,6 +1189,11 @@ class RLTrainer(BaseVLNCETrainer):
                 loc_noise_max = getattr(self.config.IL, 'dynamic_loc_noise_max', 0.60)
                 loc_noise_base = getattr(self.config.IL, 'loc_noise', 0.5)  # Base value, used when insufficient candidate points
                 # Read formula coefficients from config
+                #alpha：基准值
+                # beta：调节强度
+                # mapping_type：选哪种映射曲线
+                # sigmoid_k：sigmoid 曲线陡峭度
+                # exponential_k：指数曲线曲率
                 alpha = getattr(self.config.IL, 'dynamic_loc_noise_alpha', 0.65)
                 beta = getattr(self.config.IL, 'dynamic_loc_noise_beta', 0.25)
                 mapping_type = getattr(self.config.IL, 'dynamic_loc_noise_mapping', 'linear')
@@ -1103,6 +1202,8 @@ class RLTrainer(BaseVLNCETrainer):
                 
                 def compute_loc_noise_from_std(std_val, mapping='linear'):
                     """
+                    “根据当前候选 waypoint 角度分布的离散程度 std_val，动态计算这一步图构建要使用的 loc_noise。”
+                    动态阈值建图的核心实现
                     Calculate loc_noise from std value, supports three mapping methods:
                     - linear: loc_noise = alpha - beta * std
                     - sigmoid: use sigmoid function mapping, refer to linear_compare.py
@@ -1174,12 +1275,15 @@ class RLTrainer(BaseVLNCETrainer):
                     cand_angles_i = wp_outputs['cand_angles'][i]
                     if len(cand_angles_i) > 1:
                         # Calculate angle standard deviation (in radians)
+                        #计算标准差
                         std = float(np.std(cand_angles_i))
                         # Calculate loc_noise based on mapping type
+                        #计算loc_noise
                         dynamic_loc_noise = compute_loc_noise_from_std(std, mapping=mapping_type)
                         loc_noise_values[i] = float(dynamic_loc_noise)
                     else:
                         # If only one or no candidate points, use base value
+                        #只有1个或者0个，没有办法计算标准差，就使用基础的
                         loc_noise_values[i] = loc_noise_base
                 
                 # Record std and loc_noise in eval/infer mode
@@ -1197,6 +1301,7 @@ class RLTrainer(BaseVLNCETrainer):
                             'mapping': mapping_type
                         })
             elif use_random_loc_noise:
+                #使用随机loc_noise
                 # Random loc_noise: random sampling within specified range
                 random_loc_noise_min = getattr(self.config.IL, 'random_loc_noise_min', 0.40)
                 random_loc_noise_max = getattr(self.config.IL, 'random_loc_noise_max', 0.60)
@@ -1217,6 +1322,7 @@ class RLTrainer(BaseVLNCETrainer):
                             'type': 'random'
                         })
             else:
+                #使用固定loc_noise
                 # If both are disabled, use fixed loc_noise value, also need to record
                 fixed_loc_noise = getattr(self.config.IL, 'loc_noise', 0.5)
                 if mode in ['eval', 'infer']:
@@ -1231,26 +1337,54 @@ class RLTrainer(BaseVLNCETrainer):
             # If both are disabled, loc_noise_values remains None, will use fixed loc_noise value in GraphMap
 
             for i in range(self.envs.num_envs):
+                #遍历每一个并行环境，更新各自的图
                 cur_embeds = avg_pano_embeds[i]
+
+                #cand_embeds 是候选路点方向对应的局部特征
                 cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i]==1]
+
                 # If dynamic or random loc_noise is enabled, pass calculated value; otherwise pass None to use default value
                 loc_noise_to_use = loc_noise_values[i] if (use_dynamic_loc_noise or use_random_loc_noise) else None
+
+                #更新了一下拓扑图结构，该合并的合并，该新建的新建。将当前的观测添加到全局的拓扑图中，但是当前的拓扑图中只有几何信息，只有节点之间的距离信息。
                 self.gmaps[i].update_graph(prev_vp[i], stepk+1,
                                            cur_vp[i], cur_pos[i], cur_embeds,
                                            cand_vp[i], cand_pos[i], cand_embeds,
                                            cand_real_pos[i], loc_noise=loc_noise_to_use)
 
-            nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)
+            ##cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
+            #把已经更新好的图，打包成下一步全局导航决策所需的输入表示。
+
+            nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)  
+        #             return {
+        #     'gmap_vp_ids': batch_gmap_vp_ids, #图里有哪些点
+        #     'gmap_step_ids': batch_gmap_step_ids,   #这些点什么时候来的
+        #     'gmap_img_fts': batch_gmap_img_fts,     #这些点长什么样
+        #     'gmap_pos_fts': batch_gmap_pos_fts,     #这些点相对我在哪
+        #     'gmap_masks': batch_gmap_masks,         #哪些点有效
+        #     'gmap_visited_masks': batch_gmap_visited_masks,     #哪些点已访问
+        #     'gmap_pair_dists': gmap_pair_dists,     #点和点之间有多远
+        #     'no_vp_left': batch_no_vp_left,         #还有没有可探索 ghost
+        # }
             nav_inputs.update({
                 'mode': 'navigation',
                 'txt_embeds': txt_embeds,
                 'txt_masks': txt_masks,
             })
             no_vp_left = nav_inputs.pop('no_vp_left')
+
             nav_outs = self.policy.net(**nav_inputs)
+
+        # outs = {
+        #     'gmap_embeds': gmap_embeds, #经过全局图导航编码器更新后的图节点表示[B, L, H]
+        #     'global_logits': global_logits, # 对图中每个可选节点的打分[B, L]
+        # }
+
             nav_logits = nav_outs['global_logits']
             nav_probs = F.softmax(nav_logits, 1)
             for i, gmap in enumerate(self.gmaps):
+                #给节点打一个适合停止的分数，后面进行全局选择
+                #把当前节点如果选择 STOP 的概率，存成这个节点的 stop score。
                 gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item()
 
             # random sample demo
@@ -1259,59 +1393,80 @@ class RLTrainer(BaseVLNCETrainer):
             # logits.masked_fill_(nav_inputs['gmap_visited_masks'], -float('inf'))
 
             if mode == 'train' or self.config.VIDEO_OPTION:
+                #给当前每个环境算“老师应该选哪个图节点”
                 teacher_actions = self._teacher_action_new(nav_inputs['gmap_vp_ids'], no_vp_left)
             if mode == 'train':
+                #模型预测 nav_logits 和专家动作 teacher_actions 做交叉熵
                 loss += F.cross_entropy(nav_logits, teacher_actions, reduction='sum', ignore_index=-100)
 
             # determine action
             if feedback == 'sample':
-                c = torch.distributions.Categorical(nav_probs)
-                a_t = c.sample().detach()
+                #一部分时候跟模型自己采样，一部分时候跟专家动作
+                c = torch.distributions.Categorical(nav_probs)  #把 nav_probs 看成一个离散概率分布
+                a_t = c.sample().detach()   #从这个分布里采样一个动作索引，作为模型自己想执行的动作
+                #前期更多的按照tf走，后期更多的按照模型自己选择的走。
                 a_t = torch.where(torch.rand_like(a_t, dtype=torch.float)<=sample_ratio, teacher_actions, a_t)
             elif feedback == 'argmax':
                 a_t = nav_logits.argmax(dim=-1)
             else:
                 raise NotImplementedError
+            #GPU 上的动作张量 a_t 转成 CPU 上的 numpy 数组
             cpu_a_t = a_t.cpu().numpy()
 
             # make equiv action
             env_actions = []
+
+            #是否在严格无滑动的执行条件下，使用 tryout 机制来辅助目标节点执行
             use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING)
+
+            #enumerate遍历一个可迭代元素是，同时拿到下标和元素
             for i, gmap in enumerate(self.gmaps):
+
                 if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]:
+                    #如果要停止或者步数耗尽
                     # stop at node with max stop_prob
+                    #取出来每一个节点和他的停止分数
                     vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
+                    #取出停止分数
                     stop_scores = [s[1] for s in vp_stop_scores]
+                    #取出来停止分数最大的那个节点
                     stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                    #取出停止节点的位置
                     stop_pos = gmap.node_pos[stop_vp]
-                    if self.config.IL.back_algo == 'control':
-                        back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
-                        back_path = back_path[1:]
+
+                    if self.config.IL.back_algo == 'control':   #只有在回退策略设成 control 时，才会真的规划一条路径去控制 agent 走回去
+                        back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]  #取出当前节点到停止目标节点的最短路径
+                        back_path = back_path[1:]   #back_path 变成一条路径列表，里面每一项都带：节点 id。节点坐标
                     else:
                         back_path = None
+
                     vis_info = {
-                            'nodes': list(gmap.node_pos.values()),
-                            'ghosts': list(gmap.ghost_aug_pos.values()),
-                            'predict_ghost': stop_pos,
+                            'nodes': list(gmap.node_pos.values()),  #取出节点地址数列
+                            'ghosts': list(gmap.ghost_aug_pos.values()),    #取出ghost节点数列
+                            'predict_ghost': stop_pos,      #取出停止节点的位置
                     }
                     env_actions.append(
                         {
                             'action': {
-                                'act': 0,
-                                'cur_vp': cur_vp[i],
-                                'stop_vp': stop_vp, 'stop_pos': stop_pos,
-                                'back_path': back_path,
-                                'tryout': use_tryout,
+                                'act': 0,#高层动作类型编号
+                                'cur_vp': cur_vp[i],    #当前所在节点 id
+                                'stop_vp': stop_vp,     #最终决定要停下来的那个图节点 id
+                                'stop_pos': stop_pos,   #该停止节点的真实位置坐标
+                                'back_path': back_path, #如果当前不在 stop_vp 上，需要沿图最短路回退过去时，这里给出回退路径
+                                'tryout': use_tryout,   #是否启用 tryout 机制辅助执行这个动作
                             },
                             'vis_info': vis_info,
                         }
                     )
-                else:
+                else:#如果没有停止，继续前进执行分支
+                    #取出模型决策的目标点
                     ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                    #取出目标点的真实位置
                     ghost_pos = gmap.ghost_aug_pos[ghost_vp]
+                    #如果是ghost节点，找到里他最近的以访问节点id
                     _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
-                    front_pos = gmap.node_pos[front_vp]
-                    if self.config.VIDEO_OPTION:
+                    front_pos = gmap.node_pos[front_vp]#获取最近节点的位置
+                    if self.config.VIDEO_OPTION:#处理视频显示相关内容
                         teacher_action_cpu = teacher_actions[i].cpu().item()
                         if teacher_action_cpu in [0, -100]:
                             teacher_ghost = None
@@ -1326,7 +1481,7 @@ class RLTrainer(BaseVLNCETrainer):
                     else:
                         vis_info = None
                     # teleport to front, then forward to ghost
-                    if self.config.IL.back_algo == 'control':
+                    if self.config.IL.back_algo == 'control':#如果要回退，给出回退的路径
                         back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][front_vp]]
                         back_path = back_path[1:]
                     else:
@@ -1335,11 +1490,13 @@ class RLTrainer(BaseVLNCETrainer):
                         {
                             'action': {
                                 'act': 4,
-                                'cur_vp': cur_vp[i],
-                                'front_vp': front_vp, 'front_pos': front_pos,
-                                'ghost_vp': ghost_vp, 'ghost_pos': ghost_pos,
+                                'cur_vp': cur_vp[i],    #当前所在节点id
+                                'front_vp': front_vp, 
+                                'front_pos': front_pos,
+                                'ghost_vp': ghost_vp, 
+                                'ghost_pos': ghost_pos,
                                 'back_path': back_path,
-                                'tryout': use_tryout,
+                                'tryout': use_tryout,   #是否适用tryout
                             },
                             'vis_info': vis_info,
                         }
@@ -1348,18 +1505,19 @@ class RLTrainer(BaseVLNCETrainer):
                     if self.config.MODEL.consume_ghost:
                         gmap.delete_ghost(ghost_vp)
 
-            outputs = self.envs.step(env_actions)
+            outputs = self.envs.step(env_actions)   #发送给环境，有一个返还观测
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
 
             # calculate metric
             if mode == 'eval':
+                #在评估模式下，负责把每个 episode 的结果统计、保存和收尾处理做好
                 curr_eps = self.envs.current_episodes()
                 for i in range(self.envs.num_envs):
                     if not dones[i]:
                         continue
                     info = infos[i]
                     ep_id = curr_eps[i].episode_id
-                    gt_path = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float)
+                    gt_path = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float64)
                     pred_path = np.array(info['position']['position'])
                     distances = np.array(info['position']['distance'])
                     metric = {}
@@ -1414,25 +1572,28 @@ class RLTrainer(BaseVLNCETrainer):
                     self.pbar.update()
 
             # pause env
-            if sum(dones) > 0:
+            if sum(dones) > 0:#当前并行环境里，每个环境这一步执行后是否已经结束 episode 的标记列表
+                #如果当前这一步之后，至少有一个环境结束了 episode就进入后续结束处理逻辑
+                #reversed数列反向
                 for i in reversed(list(range(self.envs.num_envs))):
-                    if dones[i]:
-                        not_done_index.pop(i)
+                    if dones[i]:#如果是这个环境停止了，删除相关信息和数组
+                        not_done_index.pop(i)  
                         self.envs.pause_at(i)
                         observations.pop(i)
                         # graph stop
                         self.gmaps.pop(i)
                         prev_vp.pop(i)
 
-            if self.envs.num_envs == 0:
+            if self.envs.num_envs == 0:#所有环境都停止后，循环结束
                 break
 
             # obs for next step
+            #处理观测，为下一步循环做准备
             observations = extract_instruction_tokens(observations,self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID)
             batch = batch_obs(observations, self.device)
             batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
-        if mode == 'train':
+        if mode == 'train': #如果是训练模式下，统计损失信息。
             loss = ml_weight * loss / total_actions
             self.loss += loss
             self.logs['IL_loss'].append(loss.item())

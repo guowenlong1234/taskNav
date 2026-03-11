@@ -76,7 +76,9 @@ def run_exp(exp_name: str, exp_config: str,
     if 'CMA' in config.MODEL.policy_name and 'r2r' in config.BASE_TASK_CONFIG_PATH:
         config.TASK_CONFIG.DATASET.DATA_PATH = 'data/datasets/R2R_VLNCE_v1-2_preprocessed/{split}/{split}.json.gz'
 
-    config.local_rank = local_rank
+    # torch.distributed.run sets LOCAL_RANK via env; torch.distributed.launch
+    # may still pass --local_rank explicitly.
+    config.local_rank = int(os.environ.get("LOCAL_RANK", local_rank))
     config.freeze()
     os.system("mkdir -p data/logs/running_log")
     logger.add_filehandler('data/logs/running_log/'+config.LOG_FILE)

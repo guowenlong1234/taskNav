@@ -18,18 +18,20 @@ Extensive experiments demonstrate that DGNav achieves a 58.56% Success Rate (SR)
 
 ### Installation
 
-1. This project is developed with Python 3.7. If you are using [miniconda](https://docs.conda.io/en/latest/miniconda.html) or [anaconda](https://anaconda.org/), you can create an environment:
+1. This project was originally developed with Python 3.7, and is now compatible with Python 3.9. If you are using [miniconda](https://docs.conda.io/en/latest/miniconda.html) or [anaconda](https://anaconda.org/), you can create an environment:
 
 ```bash
-conda create -n vlnce python=3.7
+conda create -n vlnce python=3.9
 conda activate vlnce
 ```
 
-2. Install [habitat-sim](https://anaconda.org/aihabitat/habitat-sim/0.1.7/download/linux-64/habitat-sim-0.1.7-py3.7_headless_linux_856d4b08c1a2632626bf0d205bf46471a99502b7.tar.bz2) with the corresponding Python version and headless mode:
+2. Install habitat-sim in headless mode:
 
 ```bash
-conda install habitat-sim-0.1.7-py3.7_headless_linux_856d4b08c1a2632626bf0d205bf46471a99502b7.tar.bz2
+conda install -c conda-forge -c aihabitat habitat-sim=0.3.3 headless quaternion
 ```
+
+For Python 3.9, `habitat-sim==0.1.7` has no prebuilt package, so use `0.3.3` with the compatibility code in `habitat_extensions/habitat_simulator.py`.
 
 3. Then install [Habitat-Lab](https://github.com/facebookresearch/habitat-lab/tree/v0.1.7):
 
@@ -45,15 +47,14 @@ python -m pip install -r habitat_baselines/rl/ddppo/requirements.txt
 python setup.py develop --all
 ```
 
-4. Clone this repository and install all requirements for `habitat-lab`, VLN-CE and our experiments. Note that we specify `gym==0.21.0` because its latest version is not compatible with `habitat-lab-v0.1.7`.
+4. Clone this repository and install all requirements for `habitat-lab`, VLN-CE and our experiments.
 
 ```bash
 git clone git@github.com:shannanshouyin/DGNav.git
 cd DGNav
 pip install torch==1.9.1+cu111 torchvision==0.10.1+cu111 -f https://download.pytorch.org/whl/torch_stable.html
 pip install git+https://github.com/openai/CLIP.git
-pip install gym==0.21.0
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-py39.txt
 ```
 
 ### Scenes: Matterport3D

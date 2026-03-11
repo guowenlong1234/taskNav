@@ -1,6 +1,11 @@
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
 
+dist_launch_module="torch.distributed.launch"
+if python -c "import importlib.util as u; raise SystemExit(0 if u.find_spec('torch.distributed.run') else 1)"; then
+      dist_launch_module="torch.distributed.run"
+fi
+
 flag1="--exp_name release_rxr
       --run-type train
       --exp-config run_rxr/iter_train.yaml
@@ -51,14 +56,14 @@ mode=$1
 case $mode in 
       train)
       echo "###### train mode ######"
-      python -m torch.distributed.launch --nproc_per_node=1 --master_port $2 run.py $flag1
+      python -m ${dist_launch_module} --nproc_per_node=1 --master_port $2 run.py $flag1
       ;;
       eval)
       echo "###### eval mode ######"
-      python -m torch.distributed.launch --nproc_per_node=1 --master_port $2 run.py $flag2
+      python -m ${dist_launch_module} --nproc_per_node=1 --master_port $2 run.py $flag2
       ;;
       infer)
       echo "###### infer mode ######"
-      python -m torch.distributed.launch --nproc_per_node=1 --master_port $2 run.py $flag3
+      python -m ${dist_launch_module} --nproc_per_node=1 --master_port $2 run.py $flag3
       ;;
 esac

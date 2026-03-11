@@ -100,7 +100,7 @@ class ShortestPathSensor(Sensor):
         return SensorTypes.TACTILE
 
     def _get_observation_space(self, *args: Any, **kwargs: Any):
-        return spaces.Box(low=0.0, high=100, shape=(1,), dtype=np.float)
+        return spaces.Box(low=0.0, high=100, shape=(1,), dtype=np.float64)
 
     def get_observation(self, *args: Any, episode, **kwargs: Any):
         best_action = self.follower.get_next_action(episode.goals[0].position)
@@ -138,7 +138,7 @@ class VLNOracleProgressSensor(Sensor):
         return SensorTypes.MEASUREMENT
 
     def _get_observation_space(self, *args: Any, **kwargs: Any):
-        return spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float)
+        return spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float64)
 
     def get_observation(
         self, observations, *args: Any, episode, **kwargs: Any
@@ -175,7 +175,8 @@ class RxRInstructionSensor(Sensor):
         # self.features_path = config.features_path
         # super().__init__(config=config)
         self.uuid = "instruction"
-        self.observation_space = spaces.Discrete(0)
+        # gym>=0.23 requires n > 0 for Discrete.
+        self.observation_space = spaces.Discrete(1)
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
         return self.cls_uuid
