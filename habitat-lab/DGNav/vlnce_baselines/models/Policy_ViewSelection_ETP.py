@@ -449,19 +449,48 @@ class ETP(Net):
             NUM_IMGS = 12
             NUM_CLASSES = 12    # 12 distances at each sector
 
-            #pytorch自带函数，按照某个张量的形状，创建一个相同形状的值全为0的新张量
+            # pytorch自带函数，按照某个张量的形状，创建一个相同形状的值全为0的新张量
             depth_batch = torch.zeros_like(observations['depth']).repeat(NUM_IMGS, 1, 1, 1)
             rgb_batch = torch.zeros_like(observations['rgb']).repeat(NUM_IMGS, 1, 1, 1)
 
-            # reverse the order of input images to clockwise
-            a_count = 0 #是原始感测的顺序
-            for i, (k, v) in enumerate(observations.items()):
-                if 'depth' in k:  # You might need to double check the keys order
-                    for bi in range(v.size(0)):
-                        ra_count = (NUM_IMGS - a_count) % NUM_IMGS  #是重新排列后的观测数据
-                        depth_batch[ra_count + bi*NUM_IMGS] = v[bi]
-                        rgb_batch[ra_count + bi*NUM_IMGS] = observations[k.replace('depth','rgb')][bi]
-                    a_count += 1
+            # Reverse the input panorama from counter-clockwise to clockwise.
+            # Do NOT rely on dict iteration order: Habitat 3.3 may reorder keys
+            # lexicographically (e.g. depth_120 before depth_30), which breaks
+            # viewpoint ordering and severely hurts navigation quality.
+            def _depth_angle_from_key(key: str):
+                if key == "depth":
+                    return 0
+                if key.startswith("depth_"):
+                    try:
+                        return int(key.split("_", 1)[1])
+                    except (IndexError, ValueError):
+                        return None
+                return None
+
+            depth_keys = []
+            for key in observations.keys():
+                angle = _depth_angle_from_key(key)
+                if angle is not None:
+                    depth_keys.append((angle, key))
+
+            depth_keys.sort(key=lambda x: x[0])
+            if len(depth_keys) != NUM_IMGS:
+                raise RuntimeError(
+                    "Expected 12 depth views (depth + depth_30..depth_330), "
+                    f"but got {len(depth_keys)} keys: {[k for _, k in depth_keys]}"
+                )
+
+            for a_count, (_, depth_key) in enumerate(depth_keys):
+                rgb_key = depth_key.replace("depth", "rgb", 1)
+                if rgb_key not in observations:
+                    raise KeyError(f"Missing paired RGB key for {depth_key}: {rgb_key}")
+
+                depth_view = observations[depth_key]
+                rgb_view = observations[rgb_key]
+                for bi in range(depth_view.size(0)):
+                    ra_count = (NUM_IMGS - a_count) % NUM_IMGS
+                    depth_batch[ra_count + bi * NUM_IMGS] = depth_view[bi]
+                    rgb_batch[ra_count + bi * NUM_IMGS] = rgb_view[bi]
             obs_view12 = {}
 
             obs_view12['depth'] = depth_batch
