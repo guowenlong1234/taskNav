@@ -56,6 +56,24 @@ from copy import deepcopy
 from torch.cuda.amp import autocast, GradScaler
 from vlnce_baselines.common.ops import pad_tensors_wgrad, gen_seq_masks
 from torch.nn.utils.rnn import pad_sequence
+from yacs.config import CfgNode as CN
+
+
+def _ensure_iterator_options(task_config):
+    task_config.set_new_allowed(True)
+    if "ENVIRONMENT" not in task_config:
+        task_config.ENVIRONMENT = CN()
+    if "ITERATOR_OPTIONS" not in task_config.ENVIRONMENT:
+        task_config.ENVIRONMENT.ITERATOR_OPTIONS = CN()
+    if "SHUFFLE" not in task_config.ENVIRONMENT.ITERATOR_OPTIONS:
+        task_config.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
+    if (
+        "MAX_SCENE_REPEAT_STEPS"
+        not in task_config.ENVIRONMENT.ITERATOR_OPTIONS
+    ):
+        task_config.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
+    task_config.set_new_allowed(False)
+    return task_config.ENVIRONMENT.ITERATOR_OPTIONS
 
 
 @baseline_registry.register_trainer(name="SS-ETP")
@@ -130,10 +148,9 @@ class RLTrainer(BaseVLNCETrainer):
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
-            self._make_ckpt_dir()
-            # os.makedirs(self.lmdb_features_dir, exist_ok=True)
+            os.makedirs(self.config.CHECKPOINT_FOLDER, exist_ok=True)
             if self.config.EVAL.SAVE_RESULTS:
-                self._make_results_dir()
+                os.makedirs(self.config.RESULTS_DIR, exist_ok=True)
 
     def save_checkpoint(self, iteration: int):
         checkpoint_dict = {
@@ -287,7 +304,8 @@ class RLTrainer(BaseVLNCETrainer):
         self.config.defrost()
         self.config.TASK_CONFIG.TASK.NDTW.SPLIT = self.split
         self.config.TASK_CONFIG.TASK.SDTW.SPLIT = self.split
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
+        iterator_options = _ensure_iterator_options(self.config.TASK_CONFIG)
+        iterator_options.MAX_SCENE_REPEAT_STEPS = -1
         self.config.SIMULATOR_GPU_IDS = self.config.SIMULATOR_GPU_IDS[self.config.local_rank]
         self.config.use_pbar = not is_slurm_batch_job()
         ''' if choosing image '''
@@ -843,8 +861,9 @@ class RLTrainer(BaseVLNCETrainer):
         if self.local_rank < 1:
             logger.info(f"checkpoint_path: {checkpoint_path}")
         self.config.defrost()
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
+        iterator_options = _ensure_iterator_options(self.config.TASK_CONFIG)
+        iterator_options.SHUFFLE = False
+        iterator_options.MAX_SCENE_REPEAT_STEPS = -1
         self.config.IL.ckpt_to_load = checkpoint_path
         if self.config.VIDEO_OPTION:
             self.config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP_VLNCE")
@@ -987,8 +1006,9 @@ class RLTrainer(BaseVLNCETrainer):
         self.config.TASK_CONFIG.DATASET.SPLIT = self.config.INFERENCE.SPLIT
         self.config.TASK_CONFIG.DATASET.ROLES = ["guide"]
         self.config.TASK_CONFIG.DATASET.LANGUAGES = self.config.INFERENCE.LANGUAGES
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
+        iterator_options = _ensure_iterator_options(self.config.TASK_CONFIG)
+        iterator_options.SHUFFLE = False
+        iterator_options.MAX_SCENE_REPEAT_STEPS = -1
         self.config.TASK_CONFIG.TASK.MEASUREMENTS = ['POSITION_INFER']
         self.config.TASK_CONFIG.TASK.SENSORS = [s for s in self.config.TASK_CONFIG.TASK.SENSORS if "INSTRUCTION" in s]
         self.config.SIMULATOR_GPU_IDS = [self.config.SIMULATOR_GPU_IDS[self.config.local_rank]]

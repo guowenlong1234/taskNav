@@ -15,6 +15,7 @@ import torch.multiprocessing as mp
 import gzip
 import math
 from copy import deepcopy
+from yacs.config import CfgNode as CN
 
 import tqdm
 from gym import Space
@@ -58,12 +59,35 @@ with warnings.catch_warnings():
     # import tensorflow as tf  # noqa: F401
 
 
+def _ensure_iterator_options(task_config):
+    task_config.set_new_allowed(True)
+    if "ENVIRONMENT" not in task_config:
+        task_config.ENVIRONMENT = CN()
+    if "ITERATOR_OPTIONS" not in task_config.ENVIRONMENT:
+        task_config.ENVIRONMENT.ITERATOR_OPTIONS = CN()
+    if "SHUFFLE" not in task_config.ENVIRONMENT.ITERATOR_OPTIONS:
+        task_config.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
+    if (
+        "MAX_SCENE_REPEAT_STEPS"
+        not in task_config.ENVIRONMENT.ITERATOR_OPTIONS
+    ):
+        task_config.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
+    task_config.set_new_allowed(False)
+    return task_config.ENVIRONMENT.ITERATOR_OPTIONS
+
+
 class BaseVLNCETrainer(BaseILTrainer):
     r"""A base trainer for VLN-CE imitation learning."""
     supported_tasks: List[str] = ["VLN-v0"]
 
     def __init__(self, config=None):
-        super().__init__(config)
+        assert config is not None, "needs config file to initialize trainer"
+        # Bypass Habitat-Baselines 0.3.x BaseILTrainer init, which expects
+        # hydra-style config.habitat_baselines.* keys. DGNav keeps legacy
+        # flat YACS configs.
+        self.config = config
+        self._flush_secs = 30
+        self._make_dirs()
         self.policy = None
         self.device = (
             torch.device("cuda", self.config.TORCH_GPU_ID)
@@ -320,10 +344,9 @@ class BaseVLNCETrainer(BaseILTrainer):
         # config.TASK_CONFIG.DATASET.LANGUAGES = config.EVAL.LANGUAGES
         # config.TASK_CONFIG.TASK.NDTW.SPLIT = config.EVAL.SPLIT
         # config.TASK_CONFIG.TASK.SDTW.SPLIT = config.EVAL.SPLIT
-        config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
-        config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = (
-            -1
-        )
+        iterator_options = _ensure_iterator_options(config.TASK_CONFIG)
+        iterator_options.SHUFFLE = False
+        iterator_options.MAX_SCENE_REPEAT_STEPS = -1
         config.IL.ckpt_to_load = checkpoint_path
         if len(config.VIDEO_OPTION) > 0:
             config.defrost()
@@ -932,10 +955,9 @@ class BaseVLNCETrainer(BaseILTrainer):
         self.config.TASK_CONFIG.DATASET.SPLIT = self.config.INFERENCE.SPLIT
         self.config.TASK_CONFIG.DATASET.ROLES = ["guide"]
         self.config.TASK_CONFIG.DATASET.LANGUAGES = self.config.INFERENCE.LANGUAGES
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
-        self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = (
-            -1
-        )
+        iterator_options = _ensure_iterator_options(self.config.TASK_CONFIG)
+        iterator_options.SHUFFLE = False
+        iterator_options.MAX_SCENE_REPEAT_STEPS = -1
         self.config.IL.ckpt_to_load = self.config.INFERENCE.CKPT_PATH
         self.config.TASK_CONFIG.TASK.MEASUREMENTS = []
         self.config.TASK_CONFIG.TASK.SENSORS = [
@@ -982,10 +1004,9 @@ class BaseVLNCETrainer(BaseILTrainer):
         else:
             config = self.config.clone()
         config.defrost()
-        config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
-        config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = (
-            -1
-        )
+        iterator_options = _ensure_iterator_options(config.TASK_CONFIG)
+        iterator_options.SHUFFLE = False
+        iterator_options.MAX_SCENE_REPEAT_STEPS = -1
         config.IL.ckpt_to_load = checkpoint_path
         config.freeze()
 
