@@ -52,6 +52,10 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         self.video_frames = []
         self.plan_frames = []
 
+    @property
+    def original_action_space(self):
+        return self.action_space
+
     def get_reward_range(self) -> Tuple[float, float]:
         # We don't use a reward for DAgger, but the baseline_registry requires
         # we inherit from habitat.RLEnv.
@@ -433,7 +437,17 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         frame = cv2.copyMakeBorder(frame, 6,6,5,5, cv2.BORDER_CONSTANT, value=(255,255,255))
         self.plan_frames.append(frame)
 
-    def step(self, action, vis_info, *args, **kwargs):
+    def step(self, action, vis_info=None, *args, **kwargs):
+        # Habitat-Lab 3.3 VectorEnv passes a single dict argument.
+        # Legacy DGNav code passes (action, vis_info) separately.
+        if (
+            vis_info is None
+            and isinstance(action, dict)
+            and "action" in action
+        ):
+            vis_info = action.get("vis_info", None)
+            action = action["action"]
+
         act = action['act']
 
         if act == 4: # high to low
@@ -521,6 +535,10 @@ class VLNCEDaggerEnv(habitat.RLEnv):
 class VLNCEInferenceEnv(habitat.RLEnv):
     def __init__(self, config: Config, dataset: Optional[Dataset] = None):
         super().__init__(config.TASK_CONFIG, dataset)
+
+    @property
+    def original_action_space(self):
+        return self.action_space
 
     def get_reward_range(self):
         return (0.0, 0.0)

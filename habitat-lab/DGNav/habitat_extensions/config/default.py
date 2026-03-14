@@ -1,10 +1,16 @@
 from typing import List, Optional, Union
 
-from habitat.config.default import Config as CN
-from habitat.config.default import get_config
+from yacs.config import CfgNode as CN
 
-_C = get_config()
-_C.defrost()
+# Keep a lightweight old-style YACS config root so legacy DGNav config logic
+# can run on top of Habitat-Lab 0.3.x.
+_C = CN()
+_C.SEED = 0
+_C.ENVIRONMENT = CN()
+_C.ENVIRONMENT.MAX_EPISODE_STEPS = 5000
+_C.TASK = CN()
+_C.TASK.ACTIONS = CN()
+_C.DATASET = CN()
 
 # ----------------------------------------------------------------------------
 # CUSTOM ACTION: HIGHTOLOWINFERENCE ACTION
@@ -148,6 +154,7 @@ def get_extended_config(
         sweeping or quick tests.
     """
     config = _C.clone()
+    config.set_new_allowed(True)
 
     if config_paths:
         if isinstance(config_paths, str):
@@ -158,5 +165,6 @@ def get_extended_config(
 
     if opts:
         config.merge_from_list(opts)
+    config.set_new_allowed(False)
     config.freeze()
     return config

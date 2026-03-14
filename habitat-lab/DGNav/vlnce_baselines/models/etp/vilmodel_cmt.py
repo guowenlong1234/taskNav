@@ -977,6 +977,11 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 v.requires_grad = False
     
     def forward_txt(self, txt_ids, txt_masks):
+        # Habitat-Baselines 3.3 `batch_obs` runs under inference_mode, which can
+        # produce inference tensors. Embedding backward needs to save token ids,
+        # so clone to ensure regular tensors for training.
+        txt_ids = txt_ids.clone()
+        txt_masks = txt_masks.clone()
         txt_token_type_ids = torch.zeros_like(txt_ids)
         txt_embeds = self.embeddings(txt_ids, token_type_ids=txt_token_type_ids)
         txt_embeds = self.lang_encoder(txt_embeds, txt_masks)

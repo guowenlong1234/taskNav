@@ -1,6 +1,13 @@
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
 
+# Default to Habitat-Lab/Baselines from current DGNav_new workspace.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dgnav_dir="$(cd "${script_dir}/.." && pwd)"
+habitat_repo_root="$(cd "${dgnav_dir}/.." && pwd)"
+export PYTHONPATH="${habitat_repo_root}/habitat-lab:${habitat_repo_root}/habitat-baselines:${PYTHONPATH}"
+echo "[main.bash] Using Habitat-Lab/Baselines from ${habitat_repo_root}"
+
 dist_launch_module="torch.distributed.launch"
 if python -c "import importlib.util as u; raise SystemExit(0 if u.find_spec('torch.distributed.run') else 1)"; then
       dist_launch_module="torch.distributed.run"

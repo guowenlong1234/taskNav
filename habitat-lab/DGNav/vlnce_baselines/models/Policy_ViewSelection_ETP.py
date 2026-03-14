@@ -389,6 +389,12 @@ class ETP(Net):
         self.pano_img_idxes = np.arange(0, 12, dtype=np.int64)        # Counter-clockwise
         pano_angle_rad_c = (1-self.pano_img_idxes/12) * 2 * math.pi   # Corresponding to counter-clockwise
         self.pano_angle_fts = angle_feature_torch(torch.from_numpy(pano_angle_rad_c))   #预计算12个角度的方向角特征
+        self._recurrent_hidden_size = getattr(
+            model_config.STATE_ENCODER, "hidden_size", 512
+        )
+        self._perception_embedding_size = getattr(
+            model_config.VISUAL_DIM, "vis_hidden", 768
+        )
 
     @property  # trivial argument, just for init with habitat
     def output_size(self):
@@ -401,6 +407,14 @@ class ETP(Net):
     @property
     def num_recurrent_layers(self):
         return 1
+
+    @property
+    def recurrent_hidden_size(self):
+        return self._recurrent_hidden_size
+
+    @property
+    def perception_embedding_size(self):
+        return self._perception_embedding_size
 
     def forward(self, mode=None, 
                 txt_ids=None, txt_masks=None, txt_embeds=None, 

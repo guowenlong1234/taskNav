@@ -1,8 +1,7 @@
 from typing import List, Optional, Union
 
-import habitat_baselines.config.default
 from habitat.config.default import CONFIG_FILE_SEPARATOR
-from habitat.config.default import Config as CN
+from yacs.config import CfgNode as CN
 
 from habitat_extensions.config.default import (
     get_extended_config as get_task_config,
@@ -17,21 +16,32 @@ _C.TASK_CONFIG = CN()  # task_config will be stored as a config node
 _C.TRAINER_NAME = "dagger"
 _C.ENV_NAME = "VLNCEDaggerEnv"
 _C.SIMULATOR_GPU_IDS = [0]
+_C.TORCH_GPU_ID = 0
+_C.TORCH_GPU_IDS = [0]
+_C.GPU_NUMBERS = 1
+_C.NUM_ENVIRONMENTS = 1
+_C.local_rank = 0
 _C.VIDEO_OPTION = []  # options: "disk", "tensorboard"
 _C.VIDEO_DIR = "videos/debug"
 _C.TENSORBOARD_DIR = "data/tensorboard_dirs/debug"
+_C.CHECKPOINT_FOLDER = "data/checkpoints/debug"
+_C.EVAL_CKPT_PATH_DIR = "data/checkpoints/debug"
 _C.RESULTS_DIR = "data/checkpoints/pretrained/evals"
+_C.LOG_FILE = "train.log"
 
 # -----------------------------------------------------------------------------
 # EVAL CONFIG
 # -----------------------------------------------------------------------------
 _C.EVAL = CN()
 # The split to evaluate on
+_C.EVAL.USE_CKPT_CONFIG = True
 _C.EVAL.SPLIT = "val_seen"
 _C.EVAL.EPISODE_COUNT = -1
 _C.EVAL.LANGUAGES = ["en-US", "en-IN"]
 _C.EVAL.SAMPLE = False
 _C.EVAL.SAVE_RESULTS = True
+_C.EVAL.CKPT_PATH_DIR = ""
+_C.EVAL.fast_eval = False
 _C.EVAL.EVAL_NONLEARNING = False
 _C.EVAL.NONLEARNING = CN()
 _C.EVAL.NONLEARNING.AGENT = "RandomAgent"
@@ -50,6 +60,7 @@ _C.INFERENCE.INFERENCE_NONLEARNING = False
 _C.INFERENCE.NONLEARNING = CN()
 _C.INFERENCE.NONLEARNING.AGENT = "RandomAgent"
 _C.INFERENCE.FORMAT = "rxr"  # either 'rxr' or 'r2r'
+_C.INFERENCE.EPISODE_COUNT = -1
 # -----------------------------------------------------------------------------
 # IMITATION LEARNING CONFIG
 # -----------------------------------------------------------------------------
@@ -57,6 +68,12 @@ _C.IL = CN()
 _C.IL.lr = 2.5e-4
 _C.IL.batch_size = 5
 _C.IL.epochs = 4
+_C.IL.iters = 20000
+_C.IL.log_every = 200
+_C.IL.ml_weight = 1.0
+_C.IL.expert_policy = "spl"
+_C.IL.sample_ratio = 0.75
+_C.IL.decay_interval = 3000
 _C.IL.use_iw = True
 # inflection coefficient for RxR training set GT trajectories (guide): 1.9
 # inflection coefficient for R2R training set GT trajectories: 3.2
@@ -67,6 +84,11 @@ _C.IL.load_from_ckpt = False
 _C.IL.ckpt_to_load = "data/checkpoints/ckpt.0.pth"
 # if True, loads the optimizer state, epoch, and step_id from the ckpt dict.
 _C.IL.is_requeue = False
+_C.IL.max_traj_len = 20
+_C.IL.max_text_len = 80
+_C.IL.ghost_aug = 0.0
+_C.IL.back_algo = "teleport"
+_C.IL.tryout = True
 # it True, start training from the saved epoch
 # loc_noise configuration (fixed, dynamic, random are parallel, priority: dynamic > random > fixed)
 _C.IL.loc_noise = 0.5  # Fixed loc_noise value (used when both dynamic and random are disabled)
@@ -148,9 +170,18 @@ _C.RL.POLICY.OBS_TRANSFORMS.RESIZER_PER_SENSOR.SIZES = [
 # -----------------------------------------------------------------------------
 _C.MODEL = CN()
 _C.MODEL.policy_name = "CMAPolicy"  # or "Seq2SeqPolicy"
+_C.MODEL.task_type = "r2r"
 _C.MODEL.ablate_depth = False
 _C.MODEL.ablate_rgb = False
 _C.MODEL.ablate_instruction = False
+_C.MODEL.NUM_ANGLES = 12
+_C.MODEL.pretrained_path = ""
+_C.MODEL.fix_lang_embedding = False
+_C.MODEL.fix_pano_embedding = False
+_C.MODEL.use_depth_embedding = True
+_C.MODEL.use_sprels = True
+_C.MODEL.merge_ghost = True
+_C.MODEL.consume_ghost = True
 
 _C.MODEL.INSTRUCTION_ENCODER = CN()
 _C.MODEL.INSTRUCTION_ENCODER.sensor_uuid = "instruction"
@@ -176,6 +207,10 @@ _C.MODEL.spatial_output = True
 _C.MODEL.RGB_ENCODER = CN()
 _C.MODEL.RGB_ENCODER.cnn_type = "TorchVisionResNet50"
 _C.MODEL.RGB_ENCODER.output_size = 256
+
+_C.MODEL.VISUAL_DIM = CN()
+_C.MODEL.VISUAL_DIM.vis_hidden = 768
+_C.MODEL.VISUAL_DIM.directional = 128
 
 _C.MODEL.DEPTH_ENCODER = CN()
 _C.MODEL.DEPTH_ENCODER.cnn_type = "VlnResnetDepthEncoder"
@@ -241,10 +276,8 @@ def get_config(
         command line into the config. For example, `opts = ['FOO.BAR',
         0.5]`. Argument can be used for parameter sweeping or quick tests.
     """
-    config = CN()
-    config.merge_from_other_cfg(habitat_baselines.config.default._C)
-    purge_keys(config, ["SIMULATOR_GPU_ID", "TEST_EPISODE_COUNT"])
-    config.merge_from_other_cfg(_C.clone())
+    config = _C.clone()
+    config.set_new_allowed(True)
 
     if config_paths:
         if isinstance(config_paths, str):
@@ -266,5 +299,6 @@ def get_config(
         config.CMD_TRAILING_OPTS = opts
         config.merge_from_list(opts)
 
+    config.set_new_allowed(False)
     config.freeze()
     return config

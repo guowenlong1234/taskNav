@@ -1,18 +1,12 @@
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
 
-# NOTE:
-# DGNav codebase currently depends on old Habitat-Lab (0.1.x) Config APIs.
-# If you force import from this repo's Habitat-Lab 0.3.x tree, training may fail
-# with errors like: "cannot import name 'Config' from habitat.config".
-# Keep old environment default unless explicitly enabled.
-if [ "${DGNAV_USE_NEW_HABITAT_LAB:-0}" = "1" ]; then
-      script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-      dgnav_dir="$(cd "${script_dir}/.." && pwd)"
-      habitat_repo_root="$(cd "${dgnav_dir}/.." && pwd)"
-      export PYTHONPATH="${habitat_repo_root}/habitat-lab:${habitat_repo_root}/habitat-baselines:${PYTHONPATH}"
-      echo "[main.bash] DGNAV_USE_NEW_HABITAT_LAB=1 -> use habitat-lab from DGNav_new tree"
-fi
+# Default to Habitat-Lab/Baselines from current DGNav_new workspace.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dgnav_dir="$(cd "${script_dir}/.." && pwd)"
+habitat_repo_root="$(cd "${dgnav_dir}/.." && pwd)"
+export PYTHONPATH="${habitat_repo_root}/habitat-lab:${habitat_repo_root}/habitat-baselines:${PYTHONPATH}"
+echo "[main.bash] Using Habitat-Lab/Baselines from ${habitat_repo_root}"
 
 dist_launch_module="torch.distributed.launch"
 if python -c "import importlib.util as u; raise SystemExit(0 if u.find_spec('torch.distributed.run') else 1)"; then

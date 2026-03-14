@@ -23,6 +23,7 @@ This module API is experimental and likely to change
 import abc
 import copy
 import numbers
+import re
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -1203,25 +1204,54 @@ def get_active_obs_transforms(
 ) -> List[ObservationTransformer]:
     active_obs_transforms = []
 
-    # When using observation transformations, we
-    # assume for now that the observation space is shared among agents
-    agent_name = list(config.habitat_baselines.rl.policy.keys())[0]
-    obs_trans_conf = config.habitat_baselines.rl.policy[
-        agent_name
-    ].obs_transforms
-    if hasattr(
-        config.habitat_baselines.rl.policy[agent_name], "obs_transforms"
-    ):
-        for obs_transform_config in obs_trans_conf.values():
+    # Hydra-style Habitat-Baselines 0.3.x config.
+    if hasattr(config, "habitat_baselines"):
+        # When using observation transformations, we
+        # assume for now that the observation space is shared among agents
+        agent_name = list(config.habitat_baselines.rl.policy.keys())[0]
+        obs_trans_conf = config.habitat_baselines.rl.policy[
+            agent_name
+        ].obs_transforms
+        if hasattr(
+            config.habitat_baselines.rl.policy[agent_name], "obs_transforms"
+        ):
+            for obs_transform_config in obs_trans_conf.values():
+                obs_trans_cls = baseline_registry.get_obs_transformer(
+                    obs_transform_config.type
+                )
+                if obs_trans_cls is None:
+                    raise ValueError(
+                        f"Unkown ObservationTransform with name {obs_transform_config.type}."
+                    )
+                obs_transform = obs_trans_cls.from_config(
+                    obs_transform_config
+                )
+                active_obs_transforms.append(obs_transform)
+        return active_obs_transforms
+
+    # Legacy DGNav/YACS config.
+    if hasattr(config, "RL") and hasattr(config.RL, "POLICY"):
+        obs_transforms_cfg = config.RL.POLICY.OBS_TRANSFORMS
+        enabled_transforms = []
+        if hasattr(obs_transforms_cfg, "ENABLED_TRANSFORMS"):
+            enabled_transforms = list(obs_transforms_cfg.ENABLED_TRANSFORMS)
+
+        for transform_name in enabled_transforms:
             obs_trans_cls = baseline_registry.get_obs_transformer(
-                obs_transform_config.type
+                transform_name
             )
             if obs_trans_cls is None:
-                raise ValueError(
-                    f"Unkown ObservationTransform with name {obs_transform_config.type}."
+                obs_trans_cls = baseline_registry.get_obs_transformer(
+                    re.sub(r"(?<!^)(?=[A-Z])", "_", transform_name).upper()
                 )
-            obs_transform = obs_trans_cls.from_config(obs_transform_config)
+            if obs_trans_cls is None:
+                raise ValueError(
+                    f"Unkown ObservationTransform with name {transform_name}."
+                )
+            # DGNav custom transformers expect the full experiment config.
+            obs_transform = obs_trans_cls.from_config(config)
             active_obs_transforms.append(obs_transform)
+
     return active_obs_transforms
 
 

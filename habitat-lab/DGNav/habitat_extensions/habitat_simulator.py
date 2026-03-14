@@ -29,14 +29,12 @@ import habitat_sim
 from habitat_sim.simulator import MutableMapping, MutableMapping_T
 from habitat.sims.habitat_simulator.habitat_simulator import (
     HabitatSim,
-    HabitatSimVizSensors,
     overwrite_config,
 )
 from habitat.core.dataset import Episode
 from habitat.core.registry import registry
 from habitat.core.simulator import (
     AgentState,
-    Config,
     DepthSensor,
     Observations,
     RGBSensor,
@@ -48,6 +46,11 @@ from habitat.core.simulator import (
     VisualObservation,
 )
 from habitat.core.spaces import Space
+
+try:
+    from habitat.core.simulator import Config
+except ImportError:
+    from omegaconf import DictConfig as Config
 
 # inherit habitat-lab/habitat/sims/habitat_simulator/habitat_simulator.py
 @registry.register_simulator(name="Sim-v1")
@@ -63,6 +66,19 @@ class Simulator(HabitatSim):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
+    def _get_agent_config(self):
+        if hasattr(self.habitat_config, "AGENT_0"):
+            return self.habitat_config.AGENT_0
+        if (
+            hasattr(self.habitat_config, "agents_order")
+            and hasattr(self.habitat_config, "agents")
+        ):
+            agent_name = self.habitat_config.agents_order[
+                self.habitat_config.default_agent_id
+            ]
+            return self.habitat_config.agents[agent_name]
+        raise AttributeError("No agent config found")
+
     def create_sim_config(
         self, _sensor_suite: SensorSuite
     ) -> habitat_sim.Configuration:
@@ -73,12 +89,22 @@ class Simulator(HabitatSim):
                 "Incompatible version of Habitat-Sim detected, please upgrade habitat_sim"
             )
 
+        sim_backend_cfg = (
+            self.habitat_config.HABITAT_SIM_V0
+            if hasattr(self.habitat_config, "HABITAT_SIM_V0")
+            else self.habitat_config.habitat_sim_v0
+        )
         overwrite_config(
-            config_from=self.habitat_config.HABITAT_SIM_V0,
+            config_from=sim_backend_cfg,
             config_to=sim_config,
             ignore_keys={"gpu_gpu"},
         )
-        sim_config.scene_id = self.habitat_config.SCENE
+        scene_id = (
+            self.habitat_config.SCENE
+            if hasattr(self.habitat_config, "SCENE")
+            else self.habitat_config.scene
+        )
+        sim_config.scene_id = scene_id
 
         agent_config = habitat_sim.AgentConfiguration()
         overwrite_config(
@@ -87,6 +113,7 @@ class Simulator(HabitatSim):
             ignore_keys={
                 "is_set_start_state",
                 "sensors",
+                "sim_sensors",
                 "start_position",
                 "start_rotation",
             },
@@ -121,18 +148,46 @@ class Simulator(HabitatSim):
             elif hasattr(sim_sensor_cfg, "hfov"):
                 sim_sensor_cfg.hfov = float(sensor.config.HFOV)
 
-            sensor = cast(HabitatSimVizSensors, sensor)
-            sim_sensor_cfg.sensor_type = sensor.sim_sensor_type
+            sensor_sim_type = getattr(sensor, "sim_sensor_type", None)
+            if sensor_sim_type is not None:
+                sim_sensor_cfg.sensor_type = sensor_sim_type
             if hasattr(sim_sensor_cfg, "gpu2gpu_transfer"):
+                gpu_gpu = (
+                    sim_backend_cfg.GPU_GPU
+                    if hasattr(sim_backend_cfg, "GPU_GPU")
+                    else getattr(sim_backend_cfg, "gpu_gpu", False)
+                )
                 sim_sensor_cfg.gpu2gpu_transfer = (
-                    self.habitat_config.HABITAT_SIM_V0.GPU_GPU
+                    gpu_gpu
                 )
             sensor_specifications.append(sim_sensor_cfg)
 
         agent_config.sensor_specifications = sensor_specifications
-        agent_config.action_space = registry.get_action_space_configuration(
-            self.habitat_config.ACTION_SPACE_CONFIG
-        )(self.habitat_config).get()
+        forward_step_size = (
+            self.habitat_config.FORWARD_STEP_SIZE
+            if hasattr(self.habitat_config, "FORWARD_STEP_SIZE")
+            else self.habitat_config.forward_step_size
+        )
+        turn_angle = (
+            self.habitat_config.TURN_ANGLE
+            if hasattr(self.habitat_config, "TURN_ANGLE")
+            else self.habitat_config.turn_angle
+        )
+        agent_config.action_space = {
+            0: habitat_sim.ActionSpec("stop"),
+            1: habitat_sim.ActionSpec(
+                "move_forward",
+                habitat_sim.ActuationSpec(amount=forward_step_size),
+            ),
+            2: habitat_sim.ActionSpec(
+                "turn_left",
+                habitat_sim.ActuationSpec(amount=turn_angle),
+            ),
+            3: habitat_sim.ActionSpec(
+                "turn_right",
+                habitat_sim.ActuationSpec(amount=turn_angle),
+            ),
+        }
 
         return habitat_sim.Configuration(sim_config, [agent_config])
 

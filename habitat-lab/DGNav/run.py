@@ -1,8 +1,116 @@
 #!/usr/bin/env python3
 
 import argparse
-import random
+import importlib
 import os
+import random
+import sys
+from pathlib import Path
+
+
+def _prepend_local_habitat_paths() -> None:
+    """Force using Habitat-Lab/Baselines from the current DGNav_new tree."""
+    dgnav_dir = Path(__file__).resolve().parent
+    repo_root = dgnav_dir.parent
+    local_habitat_lab = repo_root / "habitat-lab"
+    local_habitat_baselines = repo_root / "habitat-baselines"
+
+    # Insert in reverse order so habitat-lab keeps the highest priority.
+    for p in (local_habitat_baselines, local_habitat_lab):
+        p_str = str(p)
+        if p_str not in sys.path:
+            sys.path.insert(0, p_str)
+
+
+def _patch_habitat_legacy_config_api() -> None:
+    """
+    Patch minimal legacy symbols expected by DGNav old-style code when running
+    on Habitat-Lab/Baselines 0.3.x.
+    """
+    try:
+        from omegaconf import DictConfig
+
+        import habitat
+        import habitat.config as habitat_config
+        import habitat.config.default as habitat_config_default
+        import habitat.core.env as habitat_core_env
+        import habitat.core.utils as habitat_core_utils
+        import habitat.tasks.nav.nav as habitat_nav_task
+        import habitat.utils.visualizations.utils as habitat_viz_utils
+        from contextlib import contextmanager
+        from omegaconf import Container
+        habitat_read_write_mod = importlib.import_module(
+            "habitat.config.read_write"
+        )
+
+        if not hasattr(habitat, "Config"):
+            habitat.Config = DictConfig
+        if not hasattr(habitat_config, "Config"):
+            habitat_config.Config = DictConfig
+        if not hasattr(habitat_config_default, "Config"):
+            habitat_config_default.Config = DictConfig
+        if not hasattr(habitat_core_utils, "try_cv2_import"):
+            def _try_cv2_import():
+                import cv2
+                return cv2
+
+            habitat_core_utils.try_cv2_import = _try_cv2_import
+        if (
+            not hasattr(habitat_viz_utils, "append_text_to_image")
+            and hasattr(habitat_viz_utils, "append_text_underneath_image")
+        ):
+            habitat_viz_utils.append_text_to_image = (
+                habitat_viz_utils.append_text_underneath_image
+            )
+
+        # Habitat-Lab 0.3.x read_write() asserts OmegaConf Container. DGNav
+        # task configs are legacy YACS, so treat non-Container configs as
+        # mutable no-op context to preserve old behavior.
+        if not hasattr(habitat_read_write_mod, "_dgnav_read_write_compat"):
+            _orig_read_write = habitat_read_write_mod.read_write
+
+            @contextmanager
+            def _compat_read_write(config):
+                if isinstance(config, Container):
+                    with _orig_read_write(config):
+                        yield config
+                else:
+                    was_frozen = (
+                        config.is_frozen()
+                        if hasattr(config, "is_frozen")
+                        else False
+                    )
+                    if hasattr(config, "defrost"):
+                        config.defrost()
+                    try:
+                        yield config
+                    finally:
+                        if was_frozen and hasattr(config, "freeze"):
+                            config.freeze()
+
+            habitat_read_write_mod.read_write = _compat_read_write
+            habitat_read_write_mod._dgnav_read_write_compat = True
+            habitat_config.read_write = _compat_read_write
+            habitat_core_env.read_write = _compat_read_write
+            habitat_nav_task.read_write = _compat_read_write
+    except Exception:
+        pass
+
+    # DGNav config builder expects habitat_baselines.config.default._C in old
+    # Habitat-Baselines releases.
+    try:
+        import habitat_baselines.config.default as hb_default
+        from yacs.config import CfgNode as CN
+
+        if not hasattr(hb_default, "_C"):
+            hb_default._C = CN()
+    except Exception:
+        pass
+
+
+_prepend_local_habitat_paths()
+_patch_habitat_legacy_config_api()
+
 import numpy as np
 import torch
 from habitat import logger
