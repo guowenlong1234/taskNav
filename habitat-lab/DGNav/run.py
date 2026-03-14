@@ -28,7 +28,7 @@ def _patch_habitat_legacy_config_api() -> None:
     on Habitat-Lab/Baselines 0.3.x.
     """
     try:
-        from omegaconf import DictConfig
+        from yacs.config import CfgNode
 
         import habitat
         import habitat.config as habitat_config
@@ -43,12 +43,14 @@ def _patch_habitat_legacy_config_api() -> None:
             "habitat.config.read_write"
         )
 
+        # Keep legacy Habitat Config symbol compatible with checkpoints
+        # serialized from YACS-based Habitat versions.
         if not hasattr(habitat, "Config"):
-            habitat.Config = DictConfig
+            habitat.Config = CfgNode
         if not hasattr(habitat_config, "Config"):
-            habitat_config.Config = DictConfig
+            habitat_config.Config = CfgNode
         if not hasattr(habitat_config_default, "Config"):
-            habitat_config_default.Config = DictConfig
+            habitat_config_default.Config = CfgNode
         if not hasattr(habitat_core_utils, "try_cv2_import"):
             def _try_cv2_import():
                 import cv2

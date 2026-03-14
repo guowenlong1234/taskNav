@@ -200,7 +200,14 @@ class EffoNavDinoV2Encoder(nn.Module):
             return None, f"checkpoint not found: {ckpt_path}"
 
         self._patch_torch_load_compat()
-        raw_ckpt = torch.load(ckpt_path, map_location="cpu")
+        try:
+            raw_ckpt = torch.load(ckpt_path, map_location="cpu")
+        except Exception as e:
+            err_msg = e.args[0] if len(getattr(e, "args", [])) > 0 else repr(e)
+            return None, (
+                "torch.load failed for projector checkpoint "
+                f"({type(e).__name__}: {err_msg})"
+            )
         state_dict = raw_ckpt
         if isinstance(raw_ckpt, dict):
             for maybe_key in ["state_dict", "model_state_dict", "model", "net"]:
