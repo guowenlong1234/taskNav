@@ -65,6 +65,68 @@ class RLTrainer(BaseVLNCETrainer):
         self.max_len = int(config.IL.max_traj_len) #  * 0.97 transfered gt path got 0.96 spl
         # Used to accumulate dynamic graph weight statistics (every 200 iterations)
         self.dynamic_graph_weight_history = {}  # {layer_idx: {'w1': [], 'w2': [], 'w3': []}}
+        # Dedicated rollout timing log (lightweight, train-only).
+        self._perf_timing_fh = None
+        self._perf_timing_path = None
+        self._train_rollout_counter = 0
+
+    def _init_perf_timing_log(self):
+        if self.local_rank != 0:
+            return
+        perf_dir = os.path.join(self.config.CHECKPOINT_FOLDER, "perf_timing")
+        os.makedirs(perf_dir, exist_ok=True)
+        exp_name = getattr(self.config, "EXP_NAME", "exp")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self._perf_timing_path = os.path.join(
+            perf_dir, f"{exp_name}_train_rollout_timing_rank{self.local_rank}_{ts}.log"
+        )
+        self._perf_timing_fh = open(
+            self._perf_timing_path, "a", encoding="utf-8", buffering=1
+        )
+        self._train_rollout_counter = 0
+        self._perf_timing_fh.write(
+            "timestamp,rollout_id,steps,env_instances_avg,total_actions,"
+            "waypoint_s,env_call_at_s,navigation_s,env_step_s,"
+            "tracked_total_s,rollout_total_s,"
+            "waypoint_pct,env_call_at_pct,navigation_pct,env_step_pct,"
+            "call_at_requests\n"
+        )
+        logger.info(f"Perf timing log file: {self._perf_timing_path}")
+
+    def _close_perf_timing_log(self):
+        if self._perf_timing_fh is not None:
+            self._perf_timing_fh.close()
+            self._perf_timing_fh = None
+
+    def _write_perf_timing_log(self, timing_info):
+        if self.local_rank != 0 or self._perf_timing_fh is None:
+            return
+        tracked_total = (
+            timing_info["waypoint"]
+            + timing_info["env_call_at"]
+            + timing_info["navigation"]
+            + timing_info["env_step"]
+        )
+        denom = tracked_total if tracked_total > 1e-8 else 1.0
+        line = (
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')},"
+            f"{timing_info['rollout_id']},"
+            f"{timing_info['steps']},"
+            f"{timing_info['env_instances_avg']:.3f},"
+            f"{timing_info['total_actions']},"
+            f"{timing_info['waypoint']:.6f},"
+            f"{timing_info['env_call_at']:.6f},"
+            f"{timing_info['navigation']:.6f},"
+            f"{timing_info['env_step']:.6f},"
+            f"{tracked_total:.6f},"
+            f"{timing_info['rollout_total']:.6f},"
+            f"{timing_info['waypoint'] / denom * 100.0:.2f},"
+            f"{timing_info['env_call_at'] / denom * 100.0:.2f},"
+            f"{timing_info['navigation'] / denom * 100.0:.2f},"
+            f"{timing_info['env_step'] / denom * 100.0:.2f},"
+            f"{timing_info['env_call_at_requests']}\n"
+        )
+        self._perf_timing_fh.write(line)
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
@@ -325,7 +387,29 @@ class RLTrainer(BaseVLNCETrainer):
         action_space: Space,
         create_optimizer: bool = True,
     ):
+        #如果检查点中有三层mlp权重，优先从检查点中加载三层权重
         start_iter = 0
+        projector_primary_ckpt = ""
+        if load_from_ckpt:
+            if getattr(config.IL, "is_requeue", False):
+                import glob
+
+                ckpt_list = list(
+                    filter(
+                        os.path.isfile,
+                        glob.glob(os.path.join(config.CHECKPOINT_FOLDER, "*")),
+                    )
+                )
+                if len(ckpt_list) > 0:
+                    ckpt_list.sort(key=os.path.getmtime)
+                    projector_primary_ckpt = ckpt_list[-1]
+            else:
+                projector_primary_ckpt = getattr(config.IL, "ckpt_to_load", "")
+
+        config.defrost()
+        config.MODEL.projector_ckpt_path = projector_primary_ckpt
+        config.freeze()
+
         policy = baseline_registry.get_policy(self.config.MODEL.policy_name)
         self.policy = policy.from_config(
             config=config,
@@ -672,27 +756,33 @@ class RLTrainer(BaseVLNCETrainer):
 
         self.scaler = GradScaler()
         logger.info('Traning Starts... GOOD LUCK!')
-        for idx in range(start_iter, total_iter, log_every):
-            interval = min(log_every, max(total_iter-idx, 0))
-            cur_iter = idx + interval
 
-            sample_ratio = self.config.IL.sample_ratio ** (idx // self.config.IL.decay_interval + 1)
-            # sample_ratio = self.config.IL.sample_ratio ** (idx // self.config.IL.decay_interval)
-            logs = self._train_interval(interval, self.config.IL.ml_weight, sample_ratio)
+        #记录个部分的运行时间，方便做性能分析
+        self._init_perf_timing_log()
+        try:
+            for idx in range(start_iter, total_iter, log_every):
+                interval = min(log_every, max(total_iter-idx, 0))
+                cur_iter = idx + interval
 
-            if self.local_rank < 1:
-                loss_str = f'iter {cur_iter}: '
-                for k, v in logs.items():
-                    logs[k] = np.mean(v)
-                    loss_str += f'{k}: {logs[k]:.3f}, '
-                    writer.add_scalar(f'loss/{k}', logs[k], cur_iter)
-                logger.info(loss_str)
-                self.save_checkpoint(cur_iter)
-                
-                # If dynamic graph or node gating is enabled, save weight information every 200 iterations
-                if (getattr(self.config.MODEL, 'use_dynamic_graph', False) or 
-                    getattr(self.config.MODEL, 'use_node_gating', False)) and cur_iter % 200 == 0:
-                    self.save_dynamic_graph_weights(cur_iter)
+                sample_ratio = self.config.IL.sample_ratio ** (idx // self.config.IL.decay_interval + 1)
+                # sample_ratio = self.config.IL.sample_ratio ** (idx // self.config.IL.decay_interval)
+                logs = self._train_interval(interval, self.config.IL.ml_weight, sample_ratio)
+
+                if self.local_rank < 1:
+                    loss_str = f'iter {cur_iter}: '
+                    for k, v in logs.items():
+                        logs[k] = np.mean(v)
+                        loss_str += f'{k}: {logs[k]:.3f}, '
+                        writer.add_scalar(f'loss/{k}', logs[k], cur_iter)
+                    logger.info(loss_str)
+                    self.save_checkpoint(cur_iter)
+                    
+                    # If dynamic graph or node gating is enabled, save weight information every 200 iterations
+                    if (getattr(self.config.MODEL, 'use_dynamic_graph', False) or 
+                        getattr(self.config.MODEL, 'use_node_gating', False)) and cur_iter % 200 == 0:
+                        self.save_dynamic_graph_weights(cur_iter)
+        finally:
+            self._close_perf_timing_log()
         
     def _train_interval(self, interval, ml_weight, sample_ratio):
         #切换到训练模式
@@ -1101,9 +1191,30 @@ class RLTrainer(BaseVLNCETrainer):
         #初始化每个环境上一时刻所在 viewpoint
         prev_vp = [None] * self.envs.num_envs
 
+        timing_enabled = (
+            mode == 'train'
+            and self.local_rank == 0
+            and self._perf_timing_fh is not None
+        )
+        if timing_enabled:
+            rollout_t0 = time.perf_counter()
+            timing_acc = {
+                'waypoint': 0.0,
+                'env_call_at': 0.0,
+                'navigation': 0.0,
+                'env_step': 0.0,
+            }
+            step_counter = 0
+            env_instance_sum = 0
+            env_call_at_requests = 0
+
         #对于每一个时间步K
         for stepk in range(self.max_len):
             total_actions += self.envs.num_envs
+            #性能分析使用
+            if timing_enabled:
+                step_counter += 1
+                env_instance_sum += self.envs.num_envs
 
             #只取出还没有停止的环境的对应指令和编码
             txt_masks = all_txt_masks[not_done_index]
@@ -1126,6 +1237,8 @@ class RLTrainer(BaseVLNCETrainer):
             }
             输出一组相对位置，极坐标表示形式
             '''
+            if timing_enabled:  #性能分析使用
+                t_waypoint = time.perf_counter()
             wp_outputs = self.policy.net(
                 mode = "waypoint",
                 waypoint_predictor = self.waypoint_predictor,
@@ -1152,6 +1265,8 @@ class RLTrainer(BaseVLNCETrainer):
             #这一步是在把一整圈全景视角 token，压缩成“当前节点的单个全景摘要表示”。[B, L, H] -> [B, H],将12个视角特征进行融合
             avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
                               torch.sum(pano_masks, 1, keepdim=True)
+            if timing_enabled:  #性能分析使用
+                timing_acc['waypoint'] += (time.perf_counter() - t_waypoint)
 
             # get vp_id, vp_pos of cur_node and cand_ndoe
             cur_pos, cur_ori = self.get_pos_ori()   #批量读取当前 agent 的位置和朝向，并分别整理成两个列表返回
@@ -1168,13 +1283,19 @@ class RLTrainer(BaseVLNCETrainer):
             
             if mode == 'train' or self.config.VIDEO_OPTION:
                 #获取真实的位置和朝向
+                if timing_enabled:
+                    t_call_at = time.perf_counter()
                 cand_real_pos = []
                 for i in range(self.envs.num_envs):
+                    if timing_enabled:
+                        env_call_at_requests += len(wp_outputs['cand_angles'][i])
                     cand_real_pos_i = [
                         self.envs.call_at(i, "get_cand_real_pos", {"angle": ang, "forward": dis})
                         for ang, dis in zip(wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i])
                     ]
                     cand_real_pos.append(cand_real_pos_i)
+                if timing_enabled:
+                    timing_acc['env_call_at'] += (time.perf_counter() - t_call_at)
             else:
                 cand_real_pos = [None] * self.envs.num_envs
 
@@ -1354,7 +1475,8 @@ class RLTrainer(BaseVLNCETrainer):
 
             ##cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
             #把已经更新好的图，打包成下一步全局导航决策所需的输入表示。
-
+            if timing_enabled:
+                t_navigation = time.perf_counter()
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)  
         #             return {
         #     'gmap_vp_ids': batch_gmap_vp_ids, #图里有哪些点
@@ -1374,6 +1496,8 @@ class RLTrainer(BaseVLNCETrainer):
             no_vp_left = nav_inputs.pop('no_vp_left')
 
             nav_outs = self.policy.net(**nav_inputs)
+            if timing_enabled:
+                timing_acc['navigation'] += (time.perf_counter() - t_navigation)
 
         # outs = {
         #     'gmap_embeds': gmap_embeds, #经过全局图导航编码器更新后的图节点表示[B, L, H]
@@ -1505,7 +1629,11 @@ class RLTrainer(BaseVLNCETrainer):
                     if self.config.MODEL.consume_ghost:
                         gmap.delete_ghost(ghost_vp)
 
+            if timing_enabled:
+                t_env_step = time.perf_counter()
             outputs = self.envs.step(env_actions)   #发送给环境，有一个返还观测
+            if timing_enabled:
+                timing_acc['env_step'] += (time.perf_counter() - t_env_step)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
 
             # calculate metric
@@ -1592,6 +1720,24 @@ class RLTrainer(BaseVLNCETrainer):
             observations = extract_instruction_tokens(observations,self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID)
             batch = batch_obs(observations, self.device)
             batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if timing_enabled:
+            self._train_rollout_counter += 1
+            rollout_total = time.perf_counter() - rollout_t0
+            self._write_perf_timing_log(
+                {
+                    'rollout_id': self._train_rollout_counter,
+                    'steps': step_counter,
+                    'env_instances_avg': env_instance_sum / max(step_counter, 1),
+                    'total_actions': total_actions,
+                    'waypoint': timing_acc['waypoint'],
+                    'env_call_at': timing_acc['env_call_at'],
+                    'navigation': timing_acc['navigation'],
+                    'env_step': timing_acc['env_step'],
+                    'rollout_total': rollout_total,
+                    'env_call_at_requests': env_call_at_requests,
+                }
+            )
 
         if mode == 'train': #如果是训练模式下，统计损失信息。
             loss = ml_weight * loss / total_actions

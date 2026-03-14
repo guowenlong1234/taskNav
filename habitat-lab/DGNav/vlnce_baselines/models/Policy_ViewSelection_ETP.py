@@ -1,10 +1,10 @@
 from copy import deepcopy
+import os
 import numpy as np
 import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from gym import Space
 from habitat import Config
 from habitat_baselines.common.baseline_registry import baseline_registry
@@ -75,6 +75,213 @@ class Critic(nn.Module):
     def forward(self, state):
         return self.state2value(state).squeeze()
 
+
+class EffoNavDinoV2Encoder(nn.Module):
+    """DINOv2 backbone from EffoNav + 3-layer MLP projector."""
+
+    def __init__(
+        self,
+        device,
+        output_dim=512,
+        repo_path=None,
+        weights_path=None,
+        projector_ckpt_path=None,
+        projector_fallback_ckpt_path=None,
+    ):
+        super().__init__()
+        self.is_blind = False   #不是盲的
+        self.device = device    #
+        self.projector_ckpt_path = projector_ckpt_path  #主加载路径（优先使用当前评估/恢复ckpt）
+        self.projector_fallback_ckpt_path = projector_fallback_ckpt_path  #回退路径（通常是pretrained_path）
+        self.projector_loaded = False       #初始化状态，是否加载成功projector权重
+        self.projector_load_msg = "not requested"   #初始化日志字符串。后面会更新成实际结果
+        self.projector_load_source = "none"
+        self._debug_rgb_stats_printed = False
+
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        default_repo_path = os.path.join(
+            module_dir, "train", "models", "EffoNav", "dinov2"
+        )
+        default_weights_path = os.path.join(
+            default_repo_path, "weights", "dinov2_vits14_pretrain.pth"
+        )
+
+        self.repo_path = repo_path or default_repo_path
+        self.weights_path = weights_path or default_weights_path
+
+        #找不到权重参数或加载点路径就报错
+        if not os.path.isdir(self.repo_path):
+            raise FileNotFoundError(f"DINOv2 repo path not found: {self.repo_path}")
+        if not os.path.isfile(self.weights_path):
+            raise FileNotFoundError(
+                f"DINOv2 pretrained weights not found: {self.weights_path}"
+            )
+
+        # Load local DINOv2 backbone (ViT-S/14) and freeze it.
+        self.backbone = torch.hub.load(
+            self.repo_path,
+            "dinov2_vits14",
+            source="local",
+            pretrained=False,
+        )
+
+        # Compatibility for loading weights serialized by newer torch versions.
+        self._patch_torch_load_compat()
+
+        state_dict = torch.load(self.weights_path, map_location="cpu")
+        self.backbone.load_state_dict(state_dict, strict=True)
+        self.backbone.eval()
+        self.backbone.to(self.device)
+        for param in self.backbone.parameters():
+            param.requires_grad_(False)
+
+        # DINOv2 ViT-S/14 outputs 384-dim cls token -> project to 512 for downstream.
+        self.rgb_projector = nn.Sequential(
+            nn.Linear(384, 768),
+            nn.ReLU(inplace=True),
+            nn.Linear(768, 768),
+            nn.ReLU(inplace=True),
+            nn.Linear(768, output_dim),
+        )
+        self._load_projector_with_fallback(
+            primary_ckpt_path=self.projector_ckpt_path,
+            fallback_ckpt_path=self.projector_fallback_ckpt_path,
+        )
+
+        from torchvision import transforms
+
+        self.rgb_transform = torch.nn.Sequential(
+            transforms.ConvertImageDtype(torch.float),
+            transforms.Normalize(
+                [0.485, 0.456, 0.406],
+                [0.229, 0.224, 0.225],
+            ),
+        )
+
+    def forward(self, observations):
+        if not self._debug_rgb_stats_printed:
+            rgb_raw = observations["rgb"]
+            print(
+                "[DGNav][DINO RGB DEBUG] "
+                f"dtype={rgb_raw.dtype}, min={rgb_raw.min().item():.4f}, "
+                f"max={rgb_raw.max().item():.4f}, shape={tuple(rgb_raw.shape)}"
+            )
+            self._debug_rgb_stats_printed = True
+
+        rgb_observations = observations["rgb"].permute(0, 3, 1, 2)
+        rgb_observations = self.rgb_transform(rgb_observations)
+
+        with torch.no_grad():
+            dino_feats = self.backbone(rgb_observations.contiguous())
+
+        rgb_feats = self.rgb_projector(dino_feats.float())
+        return rgb_feats
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep pretrained DINOv2 in eval mode; only projector follows outer mode.
+        self.backbone.eval()
+        return self
+
+    @staticmethod
+    def _patch_torch_load_compat():
+        import torch._tensor as torch_tensor
+
+        if (
+            not hasattr(torch_tensor, "_rebuild_from_type_v2")
+            and hasattr(torch_tensor, "_rebuild_from_type")
+        ):
+            torch_tensor._rebuild_from_type_v2 = torch_tensor._rebuild_from_type
+
+    def _extract_projector_state_from_checkpoint(self, ckpt_path):
+        if not ckpt_path:
+            return None, "checkpoint path is empty"
+        if not os.path.isfile(ckpt_path):
+            return None, f"checkpoint not found: {ckpt_path}"
+
+        self._patch_torch_load_compat()
+        raw_ckpt = torch.load(ckpt_path, map_location="cpu")
+        state_dict = raw_ckpt
+        if isinstance(raw_ckpt, dict):
+            for maybe_key in ["state_dict", "model_state_dict", "model", "net"]:
+                if maybe_key in raw_ckpt and isinstance(raw_ckpt[maybe_key], dict):
+                    state_dict = raw_ckpt[maybe_key]
+                    break
+        if not isinstance(state_dict, dict):
+            return None, (
+                f"unsupported checkpoint format for projector load: {type(state_dict)}"
+            )
+
+        projector_prefixes = [
+            # Fine-tune checkpoints (DGNav policy state_dict)
+            "net.rgb_encoder.rgb_projector.",
+            "rgb_encoder.rgb_projector.",
+            # Pretrain checkpoints (VLN-BERT image embeddings)
+            "bert.img_embeddings.rgb_projector.",
+            "img_embeddings.rgb_projector.",
+            "net.bert.img_embeddings.rgb_projector.",
+        ]
+        projector_state = {}
+        for key, value in state_dict.items():
+            normalized_key = key[7:] if key.startswith("module.") else key
+            for prefix in projector_prefixes:
+                if normalized_key.startswith(prefix):
+                    projector_state[normalized_key[len(prefix) :]] = value
+                    break
+
+        if len(projector_state) == 0:
+            return None, "no rgb_projector weights found in checkpoint"
+
+        expected_keys = set(self.rgb_projector.state_dict().keys())
+        loaded_keys = set(projector_state.keys())
+        missing_keys = sorted(expected_keys - loaded_keys)
+        unexpected_keys = sorted(loaded_keys - expected_keys)
+        if len(missing_keys) > 0 or len(unexpected_keys) > 0:
+            return None, (
+                "projector weights partially loaded "
+                f"(missing={missing_keys}, unexpected={unexpected_keys})"
+            )
+
+        self.rgb_projector.load_state_dict(projector_state, strict=True)
+        return projector_state, "ok"
+
+    def _load_projector_with_fallback(self, primary_ckpt_path, fallback_ckpt_path):
+        attempted = []
+
+        if primary_ckpt_path:
+            attempted.append(("primary", primary_ckpt_path))
+        if fallback_ckpt_path and fallback_ckpt_path != primary_ckpt_path:
+            attempted.append(("fallback", fallback_ckpt_path))
+
+        if len(attempted) == 0:
+            self.projector_load_msg = "no projector checkpoint configured; keep random init"
+            self.projector_load_source = "none"
+            return
+
+        failure_msgs = []
+        for source_name, ckpt_path in attempted:
+            _, status = self._extract_projector_state_from_checkpoint(ckpt_path)
+            if status == "ok":
+                self.projector_loaded = True
+                self.projector_load_source = source_name
+                self.projector_load_msg = (
+                    f"projector weights loaded from {source_name} checkpoint: {ckpt_path}"
+                )
+                return
+            failure_msgs.append(f"{source_name}({ckpt_path}): {status}")
+
+        self.projector_load_source = "none"
+        self.projector_load_msg = (
+            "projector load failed; keep random init; " + " | ".join(failure_msgs)
+        )
+
+    # Backward-compatible alias for older call sites.
+    def _try_load_projector_from_checkpoint(self, ckpt_path):
+        self._load_projector_with_fallback(
+            primary_ckpt_path=ckpt_path,
+            fallback_ckpt_path=None,
+        )
+
 class ETP(Net):
     def __init__(
         self, observation_space: Space, model_config: Config, num_actions,
@@ -136,8 +343,47 @@ class ETP(Net):
         #         spatial_output=model_config.spatial_output,
         #     )
 
-        #实例化一个CLIP视觉编码器
-        self.rgb_encoder = CLIPEncoder(self.device)
+        # Instantiate RGB backbone according to config.
+        if model_config.rgb_feature_extractor == "clip":
+            self.rgb_encoder = CLIPEncoder(self.device)
+            print(
+                "\n" + "=" * 72 +
+                "\n[DGNav][Vision Backbone] Using CLIPEncoder (ViT-B/32)"
+                "\n" + "=" * 72
+            )
+        elif model_config.rgb_feature_extractor == "dino":
+            if getattr(model_config, "dino", "EffoNav") != "EffoNav":
+                raise NotImplementedError(
+                    f"Unsupported dino config: {model_config.dino}"
+                )
+            self.rgb_encoder = EffoNavDinoV2Encoder(
+                device=self.device,
+                output_dim=512,
+                repo_path=getattr(model_config, "dino_repo_path", None),
+                weights_path=getattr(model_config, "dino_weights_path", None),
+                projector_ckpt_path=getattr(
+                    model_config, "projector_ckpt_path", None
+                ),
+                projector_fallback_ckpt_path=getattr(
+                    model_config, "pretrained_path", None
+                ),
+            )
+            print(
+                "\n" + "=" * 72 +
+                "\n[DGNav][Vision Backbone] Using DINOv2 (EffoNav) + 3-layer MLP"
+                f"\n[DGNav][Vision Backbone] DINO repo: {self.rgb_encoder.repo_path}"
+                f"\n[DGNav][Vision Backbone] DINO weights: {self.rgb_encoder.weights_path}"
+                f"\n[DGNav][Vision Backbone] Projector primary ckpt: {self.rgb_encoder.projector_ckpt_path}"
+                f"\n[DGNav][Vision Backbone] Projector fallback ckpt: {self.rgb_encoder.projector_fallback_ckpt_path}"
+                f"\n[DGNav][Vision Backbone] Projector source: {self.rgb_encoder.projector_load_source}"
+                f"\n[DGNav][Vision Backbone] Projector load: {self.rgb_encoder.projector_load_msg}"
+                "\n" + "=" * 72
+            )
+        else:
+            raise ValueError(
+                f"Unsupported rgb_feature_extractor: {model_config.rgb_feature_extractor}"
+            )
+
         self.space_pool_rgb = nn.Sequential(nn.AdaptiveAvgPool2d((1,1)), nn.Flatten(start_dim=2))
     
         self.pano_img_idxes = np.arange(0, 12, dtype=np.int64)        # Counter-clockwise
@@ -150,7 +396,7 @@ class ETP(Net):
 
     @property
     def is_blind(self):
-        return self.rgb_encoder.is_blind or self.depth_encoder.is_blind
+        return getattr(self.rgb_encoder, "is_blind", False) or self.depth_encoder.is_blind
 
     @property
     def num_recurrent_layers(self):

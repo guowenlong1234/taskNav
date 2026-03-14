@@ -70,6 +70,8 @@ MODEL:
   task_type: rxr
 
   policy_name: PolicyViewSelectionETP
+  rgb_feature_extractor: clip
+  dino: EffoNav
   NUM_ANGLES: 12
   pretrained_path: pretrained/ETP/mlm.sap_rxr/ckpts/model_step_90000.pt
   fix_lang_embedding: False

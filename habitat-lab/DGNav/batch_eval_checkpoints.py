@@ -10,13 +10,20 @@ Features:
 """
 
 '''
-python batch_eval_checkpoints.py \
-  --ckpt-dir data/logs/checkpoints/release_r2r \
+taskset -c 15-27 python batch_eval_checkpoints.py \
+  --ckpt-dir /home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/checkpoints/release_r2r_dino_best_gacc/ \
   --dataset r2r \
-  --split val_unseen
+  --split val_unseen \
+  --parallel-jobs 1 \
+  --num-envs 6 \
+  --run-name release_r2r_dino_best_gacc
+
+tensorboard --logdir /home/gwl/project/DGNav_new/habitat-lab/DGNav/batch_eval_results/release_r2r_dino_best_gacc/tensorboard
+
 
 '''
 import argparse
+import concurrent.futures as cf
 import csv
 import json
 import math
@@ -40,6 +47,14 @@ try:
     HAS_MATPLOTLIB = True
 except Exception:
     HAS_MATPLOTLIB = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+
+    HAS_TB_WRITER = True
+except Exception:
+    SummaryWriter = None
+    HAS_TB_WRITER = False
 
 
 DATASET_DEFAULTS = {
@@ -123,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         help="GPU id used for evaluation.",
     )
     parser.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="Comma-separated GPU ids for parallel evaluation. Defaults to --gpu-id.",
+    )
+    parser.add_argument(
         "--num-envs",
         type=int,
         default=8,
@@ -177,6 +198,15 @@ def parse_args() -> argparse.Namespace:
         help="Output directory (default: batch_eval_results/<timestamp>).",
     )
     parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help=(
+            "Custom output folder name under batch_eval_results. "
+            "If set, output becomes batch_eval_results/<dataset>_<run-name>."
+        ),
+    )
+    parser.add_argument(
         "--python-bin",
         type=str,
         default=sys.executable,
@@ -187,6 +217,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Per-checkpoint timeout in seconds (0 means no timeout).",
+    )
+    parser.add_argument(
+        "--parallel-jobs",
+        type=int,
+        default=1,
+        help="How many checkpoints to evaluate concurrently.",
+    )
+    parser.add_argument(
+        "--poll-interval-sec",
+        type=int,
+
+default=5,
+        help="Polling interval in seconds for checking new checkpoints.",
+    )
+    parser.add_argument(
+        "--idle-timeout-sec",
+        type=int,
+        default=40 * 60,
+        help="Exit after waiting this long without any new checkpoint.",
     )
     parser.add_argument(
         "--skip-param-plot",
@@ -209,6 +258,12 @@ def parse_args() -> argparse.Namespace:
 
 def now_ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def sanitize_run_name(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[^0-9A-Za-z._-]+", "_", name)
+    return name.strip("_")
 
 
 def log(message: str) -> None:
@@ -316,6 +371,28 @@ def iter_checkpoint_files(
                     yield p
 
 
+def discover_checkpoint_items(
+    ckpt_dir: Path,
+    patterns: Sequence[str],
+    recursive: bool,
+    step_min: Optional[int],
+    step_max: Optional[int],
+    forced_kind: str,
+) -> List[CkptItem]:
+    items: List[CkptItem] = []
+    for p in iter_checkpoint_files(ckpt_dir, patterns, recursive):
+        step = parse_step_from_name(p.name)
+        if step_min is not None and step >= 0 and step < step_min:
+            continue
+        if step_max is not None and step >= 0 and step > step_max:
+            continue
+        kind = detect_ckpt_kind(p, forced_kind)
+        items.append(CkptItem(path=p.resolve(), step=step, kind=kind))
+
+    items.sort(key=lambda x: (x.step if x.step >= 0 else 10**18, x.path.name))
+    return items
+
+
 def load_json(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -340,6 +417,54 @@ def should_minimize(metric_name: str, mode: str) -> bool:
     if mode == "max":
         return False
     return metric_name in MINIMIZE_METRICS
+
+
+def _metric_value_for_best(row: Dict, metric_name: str) -> Optional[float]:
+    metrics = row.get("metrics") or {}
+    if metric_name == "sr":
+        value = metrics.get("sr")
+        if not isinstance(value, (int, float)):
+            value = metrics.get("success")
+    else:
+        value = metrics.get(metric_name)
+    if not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def find_best_so_far(rows: List[Dict], metric_name: str) -> Tuple[Optional[Dict], Optional[float]]:
+    best_row = None
+    best_val = None
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        val = _metric_value_for_best(row, metric_name)
+        if val is None:
+            continue
+        if best_row is None or val > best_val:
+            best_row = row
+            best_val = val
+        elif val == best_val and row.get("step", -1) > best_row.get("step", -1):
+            # Tie-break with newer checkpoint step.
+            best_row = row
+            best_val = val
+    return best_row, best_val
+
+
+def parse_gpu_ids(gpu_ids_arg: Optional[str], gpu_id: int) -> List[int]:
+    if gpu_ids_arg is None:
+        return [gpu_id]
+
+    ids: List[int] = []
+    for chunk in gpu_ids_arg.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        ids.append(int(chunk))
+
+    if not ids:
+        return [gpu_id]
+    return ids
 
 
 def find_eval_metrics_file(exp_dir: Path, split: str) -> Optional[Path]:
@@ -373,7 +498,7 @@ def build_eval_ckpt_path(
       pretrained_override: MODEL.pretrained_path override for pretrain ckpt
     """
     step = item.step if item.step >= 0 else seq_idx
-    eval_name = f"ckpt.iter{step}.pth"
+    eval_name = f"ckpt.iter{step}.seq{seq_idx}.pth"
     eval_path = temp_ckpt_dir / eval_name
 
     if item.kind == "finetune":
@@ -391,6 +516,95 @@ def build_eval_ckpt_path(
     }
     torch.save(adapter, eval_path)
     return eval_path, item.path
+
+
+def evaluate_checkpoint_item(
+    item: CkptItem,
+    order_idx: int,
+    *,
+    project_root: Path,
+    python_bin: str,
+    dataset: str,
+    exp_config: str,
+    split: str,
+    gpu_id: int,
+    num_envs: int,
+    episode_count: int,
+    out_root: Path,
+    timeout: int,
+    temp_ckpt_dir: Path,
+    skip_param_plot: bool,
+) -> Dict:
+    step = item.step if item.step >= 0 else order_idx
+    exp_name = f"batch_eval_{dataset}_{step}_{order_idx}"
+    log_file = out_root / "logs" / f"{order_idx:03d}_step{step}_{item.path.stem}.log"
+
+    eval_ckpt_path, pretrained_override = build_eval_ckpt_path(
+        item=item,
+        temp_ckpt_dir=temp_ckpt_dir,
+        seq_idx=order_idx,
+    )
+
+    rc = -1
+    elapsed = 0.0
+    error = ""
+    metrics: Dict[str, float] = {}
+
+    try:
+        rc, elapsed = run_one_eval(
+            project_root=project_root,
+            python_bin=python_bin,
+            exp_name=exp_name,
+            exp_config=exp_config,
+            split=split,
+            eval_ckpt_path=eval_ckpt_path,
+            pretrained_override=pretrained_override,
+            gpu_id=gpu_id,
+            num_envs=num_envs,
+            episode_count=episode_count,
+            out_root=out_root,
+            timeout=timeout,
+            log_path=log_file,
+        )
+        if rc == 0:
+            exp_dir = out_root / "eval_results" / exp_name
+            metrics_file = find_eval_metrics_file(exp_dir, split)
+            if metrics_file is None:
+                rc = 99
+                error = f"Metrics file not found in {exp_dir}"
+            else:
+                metrics = load_json(metrics_file)
+                if "success" in metrics and "sr" not in metrics:
+                    metrics["sr"] = metrics["success"]
+    except subprocess.TimeoutExpired:
+        rc = 124
+        elapsed = timeout
+        error = f"Timeout after {timeout}s"
+    except Exception as e:
+        rc = 1
+        error = str(e)
+
+    param_values = {}
+    if rc == 0 and not skip_param_plot:
+        try:
+            param_values = extract_major_param_values(item.path, item.kind)
+        except Exception:
+            param_values = {}
+
+    return {
+        "order_idx": order_idx,
+        "checkpoint": str(item.path),
+        "step": step,
+        "kind": item.kind,
+        "gpu_id": gpu_id,
+        "status": "ok" if rc == 0 else "failed",
+        "return_code": rc,
+        "elapsed_sec": elapsed,
+        "metrics": metrics,
+        "param_values": param_values,
+        "log_file": str(log_file),
+        "error": error,
+    }
 
 
 def run_one_eval(
@@ -692,33 +906,45 @@ def main() -> None:
     split = args.split or defaults["split"]
     best_metric = args.best_metric or defaults["best_metric"]
     minimize = should_minimize(best_metric, args.best_mode)
+    parallel_jobs = max(1, args.parallel_jobs)
+    gpu_ids = parse_gpu_ids(args.gpu_ids, args.gpu_id)
 
     if args.output_dir:
         out_dir = Path(args.output_dir).expanduser().resolve()
+    elif args.run_name:
+        safe_name = sanitize_run_name(args.run_name)
+        if not safe_name:
+            raise ValueError("--run-name contains no valid characters after sanitize.")
+        out_dir = (project_root / "batch_eval_results" / f"{args.dataset}_{safe_name}").resolve()
     else:
         out_dir = (project_root / "batch_eval_results" / f"{args.dataset}_{now_ts()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "logs").mkdir(exist_ok=True)
     temp_ckpt_dir = out_dir / "_eval_ckpt_adapters"
     temp_ckpt_dir.mkdir(exist_ok=True)
+    agg_tb_run_dir = out_dir / "tensorboard" / "batch_eval_aggregate"
+    tb_writer = None
+    if HAS_TB_WRITER:
+        try:
+            tb_writer = SummaryWriter(log_dir=str(agg_tb_run_dir))
+        except Exception:
+            tb_writer = None
 
     patterns = [x.strip() for x in args.pattern.split(",") if x.strip()]
-    items: List[CkptItem] = []
-    for p in iter_checkpoint_files(ckpt_dir, patterns, args.recursive):
-        step = parse_step_from_name(p.name)
-        if args.step_min is not None and step >= 0 and step < args.step_min:
-            continue
-        if args.step_max is not None and step >= 0 and step > args.step_max:
-            continue
-        kind = detect_ckpt_kind(p, args.ckpt_kind)
-        items.append(CkptItem(path=p.resolve(), step=step, kind=kind))
+    poll_interval_sec = max(1, int(args.poll_interval_sec))
+    idle_timeout_sec = max(1, int(args.idle_timeout_sec))
 
-    if not items:
-        raise RuntimeError("No checkpoint file matched the conditions.")
-
-    items.sort(key=lambda x: (x.step if x.step >= 0 else 10**18, x.path.name))
+    initial_items = discover_checkpoint_items(
+        ckpt_dir=ckpt_dir,
+        patterns=patterns,
+        recursive=args.recursive,
+        step_min=args.step_min,
+        step_max=args.step_max,
+        forced_kind=args.ckpt_kind,
+    )
+    initial_found_count = len(initial_items)
     if args.max_checkpoints and args.max_checkpoints > 0:
-        items = items[: args.max_checkpoints]
+        initial_items = initial_items[: args.max_checkpoints]
 
     run_cfg = {
         "timestamp": datetime.now().isoformat(),
@@ -730,19 +956,50 @@ def main() -> None:
         "best_metric": best_metric,
         "best_mode": "min" if minimize else "max",
         "gpu_id": args.gpu_id,
+        "gpu_ids": gpu_ids,
+        "parallel_jobs": parallel_jobs,
         "num_envs": args.num_envs,
         "episode_count": args.episode_count,
-        "checkpoint_count": len(items),
+        "initial_checkpoint_count": len(initial_items),
+        "initial_found_count": initial_found_count,
         "patterns": patterns,
+        "poll_interval_sec": poll_interval_sec,
+        "idle_timeout_sec": idle_timeout_sec,
         "skip_param_plot": args.skip_param_plot,
         "python_bin": args.python_bin,
         "timeout_sec": args.timeout,
+        "run_name": args.run_name,
     }
     save_json(out_dir / "run_config.json", run_cfg)
 
     log(f"[BatchEval] Output directory: {out_dir}")
-    log(f"[BatchEval] Found {len(items)} checkpoints")
-    for idx, it in enumerate(items, 1):
+    if tb_writer is not None:
+        log(f"[BatchEval] TensorBoard aggregate run: {agg_tb_run_dir}")
+    else:
+        log("[BatchEval] TensorBoard aggregate writer unavailable; skip aggregate TB scalars.")
+    log(
+        f"[BatchEval] Initial checkpoints found: {initial_found_count}, "
+        f"scheduled at start: {len(initial_items)}"
+    )
+    log(
+        f"[BatchEval] Watch mode: poll every {poll_interval_sec}s, "
+        f"idle-timeout={hms(idle_timeout_sec)}"
+    )
+    if parallel_jobs > 1:
+        log(
+            f"[BatchEval] Parallel mode enabled: jobs={parallel_jobs}, gpu_ids={gpu_ids}"
+        )
+        if len(gpu_ids) == 1:
+            log(
+                "[BatchEval] Warning: all parallel jobs will share one GPU. "
+                "If memory or simulator contention appears, reduce --num-envs."
+            )
+        elif parallel_jobs > len(gpu_ids):
+            log(
+                "[BatchEval] Warning: parallel jobs exceed provided GPU ids; "
+                "some jobs will share GPUs."
+            )
+    for idx, it in enumerate(initial_items, 1):
         log(f"  {idx:03d}. step={it.step:<8} kind={it.kind:<8} {it.path}")
 
     if args.dry_run:
@@ -751,91 +1008,221 @@ def main() -> None:
 
     all_rows: List[Dict] = []
     start_all = time.time()
+    rows_by_order: Dict[int, Dict] = {}
+    save_json(out_dir / "results.json", {"results": all_rows})
+    pending_items: List[CkptItem] = list(initial_items)
+    pending_paths = {it.path for it in pending_items}
+    scheduled_paths = set()
+    completed_paths = set()
+    next_order_idx = 1
+    last_new_ckpt_time = time.time()
+    last_wait_log_time = 0.0
 
-    for i, item in enumerate(items, 1):
-        step = item.step if item.step >= 0 else i
-        exp_name = f"batch_eval_{args.dataset}_{step}_{i}"
-        log_file = out_dir / "logs" / f"{i:03d}_step{step}_{item.path.stem}.log"
-
-        eval_ckpt_path, pretrained_override = build_eval_ckpt_path(
-            item=item,
-            temp_ckpt_dir=temp_ckpt_dir,
-            seq_idx=i,
-        )
-
-        log(
-            f"[{i}/{len(items)}] Evaluating step={step} kind={item.kind} file={item.path.name}"
-        )
-        rc = -1
-        elapsed = 0.0
-        error = ""
-        metrics: Dict[str, float] = {}
-
-        try:
-            rc, elapsed = run_one_eval(
-                project_root=project_root,
-                python_bin=args.python_bin,
-                exp_name=exp_name,
-                exp_config=exp_config,
-                split=split,
-                eval_ckpt_path=eval_ckpt_path,
-                pretrained_override=pretrained_override,
-                gpu_id=args.gpu_id,
-                num_envs=args.num_envs,
-                episode_count=args.episode_count,
-                out_root=out_dir,
-                timeout=args.timeout,
-                log_path=log_file,
-            )
-            if rc == 0:
-                exp_dir = out_dir / "eval_results" / exp_name
-                metrics_file = find_eval_metrics_file(exp_dir, split)
-                if metrics_file is None:
-                    rc = 99
-                    error = f"Metrics file not found in {exp_dir}"
-                else:
-                    metrics = load_json(metrics_file)
-                    # Alias success to sr for easier reading.
-                    if "success" in metrics and "sr" not in metrics:
-                        metrics["sr"] = metrics["success"]
-        except subprocess.TimeoutExpired:
-            rc = 124
-            elapsed = args.timeout
-            error = f"Timeout after {args.timeout}s"
-        except Exception as e:
-            rc = 1
-            error = str(e)
-
-        param_values = {}
-        if rc == 0 and not args.skip_param_plot:
-            try:
-                # Extract from original checkpoint path.
-                param_values = extract_major_param_values(item.path, item.kind)
-            except Exception:
-                param_values = {}
-
-        row = {
-            "checkpoint": str(item.path),
-            "step": step,
-            "kind": item.kind,
-            "status": "ok" if rc == 0 else "failed",
-            "return_code": rc,
-            "elapsed_sec": elapsed,
-            "metrics": metrics,
-            "param_values": param_values,
-            "log_file": str(log_file),
-            "error": error,
-        }
-        all_rows.append(row)
+    def persist_rows() -> None:
+        nonlocal all_rows
+        all_rows = [rows_by_order[k] for k in sorted(rows_by_order)]
         save_json(out_dir / "results.json", {"results": all_rows})
 
-        if rc == 0:
-            score = metrics.get(best_metric, None)
-            score_msg = "N/A" if score is None else f"{score:.6f}"
-            log(f"    -> done in {hms(elapsed)}; {best_metric}={score_msg}")
-            log(f"    -> metrics: {format_metrics(metrics)}")
-        else:
-            log(f"    -> failed (rc={rc}) in {hms(elapsed)}; {error}")
+    with cf.ThreadPoolExecutor(max_workers=parallel_jobs) as executor:
+        future_to_meta = {}
+        while True:
+            # Discover newly created checkpoints.
+            discovered = discover_checkpoint_items(
+                ckpt_dir=ckpt_dir,
+                patterns=patterns,
+                recursive=args.recursive,
+                step_min=args.step_min,
+                step_max=args.step_max,
+                forced_kind=args.ckpt_kind,
+            )
+            new_items = []
+            for item in discovered:
+                if item.path in pending_paths or item.path in scheduled_paths or item.path in completed_paths:
+                    continue
+                new_items.append(item)
+
+            if new_items:
+                if args.max_checkpoints and args.max_checkpoints > 0:
+                    remain = args.max_checkpoints - (
+                        len(pending_items) + len(scheduled_paths) + len(completed_paths)
+                    )
+                    if remain <= 0:
+                        new_items = []
+                    else:
+                        new_items = new_items[:remain]
+
+                if new_items:
+                    pending_items.extend(new_items)
+                    pending_items.sort(
+                        key=lambda x: (x.step if x.step >= 0 else 10**18, x.path.name)
+                    )
+                    pending_paths.update(it.path for it in new_items)
+                    last_new_ckpt_time = time.time()
+                    log(f"[BatchEval] Detected {len(new_items)} new checkpoint(s).")
+                    for it in new_items:
+                        log(
+                            f"  + step={it.step:<8} kind={it.kind:<8} {it.path.name}"
+                        )
+
+            # Schedule pending items.
+            while pending_items and len(future_to_meta) < parallel_jobs:
+                if args.max_checkpoints and args.max_checkpoints > 0:
+                    if len(scheduled_paths) + len(completed_paths) >= args.max_checkpoints:
+                        break
+                item = pending_items.pop(0)
+                pending_paths.discard(item.path)
+                order_idx = next_order_idx
+                next_order_idx += 1
+                step = item.step if item.step >= 0 else order_idx
+                gpu_id = gpu_ids[(order_idx - 1) % len(gpu_ids)]
+                scheduled_paths.add(item.path)
+
+                log(
+                    f"[schedule {order_idx}] step={step} kind={item.kind} "
+                    f"gpu={gpu_id} file={item.path.name}"
+                )
+                future = executor.submit(
+                    evaluate_checkpoint_item,
+                    item,
+                    order_idx,
+                    project_root=project_root,
+                    python_bin=args.python_bin,
+                    dataset=args.dataset,
+                    exp_config=exp_config,
+                    split=split,
+                    gpu_id=gpu_id,
+                    num_envs=args.num_envs,
+                    episode_count=args.episode_count,
+                    out_root=out_dir,
+                    timeout=args.timeout,
+                    temp_ckpt_dir=temp_ckpt_dir,
+                    skip_param_plot=args.skip_param_plot,
+                )
+                future_to_meta[future] = (order_idx, item, gpu_id)
+
+            # Completion path.
+            if future_to_meta:
+                done, _ = cf.wait(
+                    list(future_to_meta.keys()),
+                    timeout=poll_interval_sec,
+                    return_when=cf.FIRST_COMPLETED,
+                )
+                for future in done:
+                    order_idx, item, gpu_id = future_to_meta.pop(future)
+                    step = item.step if item.step >= 0 else order_idx
+                    try:
+                        row = future.result()
+                    except Exception as e:
+                        row = {
+                            "order_idx": order_idx,
+                            "checkpoint": str(item.path),
+                            "step": step,
+                            "kind": item.kind,
+                            "gpu_id": gpu_id,
+                            "status": "failed",
+                            "return_code": 1,
+                            "elapsed_sec": 0.0,
+                            "metrics": {},
+                            "param_values": {},
+                            "log_file": "",
+                            "error": str(e),
+                        }
+
+                    rows_by_order[order_idx] = row
+                    completed_paths.add(item.path)
+                    persist_rows()
+
+                    if row["status"] == "ok":
+                        score = row["metrics"].get(best_metric, None)
+                        score_msg = "N/A" if score is None else f"{score:.6f}"
+                        log(
+                            f"[done {order_idx}] step={step} gpu={gpu_id} "
+                            f"{best_metric}={score_msg} elapsed={hms(row['elapsed_sec'])}"
+                        )
+                        log(f"    -> metrics: {format_metrics(row['metrics'])}")
+                        if tb_writer is not None:
+                            for metric_name, metric_val in (row.get("metrics") or {}).items():
+                                if isinstance(metric_val, (int, float)) and math.isfinite(metric_val):
+                                    tb_writer.add_scalar(
+                                        f"eval/{metric_name}", float(metric_val), int(step)
+                                    )
+                            tb_writer.add_scalar(
+                                "eval_meta/elapsed_sec",
+                                float(row.get("elapsed_sec", 0.0)),
+                                int(step),
+                            )
+                    else:
+                        log(
+                            f"[done {order_idx}] step={step} gpu={gpu_id} "
+                            f"failed (rc={row['return_code']}) elapsed={hms(row['elapsed_sec'])}; "
+                            f"{row['error']}"
+                        )
+
+                    done_rows = [rows_by_order[k] for k in sorted(rows_by_order)]
+                    best_sr_row, best_sr_val = find_best_so_far(done_rows, "sr")
+                    best_spl_row, best_spl_val = find_best_so_far(done_rows, "spl")
+
+                    if best_sr_row is not None and best_sr_val is not None:
+                        log(
+                            "[best-so-far] SR: "
+                            f"step={best_sr_row['step']} "
+                            f"ckpt={Path(best_sr_row['checkpoint']).name} "
+                            f"sr={best_sr_val:.6f}"
+                        )
+                        log(
+                            "    -> SR-best metrics: "
+                            f"{format_metrics(best_sr_row.get('metrics') or {})}"
+                        )
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("best_so_far/sr", float(best_sr_val), int(step))
+                    if best_spl_row is not None and best_spl_val is not None:
+                        log(
+                            "[best-so-far] SPL: "
+                            f"step={best_spl_row['step']} "
+                            f"ckpt={Path(best_spl_row['checkpoint']).name} "
+                            f"spl={best_spl_val:.6f}"
+                        )
+                        log(
+                            "    -> SPL-best metrics: "
+                            f"{format_metrics(best_spl_row.get('metrics') or {})}"
+                        )
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("best_so_far/spl", float(best_spl_val), int(step))
+                continue
+
+            # No running futures.
+            if args.max_checkpoints and args.max_checkpoints > 0:
+                if len(completed_paths) >= args.max_checkpoints:
+                    log(
+                        f"[BatchEval] Reached max checkpoints limit: {args.max_checkpoints}. Exit."
+                    )
+                    break
+
+            if pending_items:
+                # Defensive fallback. Normally pending items should be scheduled above.
+                continue
+
+            idle_elapsed = time.time() - last_new_ckpt_time
+            if idle_elapsed >= idle_timeout_sec:
+                log(
+                    "[BatchEval] No new checkpoint for "
+                    f"{hms(idle_timeout_sec)}. Exit watch mode."
+                )
+                break
+
+            now = time.time()
+            if now - last_wait_log_time >= 60:
+                left = max(0, idle_timeout_sec - int(idle_elapsed))
+                log(
+                    "[BatchEval] Waiting for new checkpoints... "
+                    f"(next scan in {poll_interval_sec}s, timeout in {hms(left)})"
+                )
+                last_wait_log_time = now
+            time.sleep(poll_interval_sec)
+
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
     total_elapsed = time.time() - start_all
 
@@ -889,6 +1276,7 @@ def main() -> None:
         "matplotlib_available": HAS_MATPLOTLIB,
         "results_file": str(out_dir / "results.json"),
         "results_csv": str(out_dir / "results.csv"),
+        "tensorboard_aggregate_run": str(agg_tb_run_dir) if HAS_TB_WRITER else None,
     }
     save_json(out_dir / "summary.json", summary)
 

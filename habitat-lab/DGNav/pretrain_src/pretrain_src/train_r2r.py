@@ -154,7 +154,7 @@ def main(opts):
     # load data training set
     data_cfg = EasyDict(opts.train_datasets['R2R'])
     train_nav_db = R2RTextPathData(
-        data_cfg.train_traj_files, data_cfg.img_ft_file, data_cfg.dep_ft_file,
+        data_cfg.train_traj_files, data_cfg.img_ft_file, data_cfg.dep_ft_file,      #将深度特征和视觉特征都传进去
         data_cfg.scanvp_cands_file, data_cfg.connectivity_dir,
         image_prob_size=model_config.image_prob_size,
         image_feat_size=model_config.image_feat_size, 

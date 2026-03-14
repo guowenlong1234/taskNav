@@ -169,6 +169,9 @@ _C.MODEL.INSTRUCTION_ENCODER.rnn_type = "LSTM"
 _C.MODEL.INSTRUCTION_ENCODER.final_state_only = True
 _C.MODEL.INSTRUCTION_ENCODER.bidirectional = False
 
+_C.MODEL.rgb_feature_extractor = "clip"  # options: "clip", "dino"
+_C.MODEL.dino = "EffoNav"
+_C.MODEL.projector_ckpt_path = ""
 _C.MODEL.spatial_output = True
 _C.MODEL.RGB_ENCODER = CN()
 _C.MODEL.RGB_ENCODER.cnn_type = "TorchVisionResNet50"

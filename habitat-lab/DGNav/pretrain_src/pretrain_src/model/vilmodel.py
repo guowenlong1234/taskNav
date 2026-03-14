@@ -455,6 +455,28 @@ class ImageEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        # Optional projector for raw visual features (e.g. DINO 384-dim -> 512-dim)
+        # before feeding into img_linear. This projector is trainable during pretraining.
+        self.use_rgb_projector = getattr(config, "use_rgb_projector", False)
+        if self.use_rgb_projector:
+            proj_in = getattr(config, "rgb_projector_input_size", config.image_feat_size)
+            proj_hid = getattr(config, "rgb_projector_hidden_size", 768)
+            proj_out = getattr(config, "rgb_projector_output_size", config.image_feat_size)
+            if proj_out != config.image_feat_size:
+                raise ValueError(
+                    f"rgb_projector_output_size ({proj_out}) must equal image_feat_size "
+                    f"({config.image_feat_size}) so img_linear input stays aligned."
+                )
+            self.rgb_projector = nn.Sequential(
+                nn.Linear(proj_in, proj_hid),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_hid, proj_hid),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_hid, proj_out),
+            )
+        else:
+            self.rgb_projector = None
+
         self.img_linear = nn.Linear(config.image_feat_size, config.hidden_size)
         self.img_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.loc_linear = nn.Linear(config.angle_feat_size, config.hidden_size)
@@ -492,12 +514,17 @@ class ImageEmbeddings(nn.Module):
         device = traj_view_img_fts.device
         has_obj = traj_obj_img_fts is not None
 
+        if self.rgb_projector is not None:
+            traj_view_img_fts = self.rgb_projector(traj_view_img_fts)
+
         traj_view_img_embeds = self.img_layer_norm(self.img_linear(traj_view_img_fts))
         if self.dep_linear is not None:
             traj_view_img_embeds = traj_view_img_embeds + \
                                    self.dep_layer_norm(self.dep_linear(traj_view_dep_fts))
 
         if has_obj:
+            if self.rgb_projector is not None and self.obj_linear is None:
+                traj_obj_img_fts = self.rgb_projector(traj_obj_img_fts)
             if self.obj_linear is None:
                 traj_obj_img_embeds = self.img_layer_norm(self.img_linear(traj_obj_img_fts))
             else:

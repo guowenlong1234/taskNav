@@ -35,7 +35,7 @@
             "val_seen_traj_files": ["pretrain_src/datasets/R2R/annotations/pretrain_map/R2R_val_seen_enc.jsonl"],
             "val_unseen_traj_files": ["pretrain_src/datasets/R2R/annotations/pretrain_map/R2R_val_unseen_enc.jsonl"],
             "connectivity_dir": "pretrain_src/datasets/R2R/connectivity",
-            "img_ft_file": "pretrain_src/img_features/CLIP-ViT-B-32-views-habitat.hdf5",
+            "img_ft_file": "pretrain_src/img_features/DINOv2-ViT-S-14-views-habitat.hdf5",
             "dep_ft_file": "pretrain_src/img_features/ddppo_resnet50_depth_features.hdf5",
             "scanvp_cands_file": "pretrain_src/datasets/R2R/annotations/scanvp_candview_relangles.json",
             "tasks": [

@@ -75,6 +75,9 @@ MODEL:
   task_type: r2r
 
   policy_name: PolicyViewSelectionETP
+  # rgb_feature_extractor: clip
+  rgb_feature_extractor: dino
+  dino: EffoNav
   NUM_ANGLES: 12
   pretrained_path: pretrained/ETP/mlm.sap_r2r/ckpts/model_step_82500.pt
   fix_lang_embedding: False
