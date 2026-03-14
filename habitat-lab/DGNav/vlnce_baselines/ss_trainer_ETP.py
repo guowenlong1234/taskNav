@@ -76,6 +76,49 @@ def _ensure_iterator_options(task_config):
     return task_config.ENVIRONMENT.ITERATOR_OPTIONS
 
 
+def _append_measurement_once(task_config, measurement_name: str) -> None:
+    task_config.set_new_allowed(True)
+    if "TASK" not in task_config:
+        task_config.TASK = CN()
+    if "MEASUREMENTS" not in task_config.TASK:
+        task_config.TASK.MEASUREMENTS = []
+
+    measurements = list(task_config.TASK.MEASUREMENTS)
+    if measurement_name not in measurements:
+        measurements.append(measurement_name)
+        task_config.TASK.MEASUREMENTS = measurements
+    task_config.set_new_allowed(False)
+
+
+def _get_collision_rate(info: Dict, path_len: int):
+    denom = max(int(path_len), 1)
+    if not isinstance(info, dict):
+        return 0.0, False
+
+    if "collisions" in info:
+        collisions = info["collisions"]
+        if isinstance(collisions, dict):
+            if "count" in collisions:
+                return float(collisions["count"]) / denom, True
+            if "is_collision" in collisions:
+                return float(bool(collisions["is_collision"])) / denom, True
+        elif isinstance(collisions, (list, tuple, np.ndarray)):
+            return float(np.asarray(collisions).astype(np.float32).sum()) / denom, True
+        else:
+            try:
+                return float(collisions) / denom, True
+            except (TypeError, ValueError):
+                return 0.0, False
+
+    if "collisions.is_collision" in info:
+        col_flag = info["collisions.is_collision"]
+        if isinstance(col_flag, (list, tuple, np.ndarray)):
+            return float(np.asarray(col_flag).astype(np.float32).sum()) / denom, True
+        return float(bool(col_flag)) / denom, True
+
+    return 0.0, False
+
+
 @baseline_registry.register_trainer(name="SS-ETP")
 class RLTrainer(BaseVLNCETrainer):
     def __init__(self, config=None):
@@ -87,6 +130,7 @@ class RLTrainer(BaseVLNCETrainer):
         self._perf_timing_fh = None
         self._perf_timing_path = None
         self._train_rollout_counter = 0
+        self._warned_missing_collisions = False
 
     def _init_perf_timing_log(self):
         if self.local_rank != 0:
@@ -864,6 +908,7 @@ class RLTrainer(BaseVLNCETrainer):
         iterator_options = _ensure_iterator_options(self.config.TASK_CONFIG)
         iterator_options.SHUFFLE = False
         iterator_options.MAX_SCENE_REPEAT_STEPS = -1
+        _append_measurement_once(self.config.TASK_CONFIG, "COLLISIONS")
         self.config.IL.ckpt_to_load = checkpoint_path
         if self.config.VIDEO_OPTION:
             self.config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP_VLNCE")
@@ -1674,7 +1719,14 @@ class RLTrainer(BaseVLNCETrainer):
                     metric['success'] = 1. if distances[-1] <= 3. else 0.
                     metric['oracle_success'] = 1. if (distances <= 3.).any() else 0.
                     metric['path_length'] = float(np.linalg.norm(pred_path[1:] - pred_path[:-1],axis=1).sum())
-                    metric['collisions'] = info['collisions']['count'] / len(pred_path)
+                    metric['collisions'], has_collision_info = _get_collision_rate(
+                        info, len(pred_path)
+                    )
+                    if not has_collision_info and not self._warned_missing_collisions:
+                        logger.warning(
+                            "Missing collision metrics in env info; defaulting collisions to 0 for this run."
+                        )
+                        self._warned_missing_collisions = True
                     gt_length = distances[0]
                     metric['spl'] = metric['success'] * gt_length / max(gt_length, metric['path_length'])
                     dtw_distance = fastdtw(pred_path, gt_path, dist=NDTW.euclidean_distance)[0]
