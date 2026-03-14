@@ -9,10 +9,9 @@
 from collections import defaultdict
 from typing import Any, Dict, List, Union
 
-import magnum as mn
-
-import habitat.sims.habitat_simulator.sim_utilities as sutils
 import habitat_sim
+import magnum as mn
+import habitat.sims.habitat_simulator.sim_utilities as sutils
 from habitat.sims.habitat_simulator.debug_visualizer import (
     draw_object_highlight,
 )

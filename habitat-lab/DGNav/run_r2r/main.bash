@@ -23,8 +23,7 @@ fi
 run_dgnav() {
       local master_port="$1"
       shift
-      python -m ${dist_launch_module} --nproc_per_node=1 --master_port "${master_port}" run.py "$@" \
-            2> >(grep -vF "PluginManager::Manager: duplicate static plugin" >&2)
+      python -m ${dist_launch_module} --nproc_per_node=1 --master_port "${master_port}" run.py "$@"
 }
 
 flag1="--exp_name release_r2r_dino_best_nav
@@ -47,7 +46,7 @@ flag1="--exp_name release_r2r_dino_best_nav
       MODEL.pretrained_path /home/gwl/project/DGNav_new/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s/ckpts/model_step_22500.pt
       "
 
-flag2=" --exp_name release_r2r_dino
+flag2=" --exp_name release_r2r_dino_best_nav
       --run-type eval
       --exp-config run_r2r/iter_train.yaml
       SIMULATOR_GPU_IDS [0]

@@ -7,11 +7,11 @@
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
-import magnum as mn
 import numpy as np
 from scipy import spatial
 
 import habitat_sim
+import magnum as mn
 from habitat.sims.habitat_simulator.debug_visualizer import DebugVisualizer
 
 if TYPE_CHECKING:

@@ -864,7 +864,9 @@ class RLTrainer(BaseVLNCETrainer):
 
         #主进程显示进度条
         if self.local_rank < 1:
-            pbar = tqdm.trange(interval, leave=False, dynamic_ncols=True)
+            pbar = tqdm.trange(
+                interval, leave=False, dynamic_ncols=True, file=sys.stdout
+            )
         else:
             pbar = range(interval)
 
@@ -982,7 +984,11 @@ class RLTrainer(BaseVLNCETrainer):
         self.loc_noise_history = defaultdict(list)
         # Record start time of each episode for calculating episode duration
         self.episode_start_times = {}
-        self.pbar = tqdm.tqdm(total=eps_to_eval) if self.config.use_pbar else None
+        self.pbar = (
+            tqdm.tqdm(total=eps_to_eval, dynamic_ncols=True, file=sys.stdout)
+            if self.config.use_pbar
+            else None
+        )
 
         while len(self.stat_eps) < eps_to_eval:
             self.rollout('eval')
@@ -1120,7 +1126,9 @@ class RLTrainer(BaseVLNCETrainer):
             eps_to_infer = min(self.config.INFERENCE.EPISODE_COUNT, sum(self.envs.number_of_episodes))
         self.path_eps = defaultdict(list)
         self.inst_ids: Dict[str, int] = {}   # transfer submit format
-        self.pbar = tqdm.tqdm(total=eps_to_infer)
+        self.pbar = tqdm.tqdm(
+            total=eps_to_infer, dynamic_ncols=True, file=sys.stdout
+        )
         
         # If dynamic or random loc_noise is enabled, initialize recording
         use_dynamic_loc_noise = getattr(self.config.IL, 'use_dynamic_loc_noise', False)
@@ -1700,6 +1708,13 @@ class RLTrainer(BaseVLNCETrainer):
             if timing_enabled:
                 timing_acc['env_step'] += (time.perf_counter() - t_env_step)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+
+            if mode == 'eval' and self.pbar is not None:
+                # Keep progress feedback alive even before first episode is done.
+                self.pbar.set_postfix(
+                    {"active_envs": self.envs.num_envs, "rollout_step": stepk + 1},
+                    refresh=False,
+                )
 
             # calculate metric
             if mode == 'eval':

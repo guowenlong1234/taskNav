@@ -9,10 +9,9 @@
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
-import magnum as mn
-
-import habitat.sims.habitat_simulator.sim_utilities as sutils
 import habitat_sim
+import magnum as mn
+import habitat.sims.habitat_simulator.sim_utilities as sutils
 from habitat.core.logging import logger
 from habitat.datasets.rearrange.samplers.receptacle import Receptacle
 

@@ -17,13 +17,13 @@ from typing import (
     cast,
 )
 
-import magnum as mn
 import numpy as np
 from gym import spaces
 from gym.spaces.box import Box
 from omegaconf import DictConfig
 
 import habitat_sim
+import magnum as mn
 from habitat.config.default import get_agent_config
 from habitat.core.batch_rendering.env_batch_renderer_constants import (
     KEYFRAME_OBSERVATION_KEY,

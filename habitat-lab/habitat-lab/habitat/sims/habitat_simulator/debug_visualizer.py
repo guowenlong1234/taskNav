@@ -10,11 +10,11 @@ import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import magnum as mn
 import numpy as np
 from PIL import Image, ImageDraw
 
 import habitat_sim
+import magnum as mn
 from habitat.core.logging import logger
 from habitat.utils.common import check_make_dir
 from habitat_sim.physics import ManagedArticulatedObject, ManagedRigidObject
