@@ -1254,7 +1254,7 @@ class RLTrainer(BaseVLNCETrainer):
 
         #如果开启了视频或者是训练模式，就获取真实位置信息
         #或者在验证阶段开启了上帝模式，也可以获得真实位置信息
-        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION) or (mode == "eval" and self.config.ORACLE.ENABLE and self.config.ORACLE.FORCE_HAVE_REAL_POS)
+        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION) or (mode == "eval" and self.config.ORACLE.enable and self.config.ORACLE.force_have_real_pos)
 
         ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
 
@@ -1265,7 +1265,7 @@ class RLTrainer(BaseVLNCETrainer):
                                ghost_aug,oracle_cfg=self.config.ORACLE) for _ in range(self.envs.num_envs)]   #ghost 位置扰动强度
         
         #实例化一个oracle_manager
-        if self.config.ORACLE.ENABLE:
+        if self.config.ORACLE.enable:
             oracle_manager = OracleExperimentManager(
                 config=self.config,
                 envs=self.envs,
@@ -1275,9 +1275,16 @@ class RLTrainer(BaseVLNCETrainer):
                 device=self.device,
                 run_id=getattr(self.config,"EXP_NAME", "exp"),
                 split=self.config.TASK_CONFIG.DATASET.SPLIT,
-                trace_dir=self.config.ORACLE.TRACE.DIR,
+                trace_dir=self.config.ORACLE.trace.dir,
                 vp_feature_builder=self._vp_feature_variable,
             )
+            curr_eps = self.envs.current_episodes()
+            for i, ep in enumerate(curr_eps):
+                oracle_manager.one_episode_reset(
+                    env_index=i,
+                    scene_id=ep.scene_id,
+                    episode_id=ep.episode_id,
+                )
         
 
         #初始化每个环境上一时刻所在 viewpoint
@@ -1572,8 +1579,27 @@ class RLTrainer(BaseVLNCETrainer):
             if timing_enabled:
                 t_navigation = time.perf_counter()
 
-            if self.config.ORACLE.ENABLE:
+            if self.config.ORACLE.enable:
                 oracle_stats = oracle_manager.step_update_oracle(mode=mode,stepk=stepk,gmaps=self.gmaps,env_indices=not_done_index,current_episodes=self.envs.current_episodes())
+                if self.local_rank < 1 and oracle_stats:
+                    query_cnt = int(oracle_stats.get("query_cnt", 0))
+                    cache_hit_cnt = int(oracle_stats.get("cache_hit_cnt", 0))
+                    intra_hit_cnt = int(oracle_stats.get("intra_episode_cache_hit_cnt", 0))
+                    cross_hit_cnt = int(oracle_stats.get("cross_episode_cache_hit_cnt", 0))
+                    cache_hit_pct = (cache_hit_cnt / query_cnt) if query_cnt > 0 else 0.0
+                    logger.info(
+                        "[OracleSummary] "
+                        f"step={stepk} query={query_cnt} "
+                        f"success={int(oracle_stats.get('success_cnt', 0))} "
+                        f"fail={int(oracle_stats.get('fail_cnt', 0))} "
+                        f"skipped={int(oracle_stats.get('skipped_cnt', 0))} "
+                        f"cache_hit={cache_hit_cnt} ({cache_hit_pct:.2%}) "
+                        f"intra_ep_hit={intra_hit_cnt} ({float(oracle_stats.get('intra_episode_cache_hit_pct', 0.0)):.2%}) "
+                        f"cross_ep_hit={cross_hit_cnt} ({float(oracle_stats.get('cross_episode_cache_hit_pct', 0.0)):.2%}) "
+                        f"resolve_fail={int(oracle_stats.get('resolve_fail_cnt', 0))} "
+                        f"provider_fail={int(oracle_stats.get('provider_fail_cnt', 0))} "
+                        f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f}"
+                    )
             
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)  
         #             return {

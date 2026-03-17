@@ -1,9 +1,13 @@
 from typing import Any, Dict, List, Optional
+import json
+import math
+import os
 import torch
 import numpy as np
 
+from .cache import OracleSpatialCache
 from .providers import SimulatorPeekOracleProvider
-from .types import OracleQuerySpec
+from .types import OracleFeatureResult, OracleQuerySpec
 from vlnce_baselines.models.graph_utils import GraphMap, calculate_vp_rel_pos_fts
 
 class OracleExperimentManager:
@@ -22,6 +26,7 @@ class OracleExperimentManager:
         self.config = config
         self.envs = envs
         self.config_oracle = config.ORACLE
+        self.trace_cfg = self.config_oracle.trace
         self.run_id = run_id
         self.split = split
         self.trace_dir = trace_dir
@@ -38,16 +43,207 @@ class OracleExperimentManager:
             instr_max_len=config.IL.max_text_len,
         )
 
+        self.cache = None
+        if self.config_oracle.cache_enable:
+            self.cache = OracleSpatialCache(
+                radius=self.config_oracle.cache_radius,
+                heading_tolerance_rad=math.pi / 12.0,
+                max_items_per_scene=self.config_oracle.cache_max_items_per_scene,
+            )
+
         self._episode_key = {}
+        self._trace_paths = {}
+        if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
+            os.makedirs(self.trace_dir, exist_ok=True)
 
+    def _sanitize_trace_token(self, value: str) -> str:     #清理用于文件名或者路径的字符串的辅助函数
+        return (
+            str(value)
+            .replace("/", "_")
+            .replace("\\", "_")
+            .replace(":", "_")
+            .replace(" ", "_")
+        )
 
+    def _should_trace_step(self, stepk: int) -> bool:       #判断当前stepk要不要写oracle trace，trace 开关 + 采样频率控制
+        if not self.trace_cfg.enable:
+            return False
+        if self.trace_cfg.format != "jsonl":
+            return False
+        log_every_n_steps = max(int(self.trace_cfg.log_every_n_steps), 1)
+        return stepk % log_every_n_steps == 0
 
+    def _write_trace_record(self, env_index: int, record: Dict[str, Any]) -> None:  #写日志到文件的辅助函数，record要写入的一条 trace 记录
+        if env_index not in self._trace_paths:
+            return
+        with open(self._trace_paths[env_index], "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def one_episode_reset(self,env_index:int,scene_id:int, episode_id: str):
+    def _trace_query_event(     #完成一条信息的组装和写入
+        self,
+        *,
+        env_index: int,
+        scene_id: str,
+        episode_id: str,
+        stepk: int,
+        ghost_vp_id: str,
+        chosen_front_vp_id: Optional[str],
+        pos_strategy: str,
+        heading_strategy: str,
+        pipeline: str,
+        query_pos,
+        query_heading_rad,
+        ok: bool,
+        reason: Optional[str],
+        cache_hit: bool,
+        used_pos,
+        used_heading_rad,
+        embed_norm: Optional[float],
+    ) -> None:
+        if not self._should_trace_step(stepk):
+            return
+        if (not ok) and (not self.trace_cfg.include_failures):
+            return
+
+        record = {
+            "run_id": self.run_id,
+            "split": self.split,
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "env_index": env_index,
+            "stepk": stepk,
+            "ghost_vp_id": ghost_vp_id,
+            "chosen_front_vp_id": chosen_front_vp_id,
+            "pos_strategy": pos_strategy,
+            "heading_strategy": heading_strategy,
+            "pipeline": pipeline,
+            "ok": ok,
+            "reason": reason,
+            "cache_hit": cache_hit,
+            "query_heading_rad": None if query_heading_rad is None else float(query_heading_rad),
+            "used_heading_rad": None if used_heading_rad is None else float(used_heading_rad),
+        }
+        if self.trace_cfg.include_positions:
+            record["query_pos"] = None if query_pos is None else list(query_pos)
+            record["used_pos"] = None if used_pos is None else list(used_pos)
+        if self.trace_cfg.include_embed_norm:
+            record["embed_norm"] = embed_norm
+
+        self._write_trace_record(env_index, record)
+
+    def _is_navigable(self, env_index: int, pos) -> bool:
+        #给定一个点，检查这个位置是否可导航
+        return bool(
+            self.envs.call_at(
+                env_index,
+                "check_navigability",
+                {"node": list(pos)},
+            )
+        )
+
+    def _resolve_query_pos(self, env_index: int, gmap, ghost_vp_id: str, real_pos_list, real_pos_mean):
+        base_strategy = self.config_oracle.query_pos_strategy   #读取主策略
+        fallback_strategy = self.config_oracle.query_pos_fallback   #读取回退策略
+
+        query_pos = tuple(np.asarray(real_pos_mean).tolist())   #整理真实位置格式
+        if (not self.config_oracle.navigability_check) or self._is_navigable(env_index, query_pos):
+
+            #如果不开启导航检查或者导航位置点可用，就返回这个目标位置和选点策略
+            return query_pos, base_strategy
+
+        #如果检查点核验不通过并且回退策略是nearest_real_pos的话，执行以下代码
+        if fallback_strategy == "nearest_real_pos":
+
+            sorted_real_pos = sorted(
+                real_pos_list,
+                key=lambda pos: np.linalg.norm(np.asarray(pos) - np.asarray(real_pos_mean)),
+            )
+            #对所有的real_pos_list排序，按照离目标点最近的顺序排序
+
+            #按照刚刚排好的序，一个一个尝试是否可行
+            for pos in sorted_real_pos:
+                candidate = tuple(np.asarray(pos).tolist())
+                if (not self.config_oracle.navigability_check) or self._is_navigable(env_index, candidate):
+                    #如果不用做导航检测或者这个点可达，就返回这个点和选点策略
+                    return candidate, fallback_strategy
+                
+        elif fallback_strategy == "ghost_mean_pos":
+            #如果回退选点规则是ghost_mean_pos，就用平均位置作为选点依据，返回选点策略和这个点本身
+            candidate = tuple(np.asarray(gmap.ghost_mean_pos[ghost_vp_id]).tolist())
+            if (not self.config_oracle.navigability_check) or self._is_navigable(env_index, candidate):
+                return candidate, fallback_strategy
+
+        return None, None   #如果回退和主策略都失败了，返回None
+
+    def _should_query_ghost(self, gmap, ghost_vp_id, real_pos_count, real_pos_mean):
+        """
+         只负责判断当前 ghost 这一步要不要 query,不做 query 本身
+        """
+        if not gmap.has_oracle_embed(ghost_vp_id):
+            #如果当前节点没有oracle_embed，那就要进行计算
+            return True
+        
+        if not self.config_oracle.query_only_new_or_changed:
+            #如果配置里不要求“只查新增或变化的 ghost”，那就每次都查
+            return True
+
+        if not self.config_oracle.requery_on_realpos_update:
+            #如果已经有 oracle embedding 了，而且配置又说“real_pos 更新时也不要重查”，那就直接不查
+            return False
+        
+        #读这个 ghost 上一次 query 时保存的元信息
+        meta = gmap.ghost_oracle_meta.get(ghost_vp_id, {})
+        prev_count = meta.get("real_pos_count")
+        prev_mean = meta.get("real_pos_mean")
+
+        #旧 meta 不完整，那 safest 的做法就是重新查一次
+        if prev_count is None or prev_mean is None:
+            return True
+        
+        #count_changed：这次 ghost 累积到的真实位置样本数变没变
+        count_changed = (real_pos_count != prev_count)
+
+        #mean_delta：这次真实位置均值，和上次 query 时相比移动了多少米
+        mean_delta = np.linalg.norm(np.asarray(real_pos_mean) - np.asarray(prev_mean))
+
+        #只有同时满足：样本数变了，均值位置变化超过阈值才重新 query
+        if count_changed and mean_delta >= self.config_oracle.requery_min_pos_delta:
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def _dtype_to_name(dtype) -> str:
+        return {
+            torch.float16: "fp16",
+            torch.float32: "fp32",
+            torch.float64: "fp64",
+        }.get(dtype, str(dtype))
+
+    @staticmethod
+    def _normalize_heading_rad(heading_rad: float) -> float:
+        return float(heading_rad) % (2 * math.pi)
+
+    @staticmethod
+    def _make_cache_key(scene_id: str, pos, heading_rad: float) -> str:
+        normalized_heading = OracleExperimentManager._normalize_heading_rad(heading_rad)
+        return f"{scene_id}:{tuple(pos)}:{normalized_heading:.6f}"
+        
+
+    def one_episode_reset(self, env_index: int, scene_id: str, episode_id: str):
         '''
         用于缓存和清理统计
         '''
-        pass
+        self._episode_key[env_index] = (scene_id, episode_id)
+        if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
+            scene_token = self._sanitize_trace_token(scene_id)
+            episode_token = self._sanitize_trace_token(episode_id)
+            run_token = self._sanitize_trace_token(self.run_id)
+            split_token = self._sanitize_trace_token(self.split)
+            self._trace_paths[env_index] = os.path.join(        #组织json文件的路径
+                self.trace_dir,
+                f"{run_token}__{split_token}__{scene_token}__{episode_token}.jsonl",
+            )
 
     def step_update_oracle(self,
                             mode: str,                      # "train"/"eval"/"infer"
@@ -69,7 +265,7 @@ class OracleExperimentManager:
             4) gmap.set_oracle_embed(ghost_vp_id, result.embed, meta=...)
         - 返回当步统计：query_cnt/cache_hit/avg_latency/fail_cnt 等
         '''
-        if (not self.config.ORACLE.ENABLE) or (mode != "eval"):
+        if (not self.config_oracle.enable) or (mode != "eval"):
             return {}
 
 
@@ -79,26 +275,65 @@ class OracleExperimentManager:
                         "query_cnt": 0,
                         "success_cnt": 0,
                         "fail_cnt": 0,
+                        "provider_fail_cnt": 0,
+                        "resolve_fail_cnt": 0,
                         "cache_hit_cnt": 0,
+                        "intra_episode_cache_hit_cnt": 0,
+                        "cross_episode_cache_hit_cnt": 0,
                         "latency_ms_sum": 0.0,
+                        "skipped_cnt":0,
                     }
             for active_i, (gmap, ep) in enumerate(zip(gmaps, current_episodes)):
                 ghost_vp_ids = list(gmap.ghost_mean_pos.keys())
                 for ghost_vp_id in ghost_vp_ids:
-
-                    if gmap.has_oracle_embed(ghost_vp_id):
-                        continue
-
                     if (not gmap.has_real_pos) or (ghost_vp_id not in gmap.ghost_real_pos):
                         continue
 
                     real_pos_list = gmap.ghost_real_pos[ghost_vp_id]
                     if len(real_pos_list) == 0:
                         continue
-                    
+
                     #在当前V1版本，是通过平均真实位置进行预测的
                     real_pos_mean = tuple(np.mean(real_pos_list, axis=0).tolist())
-                    query_pos = real_pos_mean
+
+                    if not self._should_query_ghost(gmap=gmap,
+                                                ghost_vp_id= ghost_vp_id,
+                                                real_pos_count=len(real_pos_list),
+                                                real_pos_mean=real_pos_mean):
+                        #不需要计算即直接取cache
+                        stats["skipped_cnt"] += 1
+                        continue
+
+                    query_pos, query_pos_strategy = self._resolve_query_pos(
+                        active_i,
+                        gmap,
+                        ghost_vp_id,
+                        real_pos_list,
+                        real_pos_mean,  #这里默认是按照主策略(平均位置)进行选点的
+                    )
+                    if query_pos is None:   #如果是空，则表示选点失败了，失败计数加一。
+                        stats["fail_cnt"] += 1      #总失败次数加一
+                        stats["resolve_fail_cnt"] += 1  #解析失败次数加一
+                        self._trace_query_event(            #用于定位问题出现在哪
+                            env_index=active_i,
+                            scene_id=ep.scene_id,
+                            episode_id=ep.episode_id,
+                            stepk=stepk,
+                            ghost_vp_id=ghost_vp_id,
+                            chosen_front_vp_id=None,
+                            pos_strategy=self.config_oracle.query_pos_strategy,
+                            heading_strategy=self.config_oracle.query_heading_strategy,
+                            pipeline=self.config_oracle.query_pipeline,
+                            query_pos=None,
+                            query_heading_rad=None,
+                            ok=False,
+                            reason="resolve_query_pos_failed",      #失败的错误原因
+                            cache_hit=False,
+                            used_pos=None,
+                            used_heading_rad=None,
+                            embed_norm=None,
+                        )
+                        continue
 
                     #接下来计算query_heading，当前V1版本按照真实朝向计算
                     front_vp_ids = list(gmap.ghost_fronts[ghost_vp_id])
@@ -125,14 +360,74 @@ class OracleExperimentManager:
                         chosen_front_vp_id=chosen_front_vp_id,
                         query_pos=query_pos,
                         query_heading_rad=float(query_heading_rad),
-                        pos_strategy="ghost_real_pos_mean",
+                        pos_strategy=query_pos_strategy,
                         heading_strategy="face_frontier",
                         pipeline="future_node_avg_pano",
                         real_pos_count=len(real_pos_list),
                         real_pos_mean=real_pos_mean,
                     )
 
-                    result = self.provider.query(spec=spec)
+                    cache_entry = None
+                    if self.cache is not None:
+                        cache_entry = self.cache.lookup(
+                            ep.scene_id,
+                            query_pos,
+                            query_heading_rad,
+                        )
+
+                    if cache_entry is not None:
+                        cached_embed = cache_entry.embed.detach().clone()
+                        cache_meta = cache_entry.meta
+                        source_episode_id = cache_meta.get("source_episode_id")
+                        result = OracleFeatureResult(
+                            ghost_vp_id=ghost_vp_id,
+                            ok=True,
+                            reason=None,
+                            embed=cached_embed,
+                            embed_dtype=self._dtype_to_name(cached_embed.dtype),
+                            embed_norm=float(cached_embed.norm().item()),
+                            used_pos=tuple(cache_meta.get("used_pos", cache_entry.pos)),
+                            used_heading_rad=float(
+                                cache_entry.heading_rad
+                                if cache_meta.get("used_heading_rad") is None
+                                else cache_meta["used_heading_rad"]
+                            ),
+                            cache_hit=True,
+                            cache_key=self._make_cache_key(
+                                ep.scene_id,
+                                cache_entry.pos,
+                                cache_entry.heading_rad,
+                            ),
+                            latency_ms=0.0,
+                        )
+                        is_intra_episode_cache_hit = (source_episode_id == ep.episode_id)
+                    else:
+                        is_intra_episode_cache_hit = False
+                        try:
+                            result = self.provider.query(spec=spec) #进行一次查询
+                        except Exception:       #如果失败，记录一次事件
+                            stats["fail_cnt"] += 1
+                            stats["provider_fail_cnt"] += 1
+                            self._trace_query_event(
+                                env_index=active_i,
+                                scene_id=ep.scene_id,
+                                episode_id=ep.episode_id,
+                                stepk=stepk,
+                                ghost_vp_id=ghost_vp_id,
+                                chosen_front_vp_id=chosen_front_vp_id,
+                                pos_strategy=query_pos_strategy,
+                                heading_strategy="face_frontier",
+                                pipeline="future_node_avg_pano",
+                                query_pos=query_pos,
+                                query_heading_rad=query_heading_rad,
+                                ok=False,
+                                reason="provider_query_failed",
+                                cache_hit=False,
+                                used_pos=None,
+                                used_heading_rad=None,
+                                embed_norm=None,
+                            )
+                            continue
 
                     #如果返回成功就写回GraphMap
                     if result.ok and result.embed is not None:
@@ -147,21 +442,68 @@ class OracleExperimentManager:
                                 "real_pos_mean": real_pos_mean,
                             },#meta是特征相关的上下文，方便后续统计调试
                         )
+                        if self.cache is not None and (not result.cache_hit):
+                            self.cache.insert(
+                                ep.scene_id,
+                                query_pos,
+                                query_heading_rad,
+                                result.embed,
+                                meta={
+                                    "used_pos": result.used_pos,
+                                    "used_heading_rad": result.used_heading_rad,
+                                    "source_episode_id": ep.episode_id,
+                                },
+                            )
 
                     #更新统计
                     stats["query_cnt"] += 1
                     stats["latency_ms_sum"] += result.latency_ms
                     stats["cache_hit_cnt"] += int(result.cache_hit)
+                    if result.cache_hit:
+                        if is_intra_episode_cache_hit:
+                            stats["intra_episode_cache_hit_cnt"] += 1
+                        else:
+                            stats["cross_episode_cache_hit_cnt"] += 1
 
                     if result.ok and result.embed is not None:
                         stats["success_cnt"] += 1
                     else:
                         stats["fail_cnt"] += 1
+
+                    self._trace_query_event(    #记录一次成功
+                        env_index=active_i,
+                        scene_id=ep.scene_id,
+                        episode_id=ep.episode_id,
+                        stepk=stepk,
+                        ghost_vp_id=ghost_vp_id,
+                        chosen_front_vp_id=chosen_front_vp_id,
+                        pos_strategy=query_pos_strategy,
+                        heading_strategy="face_frontier",
+                        pipeline="future_node_avg_pano",
+                        query_pos=query_pos,
+                        query_heading_rad=query_heading_rad,
+                        ok=result.ok,
+                        reason=result.reason,
+                        cache_hit=result.cache_hit,
+                        used_pos=result.used_pos,
+                        used_heading_rad=result.used_heading_rad,
+                        embed_norm=result.embed_norm,
+                    )
                 
             #函数结束前补平均耗时并返回
             if stats["query_cnt"] > 0:
                 stats["avg_latency_ms"] = stats["latency_ms_sum"] / stats["query_cnt"]
             else:
                 stats["avg_latency_ms"] = 0.0
+            if stats["cache_hit_cnt"] > 0:
+                stats["intra_episode_cache_hit_pct"] = (
+                    stats["intra_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
+                )
+                stats["cross_episode_cache_hit_pct"] = (
+                    stats["cross_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
+                )
+            else:
+                stats["intra_episode_cache_hit_pct"] = 0.0
+                stats["cross_episode_cache_hit_pct"] = 0.0
 
             return stats

@@ -169,42 +169,42 @@ _C.RL.POLICY.OBS_TRANSFORMS.RESIZER_PER_SENSOR.SIZES = [
 # ORACLE CONFIG
 # -----------------------------------------------------------------------------
 _C.ORACLE = CN()
-_C.ORACLE.ENABLE = False
-_C.ORACLE.MODE = "O1"
-_C.ORACLE.PROVIDER = "SimulatorPeekOracleProvider"
-_C.ORACLE.FORCE_HAVE_REAL_POS = True
-_C.ORACLE.QUERY_PIPELINE = "future_node_avg_pano"
-_C.ORACLE.QUERY_POS_STRATEGY = "ghost_real_pos_mean"
-_C.ORACLE.QUERY_POS_FALLBACK = "nearest_real_pos"
-_C.ORACLE.QUERY_HEADING_STRATEGY = "face_frontier"
-_C.ORACLE.TARGET_GHOST_SCOPE = "all"
-_C.ORACLE.QUERY_ONLY_NEW_OR_CHANGED = True
-_C.ORACLE.REQUERY_ON_REALPOS_UPDATE = True
-_C.ORACLE.REQUERY_MIN_POS_DELTA = 0.10
-_C.ORACLE.NAVIGABILITY_CHECK = True
-_C.ORACLE.NAVIGABILITY_SEARCH_RADIUS = 1.0
-_C.ORACLE.NAVIGABILITY_NUM_SAMPLES = 16
-_C.ORACLE.NAVIGABILITY_Y_LOCK = True
-_C.ORACLE.CACHE_ENABLE = True
-_C.ORACLE.CACHE_RADIUS = 0.25
-_C.ORACLE.CACHE_MAX_ITEMS_PER_SCENE = 4096
-_C.ORACLE.MAX_QUERIES_PER_STEP = -1
-_C.ORACLE.MAX_QUERIES_PER_EPISODE = -1
-_C.ORACLE.USE_AMP = False
-_C.ORACLE.EMBED_DTYPE = "fp32"
-_C.ORACLE.PERSISTENT_WRITEBACK = True
-_C.ORACLE.HARD_REPLACE = True
+_C.ORACLE.enable = False
+_C.ORACLE.mode = "O1"
+_C.ORACLE.provider = "SimulatorPeekOracleProvider"
+_C.ORACLE.force_have_real_pos = True
+_C.ORACLE.query_pipeline = "future_node_avg_pano"
+_C.ORACLE.query_pos_strategy = "ghost_real_pos_mean"
+_C.ORACLE.query_pos_fallback = "nearest_real_pos"
+_C.ORACLE.query_heading_strategy = "face_frontier"
+_C.ORACLE.target_ghost_scope = "all"
+_C.ORACLE.query_only_new_or_changed = True
+_C.ORACLE.requery_on_realpos_update = True
+_C.ORACLE.requery_min_pos_delta = 0.10
+_C.ORACLE.navigability_check = True
+_C.ORACLE.navigability_search_radius = 1.0
+_C.ORACLE.navigability_num_samples = 16
+_C.ORACLE.navigability_y_lock = True
+_C.ORACLE.cache_enable = True
+_C.ORACLE.cache_radius = 0.25
+_C.ORACLE.cache_max_items_per_scene = 4096
+_C.ORACLE.max_queries_per_step = -1
+_C.ORACLE.max_queries_per_episode = -1
+_C.ORACLE.use_amp = False
+_C.ORACLE.embed_dtype = "fp32"
+_C.ORACLE.persistent_writeback = True
+_C.ORACLE.hard_replace = True
 
-_C.ORACLE.TRACE = CN()
-_C.ORACLE.TRACE.ENABLE = True
-_C.ORACLE.TRACE.DIR = "data/logs/oracle_traces/"
-_C.ORACLE.TRACE.FORMAT = "jsonl"
-_C.ORACLE.TRACE.LOG_EVERY_N_STEPS = 1
-_C.ORACLE.TRACE.COUNTERFACTUAL_TRACE = False
-_C.ORACLE.TRACE.INCLUDE_EMBED_VECTOR = False
-_C.ORACLE.TRACE.INCLUDE_EMBED_NORM = True
-_C.ORACLE.TRACE.INCLUDE_POSITIONS = True
-_C.ORACLE.TRACE.INCLUDE_FAILURES = True
+_C.ORACLE.trace = CN()
+_C.ORACLE.trace.enable = True
+_C.ORACLE.trace.dir = "data/logs/oracle_traces/"
+_C.ORACLE.trace.format = "jsonl"
+_C.ORACLE.trace.log_every_n_steps = 1
+_C.ORACLE.trace.counterfactual_trace = False
+_C.ORACLE.trace.include_embed_vector = False
+_C.ORACLE.trace.include_embed_norm = True
+_C.ORACLE.trace.include_positions = True
+_C.ORACLE.trace.include_failures = True
 # -----------------------------------------------------------------------------
 # MODELING CONFIG
 # -----------------------------------------------------------------------------
@@ -303,43 +303,43 @@ def purge_keys(config: CN, keys: List[str]) -> None:
 
 
 _ORACLE_LEGACY_ALIASES = {
-    "enable": "ENABLE",
-    "mode": "MODE",
-    "provider": "PROVIDER",
-    "force_have_real_pos": "FORCE_HAVE_REAL_POS",
-    "query_pipeline": "QUERY_PIPELINE",
-    "query_pos_strategy": "QUERY_POS_STRATEGY",
-    "query_pos_fallback": "QUERY_POS_FALLBACK",
-    "query_heading_strategy": "QUERY_HEADING_STRATEGY",
-    "target_ghost_scope": "TARGET_GHOST_SCOPE",
-    "query_only_new_or_changed": "QUERY_ONLY_NEW_OR_CHANGED",
-    "requery_on_realpos_update": "REQUERY_ON_REALPOS_UPDATE",
-    "requery_min_pos_delta": "REQUERY_MIN_POS_DELTA",
-    "navigability_check": "NAVIGABILITY_CHECK",
-    "navigability_search_radius": "NAVIGABILITY_SEARCH_RADIUS",
-    "navigability_num_samples": "NAVIGABILITY_NUM_SAMPLES",
-    "navigability_y_lock": "NAVIGABILITY_Y_LOCK",
-    "cache_enable": "CACHE_ENABLE",
-    "cache_radius": "CACHE_RADIUS",
-    "cache_max_items_per_scene": "CACHE_MAX_ITEMS_PER_SCENE",
-    "max_queries_per_step": "MAX_QUERIES_PER_STEP",
-    "max_queries_per_episode": "MAX_QUERIES_PER_EPISODE",
-    "use_amp": "USE_AMP",
-    "embed_dtype": "EMBED_DTYPE",
-    "persistent_writeback": "PERSISTENT_WRITEBACK",
-    "hard_replace": "HARD_REPLACE",
+    "ENABLE": "enable",
+    "MODE": "mode",
+    "PROVIDER": "provider",
+    "FORCE_HAVE_REAL_POS": "force_have_real_pos",
+    "QUERY_PIPELINE": "query_pipeline",
+    "QUERY_POS_STRATEGY": "query_pos_strategy",
+    "QUERY_POS_FALLBACK": "query_pos_fallback",
+    "QUERY_HEADING_STRATEGY": "query_heading_strategy",
+    "TARGET_GHOST_SCOPE": "target_ghost_scope",
+    "QUERY_ONLY_NEW_OR_CHANGED": "query_only_new_or_changed",
+    "REQUERY_ON_REALPOS_UPDATE": "requery_on_realpos_update",
+    "REQUERY_MIN_POS_DELTA": "requery_min_pos_delta",
+    "NAVIGABILITY_CHECK": "navigability_check",
+    "NAVIGABILITY_SEARCH_RADIUS": "navigability_search_radius",
+    "NAVIGABILITY_NUM_SAMPLES": "navigability_num_samples",
+    "NAVIGABILITY_Y_LOCK": "navigability_y_lock",
+    "CACHE_ENABLE": "cache_enable",
+    "CACHE_RADIUS": "cache_radius",
+    "CACHE_MAX_ITEMS_PER_SCENE": "cache_max_items_per_scene",
+    "MAX_QUERIES_PER_STEP": "max_queries_per_step",
+    "MAX_QUERIES_PER_EPISODE": "max_queries_per_episode",
+    "USE_AMP": "use_amp",
+    "EMBED_DTYPE": "embed_dtype",
+    "PERSISTENT_WRITEBACK": "persistent_writeback",
+    "HARD_REPLACE": "hard_replace",
 }
 
 _ORACLE_TRACE_LEGACY_ALIASES = {
-    "enable": "ENABLE",
-    "dir": "DIR",
-    "format": "FORMAT",
-    "log_every_n_steps": "LOG_EVERY_N_STEPS",
-    "counterfactual_trace": "COUNTERFACTUAL_TRACE",
-    "include_embed_vector": "INCLUDE_EMBED_VECTOR",
-    "include_embed_norm": "INCLUDE_EMBED_NORM",
-    "include_positions": "INCLUDE_POSITIONS",
-    "include_failures": "INCLUDE_FAILURES",
+    "ENABLE": "enable",
+    "DIR": "dir",
+    "FORMAT": "format",
+    "LOG_EVERY_N_STEPS": "log_every_n_steps",
+    "COUNTERFACTUAL_TRACE": "counterfactual_trace",
+    "INCLUDE_EMBED_VECTOR": "include_embed_vector",
+    "INCLUDE_EMBED_NORM": "include_embed_norm",
+    "INCLUDE_POSITIONS": "include_positions",
+    "INCLUDE_FAILURES": "include_failures",
 }
 
 
@@ -356,17 +356,12 @@ def _normalize_oracle_config(config: CN) -> None:
 
     _promote_legacy_cfg_keys(config.ORACLE, _ORACLE_LEGACY_ALIASES)
 
-    if "trace" in config.ORACLE:
-        legacy_trace = config.ORACLE["trace"]
+    if "TRACE" in config.ORACLE:
+        legacy_trace = config.ORACLE["TRACE"]
         for legacy_key, canonical_key in _ORACLE_TRACE_LEGACY_ALIASES.items():
             if legacy_key in legacy_trace:
-                config.ORACLE.TRACE[canonical_key] = legacy_trace[legacy_key]
-        del config.ORACLE["trace"]
-
-    if "TRACE" in config.ORACLE:
-        _promote_legacy_cfg_keys(
-            config.ORACLE.TRACE, _ORACLE_TRACE_LEGACY_ALIASES
-        )
+                config.ORACLE.trace[canonical_key] = legacy_trace[legacy_key]
+        del config.ORACLE["TRACE"]
 
 
 def get_config(

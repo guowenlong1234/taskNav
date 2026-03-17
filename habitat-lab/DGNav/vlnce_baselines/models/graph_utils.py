@@ -379,7 +379,7 @@ class GraphMap(object):
         if not vp.startswith('g'):  #如果p是以g开头的，说明是普通节点
             return self.node_embeds[vp] #直接返回节点保存的特征
         else:   #如果是以g开头的，说明是ghost节点，ghost_embeds[vp][0]这个 ghost 被多次观测到时，所有 embedding 的累加和，ghost_embeds[vp][1]：累计了多少次
-            if self.oracle_cfg is not None and self.oracle_cfg.ENABLE and vp in self.ghost_oracle_embeds:
+            if self.oracle_cfg is not None and self.oracle_cfg.enable and vp in self.ghost_oracle_embeds:
                 return self.get_oracle_embed(vp)
             else:
                 return self.ghost_embeds[vp][0] / self.ghost_embeds[vp][1]  #返回ghost节点的平均特征值。
