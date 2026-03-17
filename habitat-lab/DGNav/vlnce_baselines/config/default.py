@@ -37,6 +37,7 @@ _C.EVAL = CN()
 _C.EVAL.USE_CKPT_CONFIG = True
 _C.EVAL.SPLIT = "val_seen"
 _C.EVAL.EPISODE_COUNT = -1
+_C.EVAL.EPISODE_ID_FILE = ""
 _C.EVAL.LANGUAGES = ["en-US", "en-IN"]
 _C.EVAL.SAMPLE = False
 _C.EVAL.SAVE_RESULTS = True
@@ -391,6 +392,7 @@ def get_config(
         prev_task_config = ""
         for config_path in config_paths:
             config.merge_from_file(config_path)
+            _normalize_oracle_config(config)
             if config.BASE_TASK_CONFIG_PATH != prev_task_config:
                 config.TASK_CONFIG = get_task_config(
                     config.BASE_TASK_CONFIG_PATH

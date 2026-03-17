@@ -673,3 +673,321 @@ class OracleExperimentManager:
 
 3. **P2（可选，默认关闭）**
    - counterfactual trace（双 forward planner）
+
+---
+
+## 附录：Oracle V1 当前实现说明（2026-03-17）
+
+本附录不是新的规格设计，而是对 **当前 clean33 工程里已经落地的实现** 做一次工程说明，方便后续 AI 或使用者快速接手。
+
+### 1. 实现所在工作区
+
+当前 Oracle V1 的有效实现位于：
+
+- `/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav`
+
+不要把它和旧工作区混用：
+
+- `/home/gwl/project/DGNav_new/habitat-lab/DGNav`
+
+其中旧工作区保留了很多历史训练/评估结果与 checkpoint，但 **Oracle 新功能主线** 是在 `DGNav_new_clean33_train_main` 里完成的。
+
+### 2. 当前已经实现的模块
+
+#### 2.1 配置层
+
+文件：
+
+- [default.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/config/default.py)
+- [eval_oracle_o1.yaml](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/run_r2r/eval_oracle_o1.yaml)
+
+当前规则：
+
+- 顶层配置节点保持为 `ORACLE`
+- `ORACLE` 内部字段以 **小写** 为 canonical key，例如：
+  - `ORACLE.enable`
+  - `ORACLE.cache_enable`
+  - `ORACLE.trace.enable`
+- 同时保留了对旧式大写 YAML 写法的兼容归一化，因此 `eval_oracle_o1.yaml` 里即使还是大写子键，运行时也会被自动映射到小写内部键
+
+#### 2.2 GraphMap 扩展
+
+文件：
+
+- [graph_utils.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/models/graph_utils.py)
+
+当前新增能力：
+
+- `ghost_oracle_embeds`
+- `ghost_oracle_meta`
+- `has_oracle_embed()`
+- `get_oracle_embed()`
+- `set_oracle_embed()`
+- `pop_oracle_embed()`
+
+当前读取逻辑：
+
+- 普通 node：仍然读取原始 node embedding
+- ghost：
+  - 若已有 oracle embed，`get_node_embeds()` 直接返回 oracle embed
+  - 否则回退到原始 `ghost_embeds` 聚合结果
+
+这意味着当前实现采用的是：
+
+- **persistent hard replace**
+
+即：一旦某个 ghost 被 Oracle 更新，后续规划器读到的就是替换后的 embedding。
+
+#### 2.3 Env Peek RPC
+
+文件：
+
+- [environments.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/common/environments.py)
+
+当前新增 RPC：
+
+- `get_oracle_pano_obs_at(position, heading_rad, ...)`
+
+当前语义：
+
+- 在指定未来位置和朝向处，临时获取一份完整 panorama observation
+- 内部会做 snapshot / restore，避免污染真实 agent 状态
+- `strict=True` 时，失败直接抛异常
+- `strict=False` 时，返回空 dict
+
+#### 2.4 Provider
+
+文件：
+
+- [providers.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/oracle/providers.py)
+- [types.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/oracle/types.py)
+
+当前实现的 provider 是：
+
+- `SimulatorPeekOracleProvider`
+
+当前主链路是：
+
+1. `envs.call_at(..., "get_oracle_pano_obs_at", ...)`
+2. `extract_instruction_tokens(...)`
+3. `batch_obs(...)`
+4. `apply_obs_transforms_batch(...)`
+5. `policy.net(mode="waypoint")`
+6. `_vp_feature_variable(...)`
+7. `policy.net(mode="panorama")`
+8. 计算 `avg_pano embedding`
+9. 返回 `OracleFeatureResult`
+
+这里要特别注意：
+
+- 当前写回 `GraphMap` 的 oracle embed **不是 instruction-conditioned 的**
+- 但它是 **heading-sensitive** 的
+- 因为 provider 的 query 过程中显式使用了 `query_heading_rad`
+
+#### 2.5 Manager
+
+文件：
+
+- [oracle_manager.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/oracle/oracle_manager.py)
+
+当前 manager 已实现的职责：
+
+- `eval-only` 生效控制
+- 全图 ghost 遍历
+- `new or changed` 刷新策略
+- `ghost_real_pos_mean` 位置策略
+- `face_frontier` 朝向策略
+- query 前的 navigability 检查与 fallback
+- provider 调用
+- provider 异常 soft-fail 兜底
+- oracle embedding 写回 `GraphMap`
+- trace 写盘
+- cache 查询/写入
+- step 级统计信息返回
+
+当前 `new or changed` 的判定依据是：
+
+- 没有 oracle embed：必查
+- 有 oracle embed，但 `ghost_real_pos` 统计发生变化，且 mean 位移超过阈值：刷新
+
+#### 2.6 Cache
+
+文件：
+
+- [cache.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/oracle/cache.py)
+
+当前 cache 已经不是最初的 `scene + pos`，而是：
+
+- **`scene_id + query_pos + query_heading_rad`**
+
+匹配规则：
+
+- 同 `scene_id`
+- 位置距离 `<= cache_radius`
+- heading 角距离 `<= 15°`（`pi / 12`）
+
+当前 cache **允许跨 episode 复用**，不会在 `one_episode_reset()` 时清空。
+
+另外：
+
+- cache 命中时会区分：
+  - `intra_episode_cache_hit_cnt`
+  - `cross_episode_cache_hit_cnt`
+
+#### 2.7 Trainer 接线
+
+文件：
+
+- [ss_trainer_ETP.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/ss_trainer_ETP.py)
+
+当前接线点有三处关键修改：
+
+1. `eval + ORACLE.enable + ORACLE.force_have_real_pos` 时，放开 `have_real_pos`
+2. `cand_real_pos` 的采集逻辑跟随 `have_real_pos`
+3. 在 `update_graph()` 之后、`_nav_gmap_variable()` 之前调用：
+   - `oracle_manager.step_update_oracle(...)`
+
+这就是当前 Oracle 主插桩点。
+
+### 3. 当前实际运行时数据流
+
+当前 Oracle eval 的主链，可以按下面理解：
+
+1. rollout 正常构造 waypoint / panorama / cand_real_pos
+2. `gmaps[i].update_graph(...)` 更新 topo 图与 ghost 信息
+3. `oracle_manager.step_update_oracle(...)` 被调用
+4. manager 对当前图中的 ghost 做：
+   - 位置解析
+   - heading 构造
+   - cache lookup
+   - miss 时调用 provider
+   - 成功后写回 `GraphMap`
+5. trainer 随后调用 `_nav_gmap_variable(...)`
+6. `gmap.get_node_embeds(...)` 这时已经会优先返回 oracle ghost embedding
+7. planner 当步就使用替换后的 ghost 特征
+
+换句话说，当前实现的控制点是：
+
+- **不是在 planner 之后修补**
+- 而是在 planner 构造输入之前，直接改写 planner 看到的 ghost 节点特征
+
+### 4. Trace 与摘要日志
+
+当前最小 trace 已落地，默认目录：
+
+- `data/logs/oracle_traces/`
+
+当前记录的主要事件：
+
+- `resolve_query_pos_failed`
+- `provider_query_failed`
+- 正常 query 返回
+
+当前 trainer 里还会打印一条 step 级摘要日志：
+
+- `[OracleSummary]`
+
+当前摘要里包含：
+
+- `query`
+- `success`
+- `fail`
+- `skipped`
+- `cache_hit`
+- `intra_ep_hit`
+- `cross_ep_hit`
+- `resolve_fail`
+- `provider_fail`
+- `avg_latency_ms`
+
+这条摘要是当前最主要的在线运行观察口。
+
+### 5. 正式运行入口
+
+当前正式 Oracle eval 不建议走：
+
+- `run_r2r/main.bash eval`
+
+原因是：
+
+- 那条老入口默认还是围绕 `iter_train.yaml`
+- 容易和当前 Oracle 专用评估配置混在一起
+
+当前建议的正式入口是：
+
+- [run_oracle_eval.bash](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/run_r2r/run_oracle_eval.bash)
+
+它内部默认使用：
+
+- [eval_oracle_o1.yaml](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/run_r2r/eval_oracle_o1.yaml)
+
+脚本支持直接改的常用参数包括：
+
+- `EXP_NAME`
+- `CKPT_PATH`
+- `NUM_ENVIRONMENTS`
+- `MASTER_PORT`
+- `EPISODE_COUNT`
+- `CPU_SET`
+- `SIMULATOR_GPU_IDS`
+- `TORCH_GPU_IDS`
+- `TORCH_GPU_ID`
+
+如果当前 shell 已经激活 `py3-9`，脚本会直接使用当前 `python`，避免 `conda run` 吞掉实时输出和进度条。
+
+### 6. 当前已完成的验证
+
+#### 6.1 2-episode smoke eval
+
+已经验证通过：
+
+- Oracle 主链真实生效
+- trace 文件生成
+- cache 命中生效
+- planner 已经使用 oracle 写回后的 ghost 特征
+
+#### 6.2 20-episode cross-episode smoke
+
+已经专门做过定向 smoke 验证跨 episode cache：
+
+- cache 机制本身有效
+- intra-episode hit 出现
+- 但这次定向 smoke 中，`cross_episode_cache_hit_cnt` 仍为 0
+
+这不代表跨 episode 逻辑无效，只代表：
+
+- 在当前这批 episode 的 `scene + pos + heading` 条件下，没有实际命中到跨 episode 可复用条目
+
+### 7. 当前已知约束与注意事项
+
+1. **heading 敏感**
+   - 当前 oracle embed 对 heading 敏感
+   - 所以 cache key 必须包含 heading，不能只按位置复用
+
+2. **不是 instruction-conditioned cache**
+   - 当前 cache 复用的风险主要来自 heading，而不是 instruction embedding
+   - 后续如果 pipeline 改成显式 text-conditioned，cache 设计要重新审视
+
+3. **主线以 clean33 为准**
+   - 后续任何继续开发或修复，都应优先修改：
+     - `/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav`
+
+4. **历史结果仍大量位于旧仓库**
+   - 一些 checkpoint、训练日志、历史 best_nav/best_gacc 结果仍在：
+     - `/home/gwl/project/DGNav_new/habitat-lab/DGNav/...`
+   - 这不影响 Oracle 功能本身，但容易造成“代码在 clean33、数据在旧仓库”的混淆
+
+### 8. 后续维护建议
+
+如果后续继续扩展 Oracle V1/V2，建议按这个顺序看代码：
+
+1. `run_r2r/eval_oracle_o1.yaml`
+2. `vlnce_baselines/config/default.py`
+3. `vlnce_baselines/ss_trainer_ETP.py`
+4. `vlnce_baselines/oracle/oracle_manager.py`
+5. `vlnce_baselines/oracle/providers.py`
+6. `vlnce_baselines/oracle/cache.py`
+7. `vlnce_baselines/models/graph_utils.py`
+8. `vlnce_baselines/common/environments.py`
+
+这个顺序基本对应当前运行时的调用链，也最适合后续 AI 或人工接手排查问题。

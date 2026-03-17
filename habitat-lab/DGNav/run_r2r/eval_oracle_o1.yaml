@@ -25,6 +25,7 @@ EVAL:
   USE_CKPT_CONFIG: False
   SPLIT: val_unseen
   EPISODE_COUNT: -1
+  EPISODE_ID_FILE: ""
   CKPT_PATH_DIR: data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter13200.pth
   fast_eval: False
 

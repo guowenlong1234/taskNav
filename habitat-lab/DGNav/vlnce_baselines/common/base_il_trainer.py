@@ -823,6 +823,60 @@ class BaseVLNCETrainer(BaseILTrainer):
 
         return trajectories
 
+    def _apply_eval_episode_subset(self, trajectories: List[str]) -> List[str]:
+        episode_id_file = getattr(self.config.EVAL, "EPISODE_ID_FILE", "")
+        if not episode_id_file:
+            return trajectories
+
+        subset_path = episode_id_file
+        if not os.path.isabs(subset_path):
+            subset_path = os.path.join(os.getcwd(), subset_path)
+        subset_path = os.path.abspath(subset_path)
+
+        if not os.path.isfile(subset_path):
+            raise FileNotFoundError(
+                f"EVAL.EPISODE_ID_FILE not found: {subset_path}"
+            )
+
+        with open(subset_path, "r") as f:
+            subset_ids = [line.strip() for line in f if line.strip()]
+
+        unique_subset_ids = list(dict.fromkeys(subset_ids))
+        subset_id_set = set(unique_subset_ids)
+        loaded_subset_count = len(subset_ids)
+        unique_subset_count = len(unique_subset_ids)
+        if loaded_subset_count != 500 or unique_subset_count != 500:
+            raise ValueError(
+                "Fixed eval subset must contain exactly 500 unique episode IDs, "
+                f"got loaded={loaded_subset_count}, unique={unique_subset_count}"
+            )
+
+        available_ids = {str(ep_id) for ep_id in trajectories}
+        missing_ids = [ep_id for ep_id in unique_subset_ids if ep_id not in available_ids]
+        filtered_trajectories = [
+            ep_id for ep_id in trajectories if str(ep_id) in subset_id_set
+        ]
+
+        if self.local_rank < 1:
+            logger.info(f"[EvalSubset] episode subset file path: {subset_path}")
+            logger.info(f"[EvalSubset] loaded_subset_count={loaded_subset_count}")
+            logger.info(f"[EvalSubset] missing_ids_count={len(missing_ids)}")
+            logger.info(f"[EvalSubset] final_allowed_episodes={len(filtered_trajectories)}")
+
+        if missing_ids:
+            missing_preview = ", ".join(map(str, missing_ids[:10]))
+            raise ValueError(
+                "Episode subset contains IDs outside current val split: "
+                f"{missing_preview}"
+            )
+        if len(filtered_trajectories) != 500:
+            raise ValueError(
+                "Filtered eval trajectories must contain exactly 500 episodes, "
+                f"got {len(filtered_trajectories)}"
+            )
+
+        return filtered_trajectories
+
     def eval(self):
         r"""Main method of trainer evaluation. Calls _eval_checkpoint() that
         is specified in Trainer class that inherits from BaseRLTrainer
@@ -903,7 +957,8 @@ class BaseVLNCETrainer(BaseILTrainer):
             self.config.TORCH_GPU_ID = self.config.TORCH_GPU_IDS[self.local_rank]
             self.config.freeze()
         self.traj = self.collect_val_traj()
-        
+        self.traj = self._apply_eval_episode_subset(self.traj)
+
         with TensorboardWriter(
             self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
         ) as writer:

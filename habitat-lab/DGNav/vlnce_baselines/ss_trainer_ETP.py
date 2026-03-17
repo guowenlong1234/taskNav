@@ -132,6 +132,7 @@ class RLTrainer(BaseVLNCETrainer):
         self._perf_timing_path = None
         self._train_rollout_counter = 0
         self._warned_missing_collisions = False
+        self._oracle_summary_path = None
 
     def _init_perf_timing_log(self):
         if self.local_rank != 0:
@@ -190,6 +191,28 @@ class RLTrainer(BaseVLNCETrainer):
             f"{timing_info['env_call_at_requests']}\n"
         )
         self._perf_timing_fh.write(line)
+
+    def _get_oracle_summary_path(self):
+        if self.local_rank != 0:
+            return None
+        if self._oracle_summary_path is None:
+            summary_dir = os.path.join("data", "logs", "oracle_summaries")
+            os.makedirs(summary_dir, exist_ok=True)
+            exp_name = getattr(self.config, "EXP_NAME", "exp")
+            split = getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval")
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._oracle_summary_path = os.path.join(
+                summary_dir,
+                f"{exp_name}_{split}_rank{self.local_rank}_{ts}.log",
+            )
+        return self._oracle_summary_path
+
+    def _write_oracle_summary_log(self, line: str) -> None:
+        path = self._get_oracle_summary_path()
+        if path is None:
+            return
+        with open(path, "a", encoding="utf-8", buffering=1) as f:
+            f.write(line + "\n")
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
@@ -1587,7 +1610,7 @@ class RLTrainer(BaseVLNCETrainer):
                     intra_hit_cnt = int(oracle_stats.get("intra_episode_cache_hit_cnt", 0))
                     cross_hit_cnt = int(oracle_stats.get("cross_episode_cache_hit_cnt", 0))
                     cache_hit_pct = (cache_hit_cnt / query_cnt) if query_cnt > 0 else 0.0
-                    logger.info(
+                    oracle_summary_line = (
                         "[OracleSummary] "
                         f"step={stepk} query={query_cnt} "
                         f"success={int(oracle_stats.get('success_cnt', 0))} "
@@ -1600,6 +1623,7 @@ class RLTrainer(BaseVLNCETrainer):
                         f"provider_fail={int(oracle_stats.get('provider_fail_cnt', 0))} "
                         f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f}"
                     )
+                    self._write_oracle_summary_log(oracle_summary_line)
             
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)  
         #             return {
