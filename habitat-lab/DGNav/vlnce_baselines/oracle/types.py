@@ -10,12 +10,15 @@ class OracleQuerySpec:
     split: str          #当前数据集划分
     scene_id :str       #场景所在id
     episode_id: str     #当前导航episode的id
-    env_index: int      #环境索引
+    active_env_index: int      #当前 active 子批次环境索引
+    original_env_index: int  #原始 vec env 槽位索引，用于调试/审计
     stepk: int          #第几个高层决策步
 
     ghost_vp_id: str    #目标ghost节点id
     front_vp_ids: List[str] #这个 ghost 是从哪些 front/node 被看见的。通常对应
     chosen_front_vp_id: Optional[str]   #这次 query 最终选用哪个 front 作为参考点。主要用于算朝向，比如“面向 frontier”
+    source_member_index: Optional[int]  #与最终 query_pos 绑定的 ghost member 索引
+    source_member_real_pos: Optional[Vec3]  #与最终 query_pos 绑定的 ghost member 真实位置
     query_pos: Vec3     #要去 peek 的目标位置
     query_heading_rad: float    #query_heading_rad: float
 

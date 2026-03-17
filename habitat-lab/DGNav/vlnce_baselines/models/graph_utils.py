@@ -270,6 +270,46 @@ class GraphMap(object):
         if self.has_real_pos:
             self.ghost_real_pos.pop(vp)
 
+    def get_ghost_members(self, ghost_vp_id):
+        if ghost_vp_id not in self.ghost_mean_pos:
+            raise ValueError(f"{ghost_vp_id} is not a valid ghost node")
+        if not self.has_real_pos:
+            raise ValueError("ghost member binding requires has_real_pos=True")
+        if ghost_vp_id not in self.ghost_real_pos:
+            raise ValueError(f"{ghost_vp_id} has no ghost_real_pos")
+        if ghost_vp_id not in self.ghost_fronts:
+            raise ValueError(f"{ghost_vp_id} has no ghost_fronts")
+        if ghost_vp_id not in self.ghost_pos:
+            raise ValueError(f"{ghost_vp_id} has no ghost_pos")
+
+        real_pos_list = self.ghost_real_pos[ghost_vp_id]
+        front_vp_list = self.ghost_fronts[ghost_vp_id]
+        cand_pos_list = self.ghost_pos[ghost_vp_id]
+
+        if not (
+            len(real_pos_list) == len(front_vp_list) == len(cand_pos_list)
+        ):
+            raise ValueError(
+                f"ghost member binding mismatch for {ghost_vp_id}: "
+                f"len(real_pos)={len(real_pos_list)} "
+                f"len(fronts)={len(front_vp_list)} "
+                f"len(cand_pos)={len(cand_pos_list)}"
+            )
+
+        members = []
+        for idx, (real_pos, front_vp_id, cand_pos) in enumerate(
+            zip(real_pos_list, front_vp_list, cand_pos_list)
+        ):
+            members.append(
+                {
+                    "index": idx,
+                    "real_pos": tuple(np.asarray(real_pos).tolist()),
+                    "front_vp_id": front_vp_id,
+                    "cand_pos": tuple(np.asarray(cand_pos).tolist()),
+                }
+            )
+        return members
+
     def update_graph(self, prev_vp, step_id,
                            cur_vp, cur_pos, cur_embeds,
                            cand_vp, cand_pos, cand_embeds, 

@@ -86,8 +86,11 @@ class OracleExperimentManager:
         scene_id: str,
         episode_id: str,
         stepk: int,
+        original_env_index: int,
         ghost_vp_id: str,
         chosen_front_vp_id: Optional[str],
+        source_member_index: Optional[int],
+        source_member_real_pos,
         pos_strategy: str,
         heading_strategy: str,
         pipeline: str,
@@ -110,10 +113,15 @@ class OracleExperimentManager:
             "split": self.split,
             "scene_id": scene_id,
             "episode_id": episode_id,
-            "env_index": env_index,
+            "active_env_index": env_index,
+            "original_env_index": original_env_index,
             "stepk": stepk,
             "ghost_vp_id": ghost_vp_id,
             "chosen_front_vp_id": chosen_front_vp_id,
+            "source_member_index": source_member_index,
+            "source_member_real_pos": None
+            if source_member_real_pos is None
+            else list(source_member_real_pos),
             "pos_strategy": pos_strategy,
             "heading_strategy": heading_strategy,
             "pipeline": pipeline,
@@ -141,41 +149,97 @@ class OracleExperimentManager:
             )
         )
 
-    def _resolve_query_pos(self, env_index: int, gmap, ghost_vp_id: str, real_pos_list, real_pos_mean):
+    @staticmethod
+    def _select_nearest_member(members, target_pos):
+        if len(members) == 0:
+            return None
+        target = np.asarray(target_pos)
+        return min(
+            members,
+            key=lambda member: np.linalg.norm(
+                np.asarray(member["real_pos"]) - target
+            ),
+        )
+
+    def _resolve_query_target(self, env_index: int, gmap, ghost_vp_id: str, real_pos_mean):
         base_strategy = self.config_oracle.query_pos_strategy   #读取主策略
         fallback_strategy = self.config_oracle.query_pos_fallback   #读取回退策略
+        try:
+            members = gmap.get_ghost_members(ghost_vp_id)
+        except ValueError:
+            return None, "resolve_member_binding_failed"
 
-        query_pos = tuple(np.asarray(real_pos_mean).tolist())   #整理真实位置格式
-        if (not self.config_oracle.navigability_check) or self._is_navigable(env_index, query_pos):
+        if len(members) == 0:
+            return None, "resolve_member_binding_failed"
 
-            #如果不开启导航检查或者导航位置点可用，就返回这个目标位置和选点策略
-            return query_pos, base_strategy
+        def _build_target(query_pos, pos_strategy):
+            source_member = self._select_nearest_member(members, query_pos)
+            if source_member is None:
+                return None, "resolve_member_binding_failed"
 
-        #如果检查点核验不通过并且回退策略是nearest_real_pos的话，执行以下代码
+            source_front_vp_id = source_member["front_vp_id"]
+            if source_front_vp_id is None or source_front_vp_id not in gmap.node_pos:
+                return None, "resolve_bound_front_failed"
+
+            return {
+                "query_pos": tuple(np.asarray(query_pos).tolist()),
+                "query_pos_strategy": pos_strategy,
+                "source_member_index": int(source_member["index"]),
+                "source_member_real_pos": tuple(
+                    np.asarray(source_member["real_pos"]).tolist()
+                ),
+                "source_front_vp_id": source_front_vp_id,
+            }, None
+
+        query_pos = tuple(np.asarray(real_pos_mean).tolist())
+        if (not self.config_oracle.navigability_check) or self._is_navigable(
+            env_index, query_pos
+        ):
+            return _build_target(query_pos, base_strategy)
+
         if fallback_strategy == "nearest_real_pos":
-
-            sorted_real_pos = sorted(
-                real_pos_list,
-                key=lambda pos: np.linalg.norm(np.asarray(pos) - np.asarray(real_pos_mean)),
+            sorted_members = sorted(
+                members,
+                key=lambda member: np.linalg.norm(
+                    np.asarray(member["real_pos"]) - np.asarray(real_pos_mean)
+                ),
             )
-            #对所有的real_pos_list排序，按照离目标点最近的顺序排序
+            for member in sorted_members:
+                candidate = tuple(np.asarray(member["real_pos"]).tolist())
+                if (not self.config_oracle.navigability_check) or self._is_navigable(
+                    env_index, candidate
+                ):
+                    source_front_vp_id = member["front_vp_id"]
+                    if source_front_vp_id is None or source_front_vp_id not in gmap.node_pos:
+                        return None, "resolve_bound_front_failed"
+                    return {
+                        "query_pos": candidate,
+                        "query_pos_strategy": fallback_strategy,
+                        "source_member_index": int(member["index"]),
+                        "source_member_real_pos": tuple(
+                            np.asarray(member["real_pos"]).tolist()
+                        ),
+                        "source_front_vp_id": source_front_vp_id,
+                    }, None
 
-            #按照刚刚排好的序，一个一个尝试是否可行
-            for pos in sorted_real_pos:
-                candidate = tuple(np.asarray(pos).tolist())
-                if (not self.config_oracle.navigability_check) or self._is_navigable(env_index, candidate):
-                    #如果不用做导航检测或者这个点可达，就返回这个点和选点策略
-                    return candidate, fallback_strategy
-                
         elif fallback_strategy == "ghost_mean_pos":
-            #如果回退选点规则是ghost_mean_pos，就用平均位置作为选点依据，返回选点策略和这个点本身
             candidate = tuple(np.asarray(gmap.ghost_mean_pos[ghost_vp_id]).tolist())
-            if (not self.config_oracle.navigability_check) or self._is_navigable(env_index, candidate):
-                return candidate, fallback_strategy
+            if (not self.config_oracle.navigability_check) or self._is_navigable(
+                env_index, candidate
+            ):
+                return _build_target(candidate, fallback_strategy)
 
-        return None, None   #如果回退和主策略都失败了，返回None
+        return None, "resolve_query_pos_failed"   #如果回退和主策略都失败了，返回None
 
-    def _should_query_ghost(self, gmap, ghost_vp_id, real_pos_count, real_pos_mean):
+    def _should_query_ghost(
+        self,
+        gmap,
+        ghost_vp_id,
+        real_pos_count,
+        real_pos_mean,
+        source_member_index,
+        source_front_vp_id,
+    ):
         """
          只负责判断当前 ghost 这一步要不要 query,不做 query 本身
         """
@@ -195,9 +259,16 @@ class OracleExperimentManager:
         meta = gmap.ghost_oracle_meta.get(ghost_vp_id, {})
         prev_count = meta.get("real_pos_count")
         prev_mean = meta.get("real_pos_mean")
+        prev_source_member_index = meta.get("query_source_index")
+        prev_source_front_vp_id = meta.get("query_source_front_vp_id")
 
         #旧 meta 不完整，那 safest 的做法就是重新查一次
-        if prev_count is None or prev_mean is None:
+        if (
+            prev_count is None
+            or prev_mean is None
+            or prev_source_member_index is None
+            or prev_source_front_vp_id is None
+        ):
             return True
         
         #count_changed：这次 ghost 累积到的真实位置样本数变没变
@@ -205,9 +276,16 @@ class OracleExperimentManager:
 
         #mean_delta：这次真实位置均值，和上次 query 时相比移动了多少米
         mean_delta = np.linalg.norm(np.asarray(real_pos_mean) - np.asarray(prev_mean))
+        source_member_changed = (source_member_index != prev_source_member_index)
+        source_front_changed = (source_front_vp_id != prev_source_front_vp_id)
 
-        #只有同时满足：样本数变了，均值位置变化超过阈值才重新 query
-        if count_changed and mean_delta >= self.config_oracle.requery_min_pos_delta:
+        # 只要任一语义相关因素变化，就重新 query
+        if (
+            count_changed
+            or source_member_changed
+            or source_front_changed
+            or mean_delta >= self.config_oracle.requery_min_pos_delta
+        ):
             return True
         else:
             return False
@@ -284,6 +362,7 @@ class OracleExperimentManager:
                         "skipped_cnt":0,
                     }
             for active_i, (gmap, ep) in enumerate(zip(gmaps, current_episodes)):
+                original_env_index = env_indices[active_i]
                 ghost_vp_ids = list(gmap.ghost_mean_pos.keys())
                 for ghost_vp_id in ghost_vp_ids:
                     if (not gmap.has_real_pos) or (ghost_vp_id not in gmap.ghost_real_pos):
@@ -296,22 +375,13 @@ class OracleExperimentManager:
                     #在当前V1版本，是通过平均真实位置进行预测的
                     real_pos_mean = tuple(np.mean(real_pos_list, axis=0).tolist())
 
-                    if not self._should_query_ghost(gmap=gmap,
-                                                ghost_vp_id= ghost_vp_id,
-                                                real_pos_count=len(real_pos_list),
-                                                real_pos_mean=real_pos_mean):
-                        #不需要计算即直接取cache
-                        stats["skipped_cnt"] += 1
-                        continue
-
-                    query_pos, query_pos_strategy = self._resolve_query_pos(
+                    target, resolve_reason = self._resolve_query_target(
                         active_i,
                         gmap,
                         ghost_vp_id,
-                        real_pos_list,
                         real_pos_mean,  #这里默认是按照主策略(平均位置)进行选点的
                     )
-                    if query_pos is None:   #如果是空，则表示选点失败了，失败计数加一。
+                    if target is None:   #如果是空，则表示选点失败了，失败计数加一。
                         stats["fail_cnt"] += 1      #总失败次数加一
                         stats["resolve_fail_cnt"] += 1  #解析失败次数加一
                         self._trace_query_event(            #用于定位问题出现在哪
@@ -319,15 +389,18 @@ class OracleExperimentManager:
                             scene_id=ep.scene_id,
                             episode_id=ep.episode_id,
                             stepk=stepk,
+                            original_env_index=original_env_index,
                             ghost_vp_id=ghost_vp_id,
                             chosen_front_vp_id=None,
+                            source_member_index=None,
+                            source_member_real_pos=None,
                             pos_strategy=self.config_oracle.query_pos_strategy,
                             heading_strategy=self.config_oracle.query_heading_strategy,
                             pipeline=self.config_oracle.query_pipeline,
                             query_pos=None,
                             query_heading_rad=None,
                             ok=False,
-                            reason="resolve_query_pos_failed",      #失败的错误原因
+                            reason=resolve_reason,      #失败的错误原因
                             cache_hit=False,
                             used_pos=None,
                             used_heading_rad=None,
@@ -335,14 +408,30 @@ class OracleExperimentManager:
                         )
                         continue
 
+                    query_pos = target["query_pos"]
+                    query_pos_strategy = target["query_pos_strategy"]
+                    source_member_index = target["source_member_index"]
+                    source_member_real_pos = target["source_member_real_pos"]
+                    chosen_front_vp_id = target["source_front_vp_id"]
+
+                    if not self._should_query_ghost(
+                        gmap=gmap,
+                        ghost_vp_id=ghost_vp_id,
+                        real_pos_count=len(real_pos_list),
+                        real_pos_mean=real_pos_mean,
+                        source_member_index=source_member_index,
+                        source_front_vp_id=chosen_front_vp_id,
+                    ):
+                        stats["skipped_cnt"] += 1
+                        continue
+
                     #接下来计算query_heading，当前V1版本按照真实朝向计算
                     front_vp_ids = list(gmap.ghost_fronts[ghost_vp_id])
-                    _, chosen_front_vp_id = gmap.front_to_ghost_dist(ghost_vp_id)
                     front_pos = gmap.node_pos[chosen_front_vp_id]
 
                     query_heading_rad, _, _ = calculate_vp_rel_pos_fts(
-                                                        np.asarray(front_pos),
                                                         np.asarray(query_pos),
+                                                        np.asarray(front_pos),
                                                         base_heading=0.0,
                                                         base_elevation=0.0,
                                                         to_clock=False,
@@ -353,11 +442,14 @@ class OracleExperimentManager:
                         split=self.split,
                         scene_id=ep.scene_id,
                         episode_id=ep.episode_id,
-                        env_index=active_i,
+                        active_env_index=active_i,
+                        original_env_index=original_env_index,
                         stepk=stepk,
                         ghost_vp_id=ghost_vp_id,
                         front_vp_ids=front_vp_ids,
                         chosen_front_vp_id=chosen_front_vp_id,
+                        source_member_index=source_member_index,
+                        source_member_real_pos=source_member_real_pos,
                         query_pos=query_pos,
                         query_heading_rad=float(query_heading_rad),
                         pos_strategy=query_pos_strategy,
@@ -413,8 +505,11 @@ class OracleExperimentManager:
                                 scene_id=ep.scene_id,
                                 episode_id=ep.episode_id,
                                 stepk=stepk,
+                                original_env_index=original_env_index,
                                 ghost_vp_id=ghost_vp_id,
                                 chosen_front_vp_id=chosen_front_vp_id,
+                                source_member_index=source_member_index,
+                                source_member_real_pos=source_member_real_pos,
                                 pos_strategy=query_pos_strategy,
                                 heading_strategy="face_frontier",
                                 pipeline="future_node_avg_pano",
@@ -440,6 +535,10 @@ class OracleExperimentManager:
                                 "used_heading_rad": result.used_heading_rad,
                                 "real_pos_count": len(real_pos_list),
                                 "real_pos_mean": real_pos_mean,
+                                "query_source_index": source_member_index,
+                                "query_source_real_pos": source_member_real_pos,
+                                "query_source_front_vp_id": chosen_front_vp_id,
+                                "query_pos_strategy": query_pos_strategy,
                             },#meta是特征相关的上下文，方便后续统计调试
                         )
                         if self.cache is not None and (not result.cache_hit):
@@ -452,6 +551,10 @@ class OracleExperimentManager:
                                     "used_pos": result.used_pos,
                                     "used_heading_rad": result.used_heading_rad,
                                     "source_episode_id": ep.episode_id,
+                                    "query_source_index": source_member_index,
+                                    "query_source_real_pos": source_member_real_pos,
+                                    "query_source_front_vp_id": chosen_front_vp_id,
+                                    "query_pos_strategy": query_pos_strategy,
                                 },
                             )
 
@@ -475,8 +578,11 @@ class OracleExperimentManager:
                         scene_id=ep.scene_id,
                         episode_id=ep.episode_id,
                         stepk=stepk,
+                        original_env_index=original_env_index,
                         ghost_vp_id=ghost_vp_id,
                         chosen_front_vp_id=chosen_front_vp_id,
+                        source_member_index=source_member_index,
+                        source_member_real_pos=source_member_real_pos,
                         pos_strategy=query_pos_strategy,
                         heading_strategy="face_frontier",
                         pipeline="future_node_avg_pano",

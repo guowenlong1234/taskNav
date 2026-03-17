@@ -28,7 +28,7 @@ fi
 conda_env="${CONDA_ENV:-py3-9}"
 experiment_variant="${EXPERIMENT_VARIANT:-oracle_cache}"
 
-master_port="${MASTER_PORT:-2685}"
+master_port="${MASTER_PORT:-4565}"
 
 config_path="${CONFIG_PATH:-run_r2r/eval_oracle_o1.yaml}"
 ckpt_path="${CKPT_PATH:-/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter21800.pth}"

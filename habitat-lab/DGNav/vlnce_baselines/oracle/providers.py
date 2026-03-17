@@ -49,7 +49,7 @@ class SimulatorPeekOracleProvider(OracleProvider):
     def query(self,spec):
         t0 = time.perf_counter()
         try:
-            env_index = spec.env_index
+            env_index = spec.active_env_index
             query_pos = spec.query_pos
             query_heading_rad = spec.query_heading_rad
 
@@ -124,7 +124,12 @@ class SimulatorPeekOracleProvider(OracleProvider):
                 latency_ms = (time.perf_counter() - t0) * 1000.0
             )
         except Exception as e:
-            raise RuntimeError(f"query过程报错,episode_id = {spec.episode_id}/ ghost_vp_id = {spec.ghost_vp_id}/ env_index = {spec.env_index}") from e
+            raise RuntimeError(
+                f"query过程报错,episode_id = {spec.episode_id}/ "
+                f"ghost_vp_id = {spec.ghost_vp_id}/ "
+                f"active_env_index = {spec.active_env_index}/ "
+                f"original_env_index = {spec.original_env_index}"
+            ) from e
 
 
     def _vp_feature_variable(self, obs):
@@ -183,4 +188,3 @@ class SimulatorPeekOracleProvider(OracleProvider):
             'rgb_fts': batch_rgb_fts, 'dep_fts': batch_dep_fts, 'loc_fts': batch_loc_fts,
             'nav_types': batch_nav_types, 'view_lens': batch_view_lens,
         }
-
