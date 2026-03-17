@@ -23,6 +23,7 @@ This module API is experimental and likely to change
 import abc
 import copy
 import numbers
+import os
 import re
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
@@ -1203,9 +1204,17 @@ def get_active_obs_transforms(
     config: "DictConfig", agent_name: str = None
 ) -> List[ObservationTransformer]:
     active_obs_transforms = []
+    diag_mode = os.environ.get(
+        "DGNAV_DIAG_OBS_TRANSFORM_MODE", "compat_33"
+    ).strip().lower()
+    if diag_mode not in {"compat_33", "legacy_yacs"}:
+        raise ValueError(
+            "Invalid DGNAV_DIAG_OBS_TRANSFORM_MODE="
+            f"{diag_mode}. Expected one of: compat_33, legacy_yacs."
+        )
 
     # Hydra-style Habitat-Baselines 0.3.x config.
-    if hasattr(config, "habitat_baselines"):
+    if diag_mode == "compat_33" and hasattr(config, "habitat_baselines"):
         # When using observation transformations, we
         # assume for now that the observation space is shared among agents
         agent_name = list(config.habitat_baselines.rl.policy.keys())[0]
@@ -1251,6 +1260,11 @@ def get_active_obs_transforms(
             # DGNav custom transformers expect the full experiment config.
             obs_transform = obs_trans_cls.from_config(config)
             active_obs_transforms.append(obs_transform)
+    elif diag_mode == "legacy_yacs":
+        raise ValueError(
+            "DGNAV_DIAG_OBS_TRANSFORM_MODE=legacy_yacs requested, "
+            "but config.RL.POLICY.OBS_TRANSFORMS is not available."
+        )
 
     return active_obs_transforms
 

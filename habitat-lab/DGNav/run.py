@@ -9,9 +9,19 @@ from pathlib import Path
 
 
 def _prepend_local_habitat_paths() -> None:
-    """Force using Habitat-Lab/Baselines from the current DGNav_new tree."""
+    """Force using Habitat-Lab/Baselines from the configured DGNav tree."""
     dgnav_dir = Path(__file__).resolve().parent
-    repo_root = dgnav_dir.parent
+    expected_repo_root = dgnav_dir.parent.resolve()
+    repo_root_env = os.environ.get("DGNAV_HABITAT_REPO_ROOT", "").strip()
+    if repo_root_env:
+        repo_root = Path(repo_root_env).expanduser().resolve()
+        if repo_root != expected_repo_root:
+            raise RuntimeError(
+                "DGNAV_HABITAT_REPO_ROOT must point to the clean DGNav worktree. "
+                f"Got {repo_root}, expected {expected_repo_root}."
+            )
+    else:
+        repo_root = expected_repo_root
     local_habitat_lab = repo_root / "habitat-lab"
     local_habitat_baselines = repo_root / "habitat-baselines"
 
@@ -20,6 +30,33 @@ def _prepend_local_habitat_paths() -> None:
         p_str = str(p)
         if p_str not in sys.path:
             sys.path.insert(0, p_str)
+
+
+def _assert_local_import_roots() -> None:
+    dgnav_dir = Path(__file__).resolve().parent
+    expected_repo_root = dgnav_dir.parent.resolve()
+    expected_habitat_baselines_root = (
+        expected_repo_root / "habitat-baselines"
+    ).resolve()
+    expected_vlnce_root = dgnav_dir.resolve()
+
+    import habitat_baselines
+    import vlnce_baselines
+
+    habitat_baselines_file = Path(habitat_baselines.__file__).resolve()
+    vlnce_baselines_file = Path(vlnce_baselines.__file__).resolve()
+
+    if not habitat_baselines_file.is_relative_to(expected_habitat_baselines_root):
+        raise RuntimeError(
+            "habitat_baselines was imported from an unexpected path. "
+            f"Got {habitat_baselines_file}, expected under "
+            f"{expected_habitat_baselines_root}."
+        )
+    if not vlnce_baselines_file.is_relative_to(expected_vlnce_root):
+        raise RuntimeError(
+            "vlnce_baselines was imported from an unexpected path. "
+            f"Got {vlnce_baselines_file}, expected under {expected_vlnce_root}."
+        )
 
 
 def _patch_habitat_legacy_config_api() -> None:
@@ -112,6 +149,7 @@ def _patch_habitat_legacy_config_api() -> None:
 
 _prepend_local_habitat_paths()
 _patch_habitat_legacy_config_api()
+_assert_local_import_roots()
 
 import numpy as np
 import torch
@@ -119,7 +157,6 @@ from habitat import logger
 from habitat_baselines.common.baseline_registry import baseline_registry
 
 import habitat_extensions  # noqa: F401
-import vlnce_baselines  # noqa: F401
 from vlnce_baselines.config.default import get_config
 # from vlnce_baselines.nonlearning_agents import (
 #     evaluate_agent,
@@ -173,6 +210,8 @@ def run_exp(exp_name: str, exp_config: str,
     """
     config = get_config(exp_config, opts)
     config.defrost()
+    config.set_new_allowed(True)
+    config.EXP_NAME = exp_name
 
     config.TENSORBOARD_DIR += exp_name
     config.CHECKPOINT_FOLDER += exp_name
@@ -189,6 +228,7 @@ def run_exp(exp_name: str, exp_config: str,
     # torch.distributed.run sets LOCAL_RANK via env; torch.distributed.launch
     # may still pass --local_rank explicitly.
     config.local_rank = int(os.environ.get("LOCAL_RANK", local_rank))
+    config.set_new_allowed(False)
     config.freeze()
     os.system("mkdir -p data/logs/running_log")
     logger.add_filehandler('data/logs/running_log/'+config.LOG_FILE)

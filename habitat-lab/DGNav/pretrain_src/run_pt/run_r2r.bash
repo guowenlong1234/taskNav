@@ -1,7 +1,7 @@
 
 NODE_RANK=0
 NUM_GPUS=1  
-outdir=pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s
+outdir=pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2_clean
 
 python pretrain_src/pretrain_src/train_r2r.py \
     --world_size ${NUM_GPUS} \

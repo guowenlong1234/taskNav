@@ -5,6 +5,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from habitat.tasks.utils import cartesian_to_polar
 from habitat.utils.geometry_utils import quaternion_rotate_vector, quaternion_from_coeff
+import torch
 
 MAX_DIST = 30
 MAX_STEP = 10
@@ -136,29 +137,90 @@ class FloydGraph(object):
 
 
 class GraphMap(object):
-    def __init__(self, has_real_pos, loc_noise, merge_ghost, ghost_aug):
+    def __init__(self, has_real_pos, loc_noise, merge_ghost, ghost_aug, oracle_cfg = None):
 
+        self.oracle_cfg = oracle_cfg
         self.graph_nx = nx.Graph()
 
-        self.node_pos = {}          # viewpoint to position (x, y, z)
-        self.node_embeds = {}       # viewpoint to pano feature
+        self.node_pos = {}          # 视点的位置
+        self.node_embeds = {}       # 视点的特征值
         self.node_stepId = {}
 
-        self.ghost_cnt = 0          # id to create ghost 
-        self.ghost_pos = {}
-        self.ghost_mean_pos = {}
-        self.ghost_embeds = {}      # viewpoint to single_view feature
-        self.ghost_fronts = {}      # viewpoint to front_vp id
-        self.ghost_real_pos = {}    # for training
-        self.has_real_pos = has_real_pos
-        self.merge_ghost = merge_ghost
-        self.ghost_aug = ghost_aug  # 0 ~ 1, noise level
-        self.loc_noise = loc_noise
+        self.ghost_cnt = 0          # 节点计数变量
+        self.ghost_pos = {}         #ghost节点位置
+        self.ghost_mean_pos = {}    #ghost节点平均位置
+        self.ghost_embeds = {}      #ghost特征编码
+        self.ghost_fronts = {}      #从哪个节点能看到这个ghost节点
+        self.ghost_real_pos = {}    #ghost节点的真实位置
+        self.has_real_pos = has_real_pos        #是否拥有真实的位置
+        self.merge_ghost = merge_ghost          #新预测出来的节点是否要和原本节点进行合并
+        self.ghost_aug = ghost_aug  # 0 ~ 1, noise level，干扰水平
+        self.loc_noise = loc_noise              #是否开启干扰
 
-        self.shortest_path = None
-        self.shortest_dist = None
+        self.shortest_path = None   #最短路径
+        self.shortest_dist = None   #最短距离
         
-        self.node_stop_scores = {}  # viewpoint to stop_score
+        self.node_stop_scores = {}  # 当前节点的停止得分
+
+        #新增：oracle ghost embedding
+        self.ghost_oracle_embeds = {}
+        #oracle 元信息,可用于刷新判定与trace
+        self.ghost_oracle_meta = {}
+
+
+    def has_oracle_embed(self, vp_id:str)->bool:
+        '''
+        返回:vp_id 是否存在 oracle embedding。
+        异常：无
+        '''
+        return vp_id in self.ghost_oracle_embeds
+        
+
+    def get_oracle_embed(self, vp_id:str):
+        '''
+        返回 oracle embedding 或 None。
+        异常KeyError 不抛出统一返回None。
+        '''
+        return self.ghost_oracle_embeds.get(vp_id, None)
+
+
+    def set_oracle_embed(self, vp_id: str, embed, meta=None, overwrite: bool = True):
+        if vp_id not in self.ghost_mean_pos:    #验证节点是不是ghost节点
+            raise ValueError(f"{vp_id} is not a valid ghost node")
+
+        if not isinstance(embed, torch.Tensor): #验证embed数据类型
+            raise ValueError("embed must be a torch.Tensor")
+
+        if embed.ndim != 1: #验证embed的维度
+            raise ValueError(f"embed must be 1D, got shape={tuple(embed.shape)}")
+
+        expected_shape = None
+        if self.node_embeds:    #取出自身node节点的维度
+            expected_shape = next(iter(self.node_embeds.values())).shape
+        elif self.ghost_embeds: #取出自身的ghost节点的维度
+            expected_shape = next(iter(self.ghost_embeds.values()))[0].shape
+
+        if expected_shape is not None and tuple(embed.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"embed shape mismatch, got {tuple(embed.shape)}, expected {tuple(expected_shape)}"
+            )
+
+        if (not overwrite) and self.has_oracle_embed(vp_id):
+            #如果你要求“不要覆盖旧值”，并且这个 ghost 已经有 oracle embedding，那就直接退出，不再写新值。
+            return
+
+        self.ghost_oracle_embeds[vp_id] = embed.detach().clone()
+        self.ghost_oracle_meta[vp_id] = {} if meta is None else dict(meta)
+
+
+    def pop_oracle_embed(self,vp_id:str):
+        '''
+        行为：若存在则删除 oracle embed 与 meta。
+        异常：无
+        '''
+        self.ghost_oracle_embeds.pop(vp_id, None)
+        self.ghost_oracle_meta.pop(vp_id, None)
+
 
     def _localize(self, qpos, kpos_dict, ignore_height=False, loc_noise=None):
         """
@@ -198,10 +260,13 @@ class GraphMap(object):
         return cur_vp, cand_vp, cand_pos
 
     def delete_ghost(self, vp):
-        self.ghost_pos.pop(vp)
+        self.ghost_pos.pop(vp)  
         self.ghost_mean_pos.pop(vp)
         self.ghost_embeds.pop(vp)
         self.ghost_fronts.pop(vp)
+
+        self.pop_oracle_embed(vp)   #调用pop_oracle_embed函数，更安全的删掉ghost_oracle_embed和ghost_oracle_meta
+
         if self.has_real_pos:
             self.ghost_real_pos.pop(vp)
 
@@ -311,10 +376,13 @@ class GraphMap(object):
         return min_dis, min_front
 
     def get_node_embeds(self, vp):
-        if not vp.startswith('g'):
-            return self.node_embeds[vp]
-        else:
-            return self.ghost_embeds[vp][0] / self.ghost_embeds[vp][1]
+        if not vp.startswith('g'):  #如果p是以g开头的，说明是普通节点
+            return self.node_embeds[vp] #直接返回节点保存的特征
+        else:   #如果是以g开头的，说明是ghost节点，ghost_embeds[vp][0]这个 ghost 被多次观测到时，所有 embedding 的累加和，ghost_embeds[vp][1]：累计了多少次
+            if self.oracle_cfg is not None and self.oracle_cfg.ENABLE and vp in self.ghost_oracle_embeds:
+                return self.get_oracle_embed(vp)
+            else:
+                return self.ghost_embeds[vp][0] / self.ghost_embeds[vp][1]  #返回ghost节点的平均特征值。
 
     def get_pos_fts(self, cur_vp, cur_pos, cur_ori, gmap_vp_ids):
         # dim=7 (sin(heading), cos(heading), sin(elevation), cos(elevation),

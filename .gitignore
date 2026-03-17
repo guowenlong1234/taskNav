@@ -12,6 +12,14 @@ __pycache__/
 
 # DGNav large data and generated artifacts
 /habitat-lab/DGNav/pretrain_src/datasets/
+/habitat-lab/DGNav/pretrain_src/datasets
+/habitat-lab/DGNav/pretrain_src/img_features/
+/habitat-lab/DGNav/pretrain_src/img_features
 /habitat-lab/DGNav/precompute_img_features/
 /habitat-lab/DGNav/pretrained/
+/habitat-lab/DGNav/pretrained
+/habitat-lab/DGNav/vlnce_baselines/models/train/
+/habitat-lab/DGNav/vlnce_baselines/models/train
+/habitat-lab/habitat-baselines/habitat_baselines/il/data/
+/habitat-lab/habitat-baselines/habitat_baselines/il/data
 /habitat-lab/DGNav/assets/

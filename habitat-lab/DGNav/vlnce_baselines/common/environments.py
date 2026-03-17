@@ -16,12 +16,13 @@ import os
 
 
 def quat_from_heading(heading, elevation=0):
-    array_h = np.array([0, heading, 0])
-    array_e = np.array([0, elevation, 0])
-    rotvec_h = R.from_rotvec(array_h)
-    rotvec_e = R.from_rotvec(array_e)
-    quat = (rotvec_h * rotvec_e).as_quat()
-    return quat
+    #heading存的是水平朝向角”，单位是弧度
+    array_h = np.array([0, heading, 0]) #把heading当成绕y轴的旋转量
+    array_e = np.array([0, elevation, 0])   #把elevation当成绕y轴的旋转量
+    rotvec_h = R.from_rotvec(array_h)   #变成一个旋转对象，绕y轴旋转heading弧度
+    rotvec_e = R.from_rotvec(array_e)   #变成一个旋转对象，绕y轴旋转ele弧度
+    quat = (rotvec_h * rotvec_e).as_quat()  #把两个旋转对象组合起来转成四元组，*表示复合旋转，先做一个旋转，在做另外一个旋转
+    return quat     #numpy 数组，长度 4，顺序 [x, y, z, w]
 
 def calculate_vp_rel_pos(p1, p2, base_heading=0, base_elevation=0):
     dx = p2[0] - p1[0]
@@ -93,20 +94,28 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         }
     
     def get_pos_ori(self):
+        #获取当前的朝向和位置
         agent_state = self._env.sim.get_agent_state()
-        pos = agent_state.position
-        ori = np.array([*(agent_state.rotation.imag), agent_state.rotation.real])
+        pos = agent_state.position  #机器人当前位置
+        ori = np.array([*(agent_state.rotation.imag), agent_state.rotation.real])   #ori = [x, y, z, w]在世界坐标系下的旋转状态
         return (pos, ori)
 
     def get_observation_at(self,
-        source_position: List[float],
-        source_rotation: List[Union[int, np.float64]],
-        keep_agent_at_new_pose: bool = False):
-        
-        obs = self._env.sim.get_observations_at(source_position, source_rotation, keep_agent_at_new_pose)
+        source_position: List[float],                   #agent的位置（x,y,z)
+        source_rotation: List[Union[int, np.float64]],  #agent的朝向，(w, x, y, z)类型不严格限定，可以是int或者f64
+        keep_agent_at_new_pose: bool = False):          #agent是否保持在最新位置
+        #获取当前的各种观测数据，包括rgbd在内的观测。
+        obs = self._env.sim.get_observations_at(source_position, source_rotation, keep_agent_at_new_pose)#从这个位置，这个指向拿到原始的观测数据，只有深度和rgb
+
         obs.update(self._env.task.sensor_suite.get_observations(
             observations=obs, episode=self._env.current_episode, task=self._env.task
-        ))
+        ))  #获取task级别的传感器观测数据，并且通过update函数拼接到观测中，最终返回完整的观测数据
+        #在当前工程中，GlobalGPSSensor，位置传感器，OrienSensor朝向，INSTRUCTION_SENSOR 是 Habitat/VLN 原生的“指令传感器”
+        #         {
+        #     "text": episode.instruction.instruction_text,
+        #     "tokens": episode.instruction.instruction_tokens,
+        #     "trajectory_id": episode.trajectory_id,
+        # }
         return obs
 
     def current_dist_to_goal(self):
@@ -122,29 +131,65 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         )
         return dist
     
+    def get_oracle_pano_obs_at(self,
+                               position,
+                               heading_rad,
+                               elevation_rad=0.0,
+                               keep_agent_at_new_pose=False,
+                               strict=True,):
+        #从指定位置获取oracle_pano_obs的观测
+        #strict 控制的是：当 peek 失败时，是“直接报错终止”，还是“吞掉错误并返回一个空结果/失败结果”。
+        #strict = true的意思是，这个函数只允许成功，不允许失败。失败就直接显式报错。
+        sim = self._env.sim
+        init_state = self._env.sim.get_agent_state()    #获取初始的位置
+        try:
+            if not self._env.sim.is_navigable(position):
+                if strict:
+                    raise RuntimeError(f"Failed to get oracle pano obs at position={position}, heading={heading_rad}")
+                else:
+                    return {}
+            rotation = quat_from_heading(heading_rad, elevation_rad)    #获取当前的朝向角度的四元组
+
+            obs = self.get_observation_at(position,
+                                            rotation,
+                                            keep_agent_at_new_pose) #从指定位置获取观测
+            return obs
+        except Exception as e:
+            if strict:
+                raise RuntimeError(f"Failed to get oracle pano obs at position={position}, heading={heading_rad}") from e
+            return {}
+
+        finally:
+            if not keep_agent_at_new_pose:  #回退到初始位置
+                sim.set_agent_state(init_state.position, init_state.rotation)
+
     def get_cand_real_pos(self, forward, angle):
         '''get cand real_pos by executing action'''
+        #在不真正改变当前环境状态的前提下，模拟执行一个候选动作，得到这个候选动作对应的“真实落点位置” post_pose
+        #forward前进的距离
+        #angle旋转的角度
 
         sim = self._env.sim
-        init_state = sim.get_agent_state()
+        init_state = sim.get_agent_state()  #记录当前agent的初始状态，主要是当前的位置和朝向
 
-        forward_action = HabitatSimActions.MOVE_FORWARD
-        init_forward = sim.get_agent(0).agent_config.action_space[forward_action].actuation.amount
+        forward_action = HabitatSimActions.MOVE_FORWARD     #取出前进一步这个动作
+        init_forward = sim.get_agent(0).agent_config.action_space[forward_action].actuation.amount  # 是这个动作每执行一次实际会前进多少米
 
-        theta = np.arctan2(init_state.rotation.imag[1], init_state.rotation.real) + angle / 2
+        #这段在做从当前四元数里提取出当前朝向角，加上候选转角 angle，构造一个新的朝向四元数，把 agent 放回原位置，但朝向改成新方向
+        theta = np.arctan2(init_state.rotation.imag[1], init_state.rotation.real) + angle / 2   #
         rotation = np.quaternion(np.cos(theta), 0, np.sin(theta), 0)
         sim.set_agent_state(init_state.position, rotation)
 
-        ksteps = int(forward//init_forward)
+        ksteps = int(forward//init_forward) #计算走了多少步
         for k in range(ksteps):
-            sim.step_without_obs(forward_action)
-        post_state = sim.get_agent_state()
+            sim.step_without_obs(forward_action)    #不带观测，走几步
+        post_state = sim.get_agent_state()  #获取当前的位置
         post_pose = post_state.position
 
         # reset agent state
-        sim.set_agent_state(init_state.position, init_state.rotation)
+        sim.set_agent_state(init_state.position, init_state.rotation)   #将agent回复到初始状态
         
-        return post_pose
+        return post_pose    #返回计算的虚拟位置。
 
     def current_dist_to_refpath(self, path):
         sim = self._env.sim

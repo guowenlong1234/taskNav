@@ -36,7 +36,8 @@ from vlnce_baselines.common.env_utils import construct_envs, construct_envs_for_
 from vlnce_baselines.common.utils import extract_instruction_tokens
 from vlnce_baselines.models.graph_utils import GraphMap, MAX_DIST
 from vlnce_baselines.utils import reduce_loss
-
+from vlnce_baselines.oracle.types import OracleFeatureResult,OracleQuerySpec
+from vlnce_baselines.oracle.oracle_manager import OracleExperimentManager
 from .utils import get_camera_orientations12
 from .utils import (
     length2mask, dir_angle_feature_with_ele,
@@ -1252,15 +1253,33 @@ class RLTrainer(BaseVLNCETrainer):
         not_done_index = list(range(self.envs.num_envs))
 
         #如果开启了视频或者是训练模式，就获取真实位置信息
-        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION)
+        #或者在验证阶段开启了上帝模式，也可以获得真实位置信息
+        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION) or (mode == "eval" and self.config.ORACLE.ENABLE and self.config.ORACLE.FORCE_HAVE_REAL_POS)
+
         ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
 
         #为每一个环境创建一个拓扑图对象
         self.gmaps = [GraphMap(have_real_pos,   #是否有真实位置
                                self.config.IL.loc_noise,    #位置匹配时候的容忍半径
                                self.config.MODEL.merge_ghost,   #是否把接近的合并
-                               ghost_aug) for _ in range(self.envs.num_envs)]   #ghost 位置扰动强度
+                               ghost_aug,oracle_cfg=self.config.ORACLE) for _ in range(self.envs.num_envs)]   #ghost 位置扰动强度
         
+        #实例化一个oracle_manager
+        if self.config.ORACLE.ENABLE:
+            oracle_manager = OracleExperimentManager(
+                config=self.config,
+                envs=self.envs,
+                policy=self.policy,
+                waypoint_predictor=self.waypoint_predictor,
+                obs_transforms=self.obs_transforms,
+                device=self.device,
+                run_id=getattr(self.config,"EXP_NAME", "exp"),
+                split=self.config.TASK_CONFIG.DATASET.SPLIT,
+                trace_dir=self.config.ORACLE.TRACE.DIR,
+                vp_feature_builder=self._vp_feature_variable,
+            )
+        
+
         #初始化每个环境上一时刻所在 viewpoint
         prev_vp = [None] * self.envs.num_envs
 
@@ -1354,7 +1373,7 @@ class RLTrainer(BaseVLNCETrainer):
                 cand_vp.append(cand_vp_i)
                 cand_pos.append(cand_pos_i)
             
-            if mode == 'train' or self.config.VIDEO_OPTION:
+            if have_real_pos:
                 #获取真实的位置和朝向
                 if timing_enabled:
                     t_call_at = time.perf_counter()
@@ -1548,11 +1567,17 @@ class RLTrainer(BaseVLNCETrainer):
 
             ##cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
             #把已经更新好的图，打包成下一步全局导航决策所需的输入表示。
+
+            #时间相关配置，用于性能分析
             if timing_enabled:
                 t_navigation = time.perf_counter()
+
+            if self.config.ORACLE.ENABLE:
+                oracle_stats = oracle_manager.step_update_oracle(mode=mode,stepk=stepk,gmaps=self.gmaps,env_indices=not_done_index,current_episodes=self.envs.current_episodes())
+            
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)  
         #             return {
-        #     'gmap_vp_ids': batch_gmap_vp_ids, #图里有哪些点
+        #     'gmap_vp_ids': batch_gmap_vp_ids,       #图里有哪些点
         #     'gmap_step_ids': batch_gmap_step_ids,   #这些点什么时候来的
         #     'gmap_img_fts': batch_gmap_img_fts,     #这些点长什么样
         #     'gmap_pos_fts': batch_gmap_pos_fts,     #这些点相对我在哪

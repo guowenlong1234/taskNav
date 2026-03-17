@@ -8,10 +8,27 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 echo "[main.bash] CPU thread caps: OMP=${OMP_NUM_THREADS}, MKL=${MKL_NUM_THREADS}, OPENBLAS=${OPENBLAS_NUM_THREADS}"
 
-# Default to Habitat-Lab/Baselines from current DGNav_new workspace.
+# Force Habitat-Lab/Baselines imports to come from this clean worktree.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dgnav_dir="$(cd "${script_dir}/.." && pwd)"
-habitat_repo_root="$(cd "${dgnav_dir}/.." && pwd)"
+preferred_habitat_repo_root="$(cd "${dgnav_dir}/.." && pwd -P)"
+if [ -n "${DGNAV_HABITAT_REPO_ROOT:-}" ]; then
+      if ! requested_habitat_repo_root="$(cd "${DGNAV_HABITAT_REPO_ROOT}" && pwd -P 2>/dev/null)"; then
+            echo "[main.bash] Invalid DGNAV_HABITAT_REPO_ROOT=${DGNAV_HABITAT_REPO_ROOT}" >&2
+            exit 1
+      fi
+      if [ "${requested_habitat_repo_root}" != "${preferred_habitat_repo_root}" ]; then
+            echo "[main.bash] Refusing Habitat repo root ${requested_habitat_repo_root}" >&2
+            echo "[main.bash] Expected clean worktree root ${preferred_habitat_repo_root}" >&2
+            exit 1
+      fi
+fi
+habitat_repo_root="${preferred_habitat_repo_root}"
+if [ ! -f "${habitat_repo_root}/habitat-baselines/habitat_baselines/common/environments.py" ]; then
+      echo "[main.bash] Missing required file: ${habitat_repo_root}/habitat-baselines/habitat_baselines/common/environments.py" >&2
+      exit 1
+fi
+export DGNAV_HABITAT_REPO_ROOT="${habitat_repo_root}"
 export PYTHONPATH="${habitat_repo_root}/habitat-lab:${habitat_repo_root}/habitat-baselines:${PYTHONPATH}"
 echo "[main.bash] Using Habitat-Lab/Baselines from ${habitat_repo_root}"
 
@@ -33,17 +50,18 @@ flag1="--exp_name release_r2r_dino_best_nav
       TORCH_GPU_IDS [0]
       GPU_NUMBERS 1
       NUM_ENVIRONMENTS 6
-      IL.iters 20000
+      IL.iters 30000
       IL.lr 1e-5
       IL.log_every 200
       IL.ml_weight 1.0
       IL.sample_ratio 0.75
       IL.decay_interval 3000
-      IL.load_from_ckpt False
-      IL.is_requeue False
+      IL.load_from_ckpt True
+      IL.is_requeue True
       IL.waypoint_aug  True
+      IL.back_algo teleport
       TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
-      MODEL.pretrained_path /home/gwl/project/DGNav_new/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s/ckpts/model_step_22500.pt
+      MODEL.pretrained_path /home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2_clean/ckpts/model_step_97500.pt
       "
 
 flag2=" --exp_name release_r2r_dino_best_nav
@@ -54,7 +72,7 @@ flag2=" --exp_name release_r2r_dino_best_nav
       GPU_NUMBERS 1
       NUM_ENVIRONMENTS 6
       TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
-      EVAL.CKPT_PATH_DIR /home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/checkpoints/release_r2r_dino_best_nav
+      EVAL.CKPT_PATH_DIR /home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/release_r2r_dino_best_nav
       IL.is_requeue False
       IL.back_algo control
       "

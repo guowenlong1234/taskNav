@@ -36,6 +36,14 @@ from data.tasks import (
 from model.pretrain_cmt import GlocalTextPathCMTPreTraining
 
 
+def _resolve_lang_model_path(lang_bert_name: str) -> str:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    local_model_path = os.path.join(repo_root, "bert_config", lang_bert_name)
+    if os.path.isdir(local_model_path):
+        return local_model_path
+    return lang_bert_name
+
+
 def create_dataloaders(
     data_cfg, nav_db, tok, is_train: bool, device: torch.device, opts
 ):
@@ -100,7 +108,8 @@ def main(opts):
         model_config.pretrain_tasks.extend(train_dataset_config['tasks'])
     model_config.pretrain_tasks = set(model_config.pretrain_tasks)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_config.lang_bert_name)
+    lang_model_name_or_path = _resolve_lang_model_path(model_config.lang_bert_name)
+    tokenizer = AutoTokenizer.from_pretrained(lang_model_name_or_path)
 
     # Prepare model
     if opts.checkpoint:
@@ -108,7 +117,7 @@ def main(opts):
     else:
         checkpoint = {}
         if opts.init_pretrained == 'bert':
-            tmp = AutoModel.from_pretrained(model_config.lang_bert_name)
+            tmp = AutoModel.from_pretrained(lang_model_name_or_path)
             for param_name, param in tmp.named_parameters():
                 checkpoint[param_name] = param
             if model_config.lang_bert_name == 'xlm-roberta-base':
