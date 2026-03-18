@@ -266,11 +266,14 @@ class GraphMap(object):
         return list(self.last_added_ghost_ids)
 
     def get_local_frontier_ghost_ids(self, current_real_vp: str):
-        return [
-            ghost_id
-            for ghost_id, front_vps in self.ghost_fronts.items()
-            if ghost_id in self.ghost_pos and current_real_vp in front_vps
-        ]
+        local_frontier_ids = []
+        for ghost_id, front_vps in self.ghost_fronts.items():
+            if ghost_id not in self.ghost_pos or current_real_vp not in front_vps:
+                continue
+            _, nearest_front_vp = self.front_to_ghost_dist(ghost_id)
+            if nearest_front_vp == current_real_vp:
+                local_frontier_ids.append(ghost_id)
+        return local_frontier_ids
 
     def get_all_alive_ghost_ids(self):
         return list(self.ghost_pos.keys())

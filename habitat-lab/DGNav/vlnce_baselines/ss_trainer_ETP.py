@@ -1968,6 +1968,7 @@ class RLTrainer(BaseVLNCETrainer):
                     else:
                         nav_bundle = planner_cache
                 else:
+                    scoped_oracle_ids_per_env = []
                     for i, gmap in enumerate(self.gmaps):
                         trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
                             oracle_manager=oracle_manager,
@@ -1981,9 +1982,18 @@ class RLTrainer(BaseVLNCETrainer):
                             planner_cache=None,
                         )
                         scope_trace_records.append(trace_record)
+                        scoped_oracle_ids_per_env.append(
+                            list(trace_record.get("selected_scope_ids", []))
+                        )
                         self._merge_oracle_query_stats(oracle_stats, env_oracle_stats)
                     nav_bundle = self._forward_navigation_once(
-                        cur_vp, cur_pos, cur_ori, txt_embeds, txt_masks
+                        cur_vp,
+                        cur_pos,
+                        cur_ori,
+                        txt_embeds,
+                        txt_masks,
+                        use_oracle_embeds=True,
+                        oracle_scope_ids_per_env=scoped_oracle_ids_per_env,
                     )
 
                 if self.local_rank < 1:
