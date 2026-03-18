@@ -179,6 +179,18 @@ _C.ORACLE.query_pos_strategy = "ghost_real_pos_mean"
 _C.ORACLE.query_pos_fallback = "nearest_real_pos"
 _C.ORACLE.query_heading_strategy = "face_frontier"
 _C.ORACLE.target_ghost_scope = "all"
+_C.ORACLE.apply_mode = "hard"
+_C.ORACLE.soft_alpha = 1.0
+_C.ORACLE.refresh_policy = "on_change"
+_C.ORACLE.multi_heading_pool_size = 4
+_C.ORACLE.multi_heading_pool_mode = "mean"
+_C.ORACLE.strict_scope = True
+_C.ORACLE.shadow_rerun_planner = True
+_C.ORACLE.max_scope_ghosts = -1
+_C.ORACLE.scope_trace_enable = False
+_C.ORACLE.scope_summary_enable = False
+_C.ORACLE.scope_trace_dir = "data/logs/oracle_scope_traces/"
+_C.ORACLE.scope_summary_dir = "data/logs/oracle_scope_summaries/"
 _C.ORACLE.query_only_new_or_changed = True
 _C.ORACLE.requery_on_realpos_update = True
 _C.ORACLE.requery_min_pos_delta = 0.10
@@ -305,6 +317,7 @@ def purge_keys(config: CN, keys: List[str]) -> None:
 
 _ORACLE_LEGACY_ALIASES = {
     "ENABLE": "enable",
+    "ENABLED": "enable",
     "MODE": "mode",
     "PROVIDER": "provider",
     "FORCE_HAVE_REAL_POS": "force_have_real_pos",
@@ -313,6 +326,21 @@ _ORACLE_LEGACY_ALIASES = {
     "QUERY_POS_FALLBACK": "query_pos_fallback",
     "QUERY_HEADING_STRATEGY": "query_heading_strategy",
     "TARGET_GHOST_SCOPE": "target_ghost_scope",
+    "SCOPE": "target_ghost_scope",
+    "APPLY_MODE": "apply_mode",
+    "REPLACE_POLICY": "apply_mode",
+    "SOFT_ALPHA": "soft_alpha",
+    "REFRESH_POLICY": "refresh_policy",
+    "MULTI_HEADING_POOL_SIZE": "multi_heading_pool_size",
+    "MULTI_HEADING_POOL_MODE": "multi_heading_pool_mode",
+    "STRICT_SCOPE": "strict_scope",
+    "SHADOW_RERUN_PLANNER": "shadow_rerun_planner",
+    "MAX_SCOPE_GHOSTS": "max_scope_ghosts",
+    "LOG_SCOPE_TRACE": "scope_trace_enable",
+    "LOG_SCOPE_SUMMARY": "scope_summary_enable",
+    "SCOPE_TRACE_DIR": "scope_trace_dir",
+    "SCOPE_SUMMARY_DIR": "scope_summary_dir",
+    "PERSIST": "persistent_writeback",
     "QUERY_ONLY_NEW_OR_CHANGED": "query_only_new_or_changed",
     "REQUERY_ON_REALPOS_UPDATE": "requery_on_realpos_update",
     "REQUERY_MIN_POS_DELTA": "requery_min_pos_delta",
@@ -351,6 +379,39 @@ def _promote_legacy_cfg_keys(config: CN, aliases) -> None:
             del config[legacy_key]
 
 
+def _normalize_legacy_oracle_opts(opts: List[str]) -> List[str]:
+    normalized_opts: List[str] = []
+    i = 0
+    while i < len(opts):
+        key = opts[i]
+        if i + 1 >= len(opts):
+            normalized_opts.append(key)
+            break
+
+        value = opts[i + 1]
+        normalized_key = key
+        if isinstance(key, str) and key.startswith("ORACLE."):
+            suffix = key.split(".", 1)[1]
+            mapped_suffix = _ORACLE_LEGACY_ALIASES.get(
+                suffix, _ORACLE_LEGACY_ALIASES.get(suffix.upper())
+            )
+            if mapped_suffix is not None:
+                normalized_key = f"ORACLE.{mapped_suffix}"
+            elif suffix.startswith("TRACE."):
+                trace_suffix = suffix.split(".", 1)[1]
+                mapped_trace_suffix = _ORACLE_TRACE_LEGACY_ALIASES.get(
+                    trace_suffix,
+                    _ORACLE_TRACE_LEGACY_ALIASES.get(trace_suffix.upper()),
+                )
+                if mapped_trace_suffix is not None:
+                    normalized_key = f"ORACLE.trace.{mapped_trace_suffix}"
+
+        normalized_opts.extend([normalized_key, value])
+        i += 2
+
+    return normalized_opts
+
+
 def _normalize_oracle_config(config: CN) -> None:
     if "ORACLE" not in config:
         return
@@ -363,6 +424,151 @@ def _normalize_oracle_config(config: CN) -> None:
             if legacy_key in legacy_trace:
                 config.ORACLE.trace[canonical_key] = legacy_trace[legacy_key]
         del config.ORACLE["TRACE"]
+
+    apply_mode = str(getattr(config.ORACLE, "apply_mode", "hard")).lower()
+    if apply_mode == "hard" and not bool(getattr(config.ORACLE, "hard_replace", True)):
+        apply_mode = "soft"
+    if apply_mode not in {"hard", "soft"}:
+        raise ValueError(
+            f"Unsupported ORACLE.apply_mode={config.ORACLE.apply_mode!r}"
+        )
+    config.ORACLE.apply_mode = apply_mode
+    config.ORACLE.soft_alpha = float(getattr(config.ORACLE, "soft_alpha", 1.0))
+    if not 0.0 <= config.ORACLE.soft_alpha <= 1.0:
+        raise ValueError(
+            f"ORACLE.soft_alpha must be in [0, 1], got {config.ORACLE.soft_alpha}"
+        )
+    config.ORACLE.hard_replace = apply_mode == "hard"
+
+    query_pipeline = str(
+        getattr(config.ORACLE, "query_pipeline", "future_node_avg_pano")
+    ).lower()
+    allowed_pipelines = {"future_node_avg_pano"}
+    if query_pipeline not in allowed_pipelines:
+        raise ValueError(
+            f"Unsupported ORACLE.query_pipeline={config.ORACLE.query_pipeline!r}. "
+            f"Supported values: {sorted(allowed_pipelines)}"
+        )
+    config.ORACLE.query_pipeline = query_pipeline
+
+    query_heading_strategy = str(
+        getattr(config.ORACLE, "query_heading_strategy", "face_frontier")
+    ).lower()
+    allowed_heading_strategies = {
+        "face_frontier",
+        "travel_dir",
+        "multi_heading_pool",
+    }
+    if query_heading_strategy not in allowed_heading_strategies:
+        raise ValueError(
+            "Unsupported ORACLE.query_heading_strategy="
+            f"{config.ORACLE.query_heading_strategy!r}. "
+            f"Supported values: {sorted(allowed_heading_strategies)}"
+        )
+    config.ORACLE.query_heading_strategy = query_heading_strategy
+    config.ORACLE.multi_heading_pool_size = int(
+        getattr(config.ORACLE, "multi_heading_pool_size", 4)
+    )
+    if config.ORACLE.multi_heading_pool_size <= 0:
+        raise ValueError(
+            "ORACLE.multi_heading_pool_size must be > 0, got "
+            f"{config.ORACLE.multi_heading_pool_size}"
+        )
+    config.ORACLE.multi_heading_pool_mode = str(
+        getattr(config.ORACLE, "multi_heading_pool_mode", "mean")
+    ).lower()
+
+    target_ghost_scope = str(
+        getattr(config.ORACLE, "target_ghost_scope", "all")
+    ).lower()
+    allowed_scopes = {"all", "new_only", "local_frontier", "top1_shadow"}
+    if target_ghost_scope not in allowed_scopes:
+        raise ValueError(
+            "Unsupported ORACLE.target_ghost_scope="
+            f"{config.ORACLE.target_ghost_scope!r}. "
+            f"Supported values: {sorted(allowed_scopes)}"
+        )
+    config.ORACLE.target_ghost_scope = target_ghost_scope
+
+    config.ORACLE.strict_scope = bool(
+        getattr(config.ORACLE, "strict_scope", True)
+    )
+    config.ORACLE.shadow_rerun_planner = bool(
+        getattr(config.ORACLE, "shadow_rerun_planner", True)
+    )
+    config.ORACLE.max_scope_ghosts = int(
+        getattr(config.ORACLE, "max_scope_ghosts", -1)
+    )
+    config.ORACLE.scope_trace_enable = bool(
+        getattr(config.ORACLE, "scope_trace_enable", False)
+    )
+    config.ORACLE.scope_summary_enable = bool(
+        getattr(config.ORACLE, "scope_summary_enable", False)
+    )
+    config.ORACLE.scope_trace_dir = str(
+        getattr(config.ORACLE, "scope_trace_dir", "data/logs/oracle_scope_traces/")
+    )
+    config.ORACLE.scope_summary_dir = str(
+        getattr(
+            config.ORACLE,
+            "scope_summary_dir",
+            "data/logs/oracle_scope_summaries/",
+        )
+    )
+
+    default_refresh_policy = "on_change"
+    default_bool_pair = (True, True)
+    current_bool_pair = (
+        bool(getattr(config.ORACLE, "query_only_new_or_changed", True)),
+        bool(getattr(config.ORACLE, "requery_on_realpos_update", True)),
+    )
+    refresh_policy = str(
+        getattr(config.ORACLE, "refresh_policy", default_refresh_policy)
+    ).lower()
+    refresh_policy_pairs = {
+        "on_change": (True, True),
+        "first_only": (True, False),
+        "every_step": (False, True),
+        "manual": current_bool_pair,
+    }
+    if refresh_policy not in refresh_policy_pairs:
+        raise ValueError(
+            f"Unsupported ORACLE.refresh_policy={config.ORACLE.refresh_policy!r}"
+        )
+
+    policy_is_default = refresh_policy == default_refresh_policy
+    bools_are_default = current_bool_pair == default_bool_pair
+    derived_pair = refresh_policy_pairs[refresh_policy]
+
+    if (not policy_is_default) and bools_are_default:
+        final_bool_pair = derived_pair
+        final_refresh_policy = refresh_policy
+    elif policy_is_default and (not bools_are_default):
+        final_bool_pair = current_bool_pair
+        final_refresh_policy = {
+            (True, True): "on_change",
+            (True, False): "first_only",
+            (False, True): "every_step",
+        }.get(current_bool_pair, "manual")
+    elif (
+        (not policy_is_default)
+        and (not bools_are_default)
+        and refresh_policy != "manual"
+        and current_bool_pair != derived_pair
+    ):
+        final_bool_pair = current_bool_pair
+        final_refresh_policy = {
+            (True, True): "on_change",
+            (True, False): "first_only",
+            (False, True): "every_step",
+        }.get(current_bool_pair, "manual")
+    else:
+        final_bool_pair = derived_pair
+        final_refresh_policy = refresh_policy
+
+    config.ORACLE.query_only_new_or_changed = final_bool_pair[0]
+    config.ORACLE.requery_on_realpos_update = final_bool_pair[1]
+    config.ORACLE.refresh_policy = final_refresh_policy
 
 
 def get_config(
@@ -400,8 +606,9 @@ def get_config(
                 prev_task_config = config.BASE_TASK_CONFIG_PATH
 
     if opts:
-        config.CMD_TRAILING_OPTS = opts
-        config.merge_from_list(opts)
+        normalized_opts = _normalize_legacy_oracle_opts(opts)
+        config.CMD_TRAILING_OPTS = normalized_opts
+        config.merge_from_list(normalized_opts)
 
     _normalize_oracle_config(config)
     config.set_new_allowed(False)

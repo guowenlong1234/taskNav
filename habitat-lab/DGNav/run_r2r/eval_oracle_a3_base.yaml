@@ -102,9 +102,16 @@ ORACLE:
   query_pos_fallback: nearest_real_pos
   query_heading_strategy: face_frontier
   target_ghost_scope: all
-  apply_mode: soft
-  soft_alpha: 0.50
+  apply_mode: hard
+  soft_alpha: 1.0
   refresh_policy: on_change
+  strict_scope: True
+  shadow_rerun_planner: True
+  max_scope_ghosts: -1
+  scope_trace_enable: True
+  scope_summary_enable: True
+  scope_trace_dir: data/logs/oracle_scope_traces/
+  scope_summary_dir: data/logs/oracle_scope_summaries/
   requery_min_pos_delta: 0.10
   navigability_check: True
   navigability_search_radius: 1.0

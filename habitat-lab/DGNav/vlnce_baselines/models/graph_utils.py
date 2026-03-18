@@ -166,6 +166,14 @@ class GraphMap(object):
         self.ghost_oracle_embeds = {}
         #oracle 元信息,可用于刷新判定与trace
         self.ghost_oracle_meta = {}
+        self.graph_step = 0
+        self.last_added_ghost_ids = []
+        self.step_added_ghost_ids = {}
+        self.ghost_parent_real_node = {}
+        self.oracle_last_scope_ids = []
+        self.oracle_last_written_ids = []
+        self.oracle_last_skipped_ids = []
+        self.oracle_write_step = {}
 
 
     def has_oracle_embed(self, vp_id:str)->bool:
@@ -182,6 +190,39 @@ class GraphMap(object):
         异常KeyError 不抛出统一返回None。
         '''
         return self.ghost_oracle_embeds.get(vp_id, None)
+
+    def get_base_ghost_embed(self, vp_id: str):
+        return self.ghost_embeds[vp_id][0] / self.ghost_embeds[vp_id][1]
+
+    def get_effective_ghost_embed(
+        self,
+        vp_id: str,
+        use_oracle: bool = True,
+        allowed_oracle_ghost_ids=None,
+    ):
+        e_base = self.get_base_ghost_embed(vp_id)
+        if (
+            use_oracle
+            and
+            self.oracle_cfg is not None
+            and self.oracle_cfg.enable
+            and vp_id in self.ghost_oracle_embeds
+        ):
+            if (
+                allowed_oracle_ghost_ids is not None
+                and vp_id not in allowed_oracle_ghost_ids
+            ):
+                return e_base
+            apply_mode = str(
+                getattr(self.oracle_cfg, "apply_mode", "hard")
+            ).lower()
+            if apply_mode == "soft":
+                alpha = float(getattr(self.oracle_cfg, "soft_alpha", 1.0))
+                alpha = max(0.0, min(1.0, alpha))
+                e_oracle = self.get_oracle_embed(vp_id)
+                return (1.0 - alpha) * e_base + alpha * e_oracle
+            return self.get_oracle_embed(vp_id)
+        return e_base
 
 
     def set_oracle_embed(self, vp_id: str, embed, meta=None, overwrite: bool = True):
@@ -220,6 +261,60 @@ class GraphMap(object):
         '''
         self.ghost_oracle_embeds.pop(vp_id, None)
         self.ghost_oracle_meta.pop(vp_id, None)
+
+    def get_last_added_ghost_ids(self):
+        return list(self.last_added_ghost_ids)
+
+    def get_local_frontier_ghost_ids(self, current_real_vp: str):
+        return [
+            ghost_id
+            for ghost_id, front_vps in self.ghost_fronts.items()
+            if ghost_id in self.ghost_pos and current_real_vp in front_vps
+        ]
+
+    def get_all_alive_ghost_ids(self):
+        return list(self.ghost_pos.keys())
+
+    def apply_oracle_embeds(
+        self,
+        ghost_embeds: dict,
+        allowed_ghost_ids: list,
+        step_id: int,
+        strict_scope: bool = True,
+    ):
+        allow = set(allowed_ghost_ids)
+        written, skipped = [], []
+        for ghost_id, payload in ghost_embeds.items():
+            if strict_scope and ghost_id not in allow:
+                skipped.append(ghost_id)
+                continue
+            if ghost_id not in self.ghost_pos:
+                skipped.append(ghost_id)
+                continue
+
+            embed = payload
+            meta = None
+            if isinstance(payload, dict):
+                embed = payload.get("embed")
+                meta = payload.get("meta")
+            elif hasattr(payload, "embed"):
+                embed = getattr(payload, "embed")
+                meta = getattr(payload, "meta", None)
+
+            if embed is None:
+                skipped.append(ghost_id)
+                continue
+
+            effective_meta = {} if meta is None else dict(meta)
+            effective_meta.setdefault("stepk", step_id)
+            self.set_oracle_embed(ghost_id, embed, meta=effective_meta)
+            self.oracle_write_step[ghost_id] = step_id
+            written.append(ghost_id)
+
+        self.oracle_last_scope_ids = list(allowed_ghost_ids)
+        self.oracle_last_written_ids = written
+        self.oracle_last_skipped_ids = skipped
+        return written, skipped
 
 
     def _localize(self, qpos, kpos_dict, ignore_height=False, loc_noise=None):
@@ -269,6 +364,15 @@ class GraphMap(object):
 
         if self.has_real_pos:
             self.ghost_real_pos.pop(vp)
+        self.ghost_parent_real_node.pop(vp, None)
+        self.oracle_write_step.pop(vp, None)
+        self.last_added_ghost_ids = [
+            ghost_id for ghost_id in self.last_added_ghost_ids if ghost_id != vp
+        ]
+        for step_id, ghost_ids in list(self.step_added_ghost_ids.items()):
+            self.step_added_ghost_ids[step_id] = [
+                ghost_id for ghost_id in ghost_ids if ghost_id != vp
+            ]
 
     def get_ghost_members(self, ghost_vp_id):
         if ghost_vp_id not in self.ghost_mean_pos:
@@ -329,6 +433,9 @@ class GraphMap(object):
         # cand_real_pos[i]候选点真实位置，训练/可视化时可能用来监督
         # loc_noise=loc_noise_to_use当前步用于节点/ghost 合并判断的容差阈值
         
+        self.graph_step = step_id
+        new_ghost_ids = []
+
         # 1. connect prev_vp
         self.graph_nx.add_node(cur_vp)
 
@@ -369,6 +476,8 @@ class GraphMap(object):
                         self.ghost_mean_pos[gvp] = cpos #初始化它的平均位置 ghost_mean_pos
                         self.ghost_embeds[gvp] = [cembeds, 1]   #记录它的 embedding 和计数 ghost_embeds = [特征和, 数量]，当前候选方向对应的上下文化 panorama token 特征
                         self.ghost_fronts[gvp] = [cur_vp]       #记录这个 ghost 是从哪个当前节点 cur_vp 看到的 ghost_fronts
+                        self.ghost_parent_real_node[gvp] = cur_vp
+                        new_ghost_ids.append(gvp)
                         if self.has_real_pos:   #如果保存真实位置，还把真实位置记下来
                             self.ghost_real_pos[gvp] = [cand_real_pos[i]]
                     # update ghost
@@ -388,8 +497,13 @@ class GraphMap(object):
                     self.ghost_mean_pos[gvp] = cpos
                     self.ghost_embeds[gvp] = [cembeds, 1]
                     self.ghost_fronts[gvp] = [cur_vp]
+                    self.ghost_parent_real_node[gvp] = cur_vp
+                    new_ghost_ids.append(gvp)
                     if self.has_real_pos:
                         self.ghost_real_pos[gvp] = [cand_real_pos[i]]
+
+        self.last_added_ghost_ids = list(new_ghost_ids)
+        self.step_added_ghost_ids[step_id] = list(new_ghost_ids)
         
         self.ghost_aug_pos = deepcopy(self.ghost_mean_pos)  #ghost_mean_pos存的是每个 ghost 的“平均位置”#self.ghost_aug_pos前实际拿来参与后续图计算的 ghost 位置
         if self.ghost_aug != 0: #如过有扰动，就在平均位置上加上一些扰动，如果没有扰动，就直接使用当前的平均位置    
@@ -415,14 +529,15 @@ class GraphMap(object):
                 min_front = front_vp
         return min_dis, min_front
 
-    def get_node_embeds(self, vp):
+    def get_node_embeds(self, vp, use_oracle: bool = True, allowed_oracle_ghost_ids=None):
         if not vp.startswith('g'):  #如果p是以g开头的，说明是普通节点
             return self.node_embeds[vp] #直接返回节点保存的特征
-        else:   #如果是以g开头的，说明是ghost节点，ghost_embeds[vp][0]这个 ghost 被多次观测到时，所有 embedding 的累加和，ghost_embeds[vp][1]：累计了多少次
-            if self.oracle_cfg is not None and self.oracle_cfg.enable and vp in self.ghost_oracle_embeds:
-                return self.get_oracle_embed(vp)
-            else:
-                return self.ghost_embeds[vp][0] / self.ghost_embeds[vp][1]  #返回ghost节点的平均特征值。
+        else:   #如果是以g开头的，说明是ghost节点，返回最终送入planner的ghost特征。
+            return self.get_effective_ghost_embed(
+                vp,
+                use_oracle=use_oracle,
+                allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
+            )
 
     def get_pos_fts(self, cur_vp, cur_pos, cur_ori, gmap_vp_ids):
         # dim=7 (sin(heading), cos(heading), sin(elevation), cos(elevation),

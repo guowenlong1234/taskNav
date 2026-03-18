@@ -4,7 +4,7 @@ import sys
 import random
 import warnings
 from collections import defaultdict
-from typing import Dict, List
+from typing import Any, Dict, List
 import jsonlines
 
 import lmdb
@@ -133,6 +133,9 @@ class RLTrainer(BaseVLNCETrainer):
         self._train_rollout_counter = 0
         self._warned_missing_collisions = False
         self._oracle_summary_path = None
+        self._oracle_scope_trace_path = None
+        self._oracle_scope_summary_path = None
+        self._oracle_scope_stats = None
 
     def _init_perf_timing_log(self):
         if self.local_rank != 0:
@@ -213,6 +216,305 @@ class RLTrainer(BaseVLNCETrainer):
             return
         with open(path, "a", encoding="utf-8", buffering=1) as f:
             f.write(line + "\n")
+
+    def _reset_oracle_scope_eval_state(self) -> None:
+        self._oracle_scope_trace_path = None
+        self._oracle_scope_summary_path = None
+        self._oracle_scope_stats = {
+            "step_records": 0,
+            "alive_ghost_sum": 0.0,
+            "scope_ghost_sum": 0.0,
+            "written_ghost_sum": 0.0,
+            "planner_target_changed_cnt": 0,
+            "planner_target_compare_cnt": 0,
+            "top1_shadow_valid_cnt": 0,
+            "top1_shadow_total_cnt": 0,
+        }
+
+    def _get_oracle_scope_name(self) -> str:
+        return str(getattr(self.config.ORACLE, "target_ghost_scope", "all")).lower()
+
+    def _get_oracle_scope_trace_path(self):
+        if self.local_rank != 0 or not getattr(self.config.ORACLE, "scope_trace_enable", False):
+            return None
+        if self._oracle_scope_trace_path is None:
+            trace_dir = getattr(
+                self.config.ORACLE,
+                "scope_trace_dir",
+                os.path.join("data", "logs", "oracle_scope_traces"),
+            )
+            os.makedirs(trace_dir, exist_ok=True)
+            exp_name = getattr(self.config, "EXP_NAME", "exp")
+            split = getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval")
+            scope = self._get_oracle_scope_name()
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._oracle_scope_trace_path = os.path.join(
+                trace_dir,
+                f"{exp_name}_{split}_{scope}_rank{self.local_rank}_{ts}.jsonl",
+            )
+        return self._oracle_scope_trace_path
+
+    def _write_oracle_scope_trace_record(self, record: Dict) -> None:
+        path = self._get_oracle_scope_trace_path()
+        if path is None:
+            return
+        with open(path, "a", encoding="utf-8", buffering=1) as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _get_oracle_scope_summary_path(self):
+        if self.local_rank != 0 or not getattr(self.config.ORACLE, "scope_summary_enable", False):
+            return None
+        if self._oracle_scope_summary_path is None:
+            summary_dir = getattr(
+                self.config.ORACLE,
+                "scope_summary_dir",
+                os.path.join("data", "logs", "oracle_scope_summaries"),
+            )
+            os.makedirs(summary_dir, exist_ok=True)
+            exp_name = getattr(self.config, "EXP_NAME", "exp")
+            split = getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval")
+            scope = self._get_oracle_scope_name()
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._oracle_scope_summary_path = os.path.join(
+                summary_dir,
+                f"{exp_name}_{split}_{scope}_rank{self.local_rank}_{ts}.json",
+            )
+        return self._oracle_scope_summary_path
+
+    def _log_oracle_scope_trace(self, record: Dict[str, Any]) -> None:
+        self._write_oracle_scope_trace_record(record)
+        if self._oracle_scope_stats is None:
+            return
+        self._oracle_scope_stats["step_records"] += 1
+        self._oracle_scope_stats["alive_ghost_sum"] += len(
+            record.get("all_alive_ghost_ids", [])
+        )
+        self._oracle_scope_stats["scope_ghost_sum"] += len(
+            record.get("selected_scope_ids", [])
+        )
+        self._oracle_scope_stats["written_ghost_sum"] += len(
+            record.get("oracle_written_ids", [])
+        )
+
+        top1_before = record.get("planner_top1_before")
+        top1_after = record.get("planner_top1_after")
+        if top1_before is not None and top1_after is not None:
+            self._oracle_scope_stats["planner_target_compare_cnt"] += 1
+            if bool(record.get("target_changed", False)):
+                self._oracle_scope_stats["planner_target_changed_cnt"] += 1
+
+        if self._get_oracle_scope_name() == "top1_shadow":
+            self._oracle_scope_stats["top1_shadow_total_cnt"] += 1
+            if isinstance(top1_before, str) and top1_before.startswith("g"):
+                self._oracle_scope_stats["top1_shadow_valid_cnt"] += 1
+
+    def _write_oracle_scope_summary(self, episodes: int) -> None:
+        path = self._get_oracle_scope_summary_path()
+        if path is None or self._oracle_scope_stats is None:
+            return
+        steps = max(int(self._oracle_scope_stats["step_records"]), 1)
+        compare_cnt = max(int(self._oracle_scope_stats["planner_target_compare_cnt"]), 1)
+        top1_total = max(int(self._oracle_scope_stats["top1_shadow_total_cnt"]), 1)
+        payload = {
+            "exp_name": getattr(self.config, "EXP_NAME", "exp"),
+            "split": getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval"),
+            "scope": self._get_oracle_scope_name(),
+            "episodes": int(episodes),
+            "avg_alive_ghosts": self._oracle_scope_stats["alive_ghost_sum"] / steps,
+            "avg_scope_ghosts": self._oracle_scope_stats["scope_ghost_sum"] / steps,
+            "avg_written_ghosts": self._oracle_scope_stats["written_ghost_sum"] / steps,
+            "planner_target_changed_ratio": (
+                self._oracle_scope_stats["planner_target_changed_cnt"] / compare_cnt
+            ),
+            "top1_shadow_valid_ratio": (
+                self._oracle_scope_stats["top1_shadow_valid_cnt"] / top1_total
+            ),
+            "step_records": int(self._oracle_scope_stats["step_records"]),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    @staticmethod
+    def _init_oracle_query_stats() -> Dict[str, Any]:
+        return {
+            "requested_ids": [],
+            "returned_ids": [],
+            "failed_ids": [],
+            "query_cnt": 0,
+            "success_cnt": 0,
+            "fail_cnt": 0,
+            "provider_fail_cnt": 0,
+            "resolve_fail_cnt": 0,
+            "cache_hit_cnt": 0,
+            "intra_episode_cache_hit_cnt": 0,
+            "cross_episode_cache_hit_cnt": 0,
+            "latency_ms_sum": 0.0,
+            "skipped_cnt": 0,
+            "avg_latency_ms": 0.0,
+            "intra_episode_cache_hit_pct": 0.0,
+            "cross_episode_cache_hit_pct": 0.0,
+        }
+
+    @staticmethod
+    def _merge_oracle_query_stats(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+        for key in ("requested_ids", "returned_ids", "failed_ids"):
+            dst[key].extend(src.get(key, []))
+        for key in (
+            "query_cnt",
+            "success_cnt",
+            "fail_cnt",
+            "provider_fail_cnt",
+            "resolve_fail_cnt",
+            "cache_hit_cnt",
+            "intra_episode_cache_hit_cnt",
+            "cross_episode_cache_hit_cnt",
+            "latency_ms_sum",
+            "skipped_cnt",
+        ):
+            dst[key] += src.get(key, 0)
+        if dst["query_cnt"] > 0:
+            dst["avg_latency_ms"] = dst["latency_ms_sum"] / dst["query_cnt"]
+        if dst["cache_hit_cnt"] > 0:
+            dst["intra_episode_cache_hit_pct"] = (
+                dst["intra_episode_cache_hit_cnt"] / dst["cache_hit_cnt"]
+            )
+            dst["cross_episode_cache_hit_pct"] = (
+                dst["cross_episode_cache_hit_cnt"] / dst["cache_hit_cnt"]
+            )
+
+    def _forward_navigation_once(
+        self,
+        cur_vp,
+        cur_pos,
+        cur_ori,
+        txt_embeds,
+        txt_masks,
+        use_oracle_embeds: bool = True,
+        oracle_scope_ids_per_env=None,
+    ) -> Dict[str, Any]:
+        nav_inputs = self._nav_gmap_variable(
+            cur_vp,
+            cur_pos,
+            cur_ori,
+            use_oracle_embeds=use_oracle_embeds,
+            oracle_scope_ids_per_env=oracle_scope_ids_per_env,
+        )
+        no_vp_left = nav_inputs.pop("no_vp_left")
+        nav_inputs.update(
+            {
+                "mode": "navigation",
+                "txt_embeds": txt_embeds,
+                "txt_masks": txt_masks,
+            }
+        )
+        nav_outs = self.policy.net(**nav_inputs)
+        nav_logits = nav_outs["global_logits"]
+        nav_probs = F.softmax(nav_logits, 1)
+        top1_vps = []
+        for i, gmap_vp_ids in enumerate(nav_inputs["gmap_vp_ids"]):
+            top1_idx = int(nav_logits[i].argmax(dim=-1).item())
+            top1_vps.append(
+                gmap_vp_ids[top1_idx] if top1_idx < len(gmap_vp_ids) else None
+            )
+        return {
+            "nav_inputs": nav_inputs,
+            "no_vp_left": no_vp_left,
+            "nav_outs": nav_outs,
+            "nav_logits": nav_logits,
+            "nav_probs": nav_probs,
+            "top1_vps": top1_vps,
+        }
+
+    def _get_baseline_top1_ghost_ids(self, env_idx, gmap, planner_cache=None):
+        if planner_cache is None:
+            return []
+        top1_vp = planner_cache["top1_vps"][env_idx]
+        if top1_vp is None or not str(top1_vp).startswith("g"):
+            return []
+        if top1_vp not in gmap.ghost_pos:
+            return []
+        return [top1_vp]
+
+    def _select_oracle_scope_ids(
+        self, env_idx, gmap, current_real_vp, planner_cache=None
+    ):
+        scope = self._get_oracle_scope_name()
+        if scope == "all":
+            ids = gmap.get_all_alive_ghost_ids()
+        elif scope == "new_only":
+            ids = gmap.get_last_added_ghost_ids()
+        elif scope == "local_frontier":
+            ids = gmap.get_local_frontier_ghost_ids(current_real_vp)
+        elif scope == "top1_shadow":
+            ids = self._get_baseline_top1_ghost_ids(env_idx, gmap, planner_cache)
+        else:
+            raise ValueError(f"Unknown ORACLE.target_ghost_scope={scope}")
+
+        max_scope = int(getattr(self.config.ORACLE, "max_scope_ghosts", -1))
+        if max_scope >= 0:
+            ids = ids[:max_scope]
+        return ids
+
+    def _apply_oracle_scope_for_env(
+        self,
+        oracle_manager,
+        mode,
+        stepk,
+        env_idx,
+        original_env_index,
+        gmap,
+        current_episode,
+        current_real_vp,
+        planner_cache=None,
+    ):
+        scope_ids = self._select_oracle_scope_ids(
+            env_idx=env_idx,
+            gmap=gmap,
+            current_real_vp=current_real_vp,
+            planner_cache=planner_cache,
+        )
+        oracle_results = oracle_manager.query_ghosts(
+            mode=mode,
+            stepk=stepk,
+            gmap=gmap,
+            current_episode=current_episode,
+            active_env_index=env_idx,
+            original_env_index=original_env_index,
+            candidate_ghost_ids=scope_ids,
+            current_step=gmap.graph_step,
+        )
+        query_stats = oracle_manager.get_last_query_stats()
+
+        if getattr(self.config.ORACLE, "persistent_writeback", True):
+            written_ids, skipped_ids = gmap.apply_oracle_embeds(
+                ghost_embeds=oracle_results,
+                allowed_ghost_ids=scope_ids,
+                step_id=gmap.graph_step,
+                strict_scope=getattr(self.config.ORACLE, "strict_scope", True),
+            )
+        else:
+            written_ids, skipped_ids = [], []
+
+        planner_top1_before = None
+        if planner_cache is not None:
+            planner_top1_before = planner_cache["top1_vps"][env_idx]
+
+        trace_record = {
+            "episode_id": str(current_episode.episode_id),
+            "step": int(stepk),
+            "current_real_vp": current_real_vp,
+            "oracle_scope": self._get_oracle_scope_name(),
+            "all_alive_ghost_ids": gmap.get_all_alive_ghost_ids(),
+            "selected_scope_ids": list(scope_ids),
+            "oracle_requested_ids": list(query_stats.get("requested_ids", [])),
+            "oracle_returned_ids": list(query_stats.get("returned_ids", [])),
+            "oracle_written_ids": list(written_ids),
+            "oracle_skipped_ids": list(skipped_ids),
+            "planner_top1_before": planner_top1_before,
+            "planner_top1_after": None,
+            "target_changed": False,
+        }
+        return trace_record, query_stats
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
@@ -716,7 +1018,14 @@ class RLTrainer(BaseVLNCETrainer):
             'nav_types': batch_nav_types, 'view_lens': batch_view_lens,
         }
         
-    def _nav_gmap_variable(self, cur_vp, cur_pos, cur_ori):
+    def _nav_gmap_variable(
+        self,
+        cur_vp,
+        cur_pos,
+        cur_ori,
+        use_oracle_embeds: bool = True,
+        oracle_scope_ids_per_env=None,
+    ):
         #cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
         batch_gmap_vp_ids, batch_gmap_step_ids, batch_gmap_lens = [], [], []
         batch_gmap_img_fts, batch_gmap_pos_fts = [], []
@@ -734,9 +1043,19 @@ class RLTrainer(BaseVLNCETrainer):
             gmap_vp_ids = [None] + node_vp_ids + ghost_vp_ids
             gmap_step_ids = [0] + [gmap.node_stepId[vp] for vp in node_vp_ids] + [0]*len(ghost_vp_ids)
             gmap_visited_masks = [0] + [1] * len(node_vp_ids) + [0] * len(ghost_vp_ids)
+            allowed_oracle_ghost_ids = None
+            if oracle_scope_ids_per_env is not None:
+                allowed_oracle_ghost_ids = set(oracle_scope_ids_per_env[i])
 
             gmap_img_fts = [gmap.get_node_embeds(vp) for vp in node_vp_ids] + \
-                           [gmap.get_node_embeds(vp) for vp in ghost_vp_ids]
+                           [
+                               gmap.get_node_embeds(
+                                   vp,
+                                   use_oracle=use_oracle_embeds,
+                                   allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
+                               )
+                               for vp in ghost_vp_ids
+                           ]
             gmap_img_fts = torch.stack(
                 [torch.zeros_like(gmap_img_fts[0])] + gmap_img_fts, dim=0
             )
@@ -1004,6 +1323,7 @@ class RLTrainer(BaseVLNCETrainer):
         else:
             eps_to_eval = min(self.config.EVAL.EPISODE_COUNT, sum(self.envs.number_of_episodes))
         self.stat_eps = {}
+        self._reset_oracle_scope_eval_state()
         # Always initialize loc_noise_history to record loc_noise values for each episode
         self.loc_noise_history = defaultdict(list)
         # Record start time of each episode for calculating episode duration
@@ -1071,6 +1391,8 @@ class RLTrainer(BaseVLNCETrainer):
             for k, v in aggregated_states.items():
                 logger.info(f"Average episode {k}: {v:.6f}")
                 writer.add_scalar(f"eval_{k}/{split}", v, checkpoint_num)
+            if self.config.ORACLE.enable and self.config.ORACLE.scope_summary_enable:
+                self._write_oracle_scope_summary(total)
 
     @torch.no_grad()
     def inference(self):
@@ -1602,9 +1924,69 @@ class RLTrainer(BaseVLNCETrainer):
             if timing_enabled:
                 t_navigation = time.perf_counter()
 
-            if self.config.ORACLE.enable:
-                oracle_stats = oracle_manager.step_update_oracle(mode=mode,stepk=stepk,gmaps=self.gmaps,env_indices=not_done_index,current_episodes=self.envs.current_episodes())
-                if self.local_rank < 1 and oracle_stats:
+            current_eps = self.envs.current_episodes()
+            scope_trace_records = []
+            if self.config.ORACLE.enable and mode == 'eval':
+                oracle_stats = self._init_oracle_query_stats()
+                if self._get_oracle_scope_name() == "top1_shadow":
+                    planner_cache = self._forward_navigation_once(
+                        cur_vp,
+                        cur_pos,
+                        cur_ori,
+                        txt_embeds,
+                        txt_masks,
+                        use_oracle_embeds=False,
+                    )
+                    top1_shadow_scope_ids = []
+                    for i, gmap in enumerate(self.gmaps):
+                        trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
+                            oracle_manager=oracle_manager,
+                            mode=mode,
+                            stepk=stepk,
+                            env_idx=i,
+                            original_env_index=not_done_index[i],
+                            gmap=gmap,
+                            current_episode=current_eps[i],
+                            current_real_vp=cur_vp[i],
+                            planner_cache=planner_cache,
+                        )
+                        scope_trace_records.append(trace_record)
+                        top1_shadow_scope_ids.append(
+                            list(trace_record.get("selected_scope_ids", []))
+                        )
+                        self._merge_oracle_query_stats(oracle_stats, env_oracle_stats)
+                    if self.config.ORACLE.shadow_rerun_planner:
+                        nav_bundle = self._forward_navigation_once(
+                            cur_vp,
+                            cur_pos,
+                            cur_ori,
+                            txt_embeds,
+                            txt_masks,
+                            use_oracle_embeds=True,
+                            oracle_scope_ids_per_env=top1_shadow_scope_ids,
+                        )
+                    else:
+                        nav_bundle = planner_cache
+                else:
+                    for i, gmap in enumerate(self.gmaps):
+                        trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
+                            oracle_manager=oracle_manager,
+                            mode=mode,
+                            stepk=stepk,
+                            env_idx=i,
+                            original_env_index=not_done_index[i],
+                            gmap=gmap,
+                            current_episode=current_eps[i],
+                            current_real_vp=cur_vp[i],
+                            planner_cache=None,
+                        )
+                        scope_trace_records.append(trace_record)
+                        self._merge_oracle_query_stats(oracle_stats, env_oracle_stats)
+                    nav_bundle = self._forward_navigation_once(
+                        cur_vp, cur_pos, cur_ori, txt_embeds, txt_masks
+                    )
+
+                if self.local_rank < 1:
                     query_cnt = int(oracle_stats.get("query_cnt", 0))
                     cache_hit_cnt = int(oracle_stats.get("cache_hit_cnt", 0))
                     intra_hit_cnt = int(oracle_stats.get("intra_episode_cache_hit_cnt", 0))
@@ -1624,26 +2006,24 @@ class RLTrainer(BaseVLNCETrainer):
                         f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f}"
                     )
                     self._write_oracle_summary_log(oracle_summary_line)
-            
-            nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)  
-        #             return {
-        #     'gmap_vp_ids': batch_gmap_vp_ids,       #图里有哪些点
-        #     'gmap_step_ids': batch_gmap_step_ids,   #这些点什么时候来的
-        #     'gmap_img_fts': batch_gmap_img_fts,     #这些点长什么样
-        #     'gmap_pos_fts': batch_gmap_pos_fts,     #这些点相对我在哪
-        #     'gmap_masks': batch_gmap_masks,         #哪些点有效
-        #     'gmap_visited_masks': batch_gmap_visited_masks,     #哪些点已访问
-        #     'gmap_pair_dists': gmap_pair_dists,     #点和点之间有多远
-        #     'no_vp_left': batch_no_vp_left,         #还有没有可探索 ghost
-        # }
-            nav_inputs.update({
-                'mode': 'navigation',
-                'txt_embeds': txt_embeds,
-                'txt_masks': txt_masks,
-            })
-            no_vp_left = nav_inputs.pop('no_vp_left')
 
-            nav_outs = self.policy.net(**nav_inputs)
+                for i, trace_record in enumerate(scope_trace_records):
+                    planner_top1_after = nav_bundle["top1_vps"][i]
+                    trace_record["planner_top1_after"] = planner_top1_after
+                    planner_top1_before = trace_record.get("planner_top1_before")
+                    if planner_top1_before is not None:
+                        trace_record["target_changed"] = (
+                            planner_top1_before != planner_top1_after
+                        )
+                    self._log_oracle_scope_trace(trace_record)
+            else:
+                nav_bundle = self._forward_navigation_once(
+                    cur_vp, cur_pos, cur_ori, txt_embeds, txt_masks
+                )
+
+            nav_inputs = nav_bundle["nav_inputs"]
+            no_vp_left = nav_bundle["no_vp_left"]
+            nav_outs = nav_bundle["nav_outs"]
             if timing_enabled:
                 timing_acc['navigation'] += (time.perf_counter() - t_navigation)
 
@@ -1652,8 +2032,8 @@ class RLTrainer(BaseVLNCETrainer):
         #     'global_logits': global_logits, # 对图中每个可选节点的打分[B, L]
         # }
 
-            nav_logits = nav_outs['global_logits']
-            nav_probs = F.softmax(nav_logits, 1)
+            nav_logits = nav_bundle['nav_logits']
+            nav_probs = nav_bundle['nav_probs']
             for i, gmap in enumerate(self.gmaps):
                 #给节点打一个适合停止的分数，后面进行全局选择
                 #把当前节点如果选择 STOP 的概率，存成这个节点的 stop score。

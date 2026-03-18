@@ -46,6 +46,7 @@ class OracleFeatureResult:
     cache_key: Optional[str]        #这次缓存对应的 key
 
     latency_ms: float               #这次查询耗时，单位毫秒
+    meta: Optional[Dict[str, Any]] = None
 
 @dataclass
 class TrajectoryObservationBufferItem:

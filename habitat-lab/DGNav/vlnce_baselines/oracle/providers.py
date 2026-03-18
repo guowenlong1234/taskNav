@@ -49,6 +49,10 @@ class SimulatorPeekOracleProvider(OracleProvider):
     def query(self,spec):
         t0 = time.perf_counter()
         try:
+            if spec.pipeline != "future_node_avg_pano":
+                raise NotImplementedError(
+                    f"Unsupported oracle pipeline: {spec.pipeline}"
+                )
             env_index = spec.active_env_index
             query_pos = spec.query_pos
             query_heading_rad = spec.query_heading_rad

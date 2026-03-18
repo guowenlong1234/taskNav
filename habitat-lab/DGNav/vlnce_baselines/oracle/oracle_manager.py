@@ -53,6 +53,7 @@ class OracleExperimentManager:
 
         self._episode_key = {}
         self._trace_paths = {}
+        self._last_query_stats: Dict[str, Any] = {}
         if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
             os.makedirs(self.trace_dir, exist_ok=True)
 
@@ -231,6 +232,41 @@ class OracleExperimentManager:
 
         return None, "resolve_query_pos_failed"   #如果回退和主策略都失败了，返回None
 
+    def _resolve_query_heading(
+        self,
+        query_pos,
+        front_pos,
+    ) -> float:
+        strategy = str(
+            getattr(self.config_oracle, "query_heading_strategy", "face_frontier")
+        ).lower()
+
+        if strategy == "face_frontier":
+            src_pos = np.asarray(query_pos)
+            dst_pos = np.asarray(front_pos)
+        elif strategy == "travel_dir":
+            src_pos = np.asarray(front_pos)
+            dst_pos = np.asarray(query_pos)
+        elif strategy == "multi_heading_pool":
+            raise NotImplementedError(
+                "ORACLE.query_heading_strategy=multi_heading_pool is not "
+                "implemented in the current oracle provider path."
+            )
+        else:
+            raise ValueError(
+                "Unsupported ORACLE.query_heading_strategy="
+                f"{self.config_oracle.query_heading_strategy!r}"
+            )
+
+        query_heading_rad, _, _ = calculate_vp_rel_pos_fts(
+            src_pos,
+            dst_pos,
+            base_heading=0.0,
+            base_elevation=0.0,
+            to_clock=False,
+        )
+        return float(query_heading_rad)
+
     def _should_query_ghost(
         self,
         gmap,
@@ -323,6 +359,326 @@ class OracleExperimentManager:
                 f"{run_token}__{split_token}__{scene_token}__{episode_token}.jsonl",
             )
 
+    def get_last_query_stats(self) -> Dict[str, Any]:
+        return dict(self._last_query_stats)
+
+    @staticmethod
+    def _init_query_stats(candidate_ghost_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "requested_ids": list(candidate_ghost_ids or []),
+            "returned_ids": [],
+            "failed_ids": [],
+            "query_cnt": 0,
+            "success_cnt": 0,
+            "fail_cnt": 0,
+            "provider_fail_cnt": 0,
+            "resolve_fail_cnt": 0,
+            "cache_hit_cnt": 0,
+            "intra_episode_cache_hit_cnt": 0,
+            "cross_episode_cache_hit_cnt": 0,
+            "latency_ms_sum": 0.0,
+            "skipped_cnt": 0,
+            "avg_latency_ms": 0.0,
+            "intra_episode_cache_hit_pct": 0.0,
+            "cross_episode_cache_hit_pct": 0.0,
+        }
+
+    @staticmethod
+    def _finalize_query_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
+        if stats["query_cnt"] > 0:
+            stats["avg_latency_ms"] = stats["latency_ms_sum"] / stats["query_cnt"]
+        if stats["cache_hit_cnt"] > 0:
+            stats["intra_episode_cache_hit_pct"] = (
+                stats["intra_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
+            )
+            stats["cross_episode_cache_hit_pct"] = (
+                stats["cross_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
+            )
+        return stats
+
+    def query_ghosts(
+        self,
+        *,
+        mode: str,
+        stepk: int,
+        gmap: GraphMap,
+        current_episode,
+        active_env_index: int,
+        original_env_index: int,
+        candidate_ghost_ids: List[str],
+        current_step: Optional[int] = None,
+    ) -> Dict[str, OracleFeatureResult]:
+        if (not self.config_oracle.enable) or (mode != "eval"):
+            self._last_query_stats = self._init_query_stats(candidate_ghost_ids)
+            return {}
+
+        step_id = stepk if current_step is None else current_step
+        ep = current_episode
+        results: Dict[str, OracleFeatureResult] = {}
+        stats = self._init_query_stats(candidate_ghost_ids)
+
+        for ghost_vp_id in candidate_ghost_ids:
+            if ghost_vp_id not in gmap.ghost_mean_pos:
+                stats["failed_ids"].append(ghost_vp_id)
+                continue
+            if (not gmap.has_real_pos) or (ghost_vp_id not in gmap.ghost_real_pos):
+                stats["failed_ids"].append(ghost_vp_id)
+                continue
+
+            real_pos_list = gmap.ghost_real_pos[ghost_vp_id]
+            if len(real_pos_list) == 0:
+                stats["failed_ids"].append(ghost_vp_id)
+                continue
+
+            real_pos_mean = tuple(np.mean(real_pos_list, axis=0).tolist())
+            target, resolve_reason = self._resolve_query_target(
+                active_env_index,
+                gmap,
+                ghost_vp_id,
+                real_pos_mean,
+            )
+            if target is None:
+                stats["fail_cnt"] += 1
+                stats["resolve_fail_cnt"] += 1
+                stats["failed_ids"].append(ghost_vp_id)
+                self._trace_query_event(
+                    env_index=active_env_index,
+                    scene_id=ep.scene_id,
+                    episode_id=ep.episode_id,
+                    stepk=step_id,
+                    original_env_index=original_env_index,
+                    ghost_vp_id=ghost_vp_id,
+                    chosen_front_vp_id=None,
+                    source_member_index=None,
+                    source_member_real_pos=None,
+                    pos_strategy=self.config_oracle.query_pos_strategy,
+                    heading_strategy=self.config_oracle.query_heading_strategy,
+                    pipeline=self.config_oracle.query_pipeline,
+                    query_pos=None,
+                    query_heading_rad=None,
+                    ok=False,
+                    reason=resolve_reason,
+                    cache_hit=False,
+                    used_pos=None,
+                    used_heading_rad=None,
+                    embed_norm=None,
+                )
+                continue
+
+            query_pos = target["query_pos"]
+            query_pos_strategy = target["query_pos_strategy"]
+            source_member_index = target["source_member_index"]
+            source_member_real_pos = target["source_member_real_pos"]
+            chosen_front_vp_id = target["source_front_vp_id"]
+
+            if not self._should_query_ghost(
+                gmap=gmap,
+                ghost_vp_id=ghost_vp_id,
+                real_pos_count=len(real_pos_list),
+                real_pos_mean=real_pos_mean,
+                source_member_index=source_member_index,
+                source_front_vp_id=chosen_front_vp_id,
+            ):
+                stats["skipped_cnt"] += 1
+                continue
+
+            front_vp_ids = list(gmap.ghost_fronts[ghost_vp_id])
+            front_pos = gmap.node_pos[chosen_front_vp_id]
+            query_heading_strategy = str(
+                getattr(
+                    self.config_oracle,
+                    "query_heading_strategy",
+                    "face_frontier",
+                )
+            ).lower()
+            query_pipeline = str(
+                getattr(
+                    self.config_oracle,
+                    "query_pipeline",
+                    "future_node_avg_pano",
+                )
+            ).lower()
+            query_heading_rad = self._resolve_query_heading(
+                query_pos=query_pos,
+                front_pos=front_pos,
+            )
+
+            spec = OracleQuerySpec(
+                run_id=self.run_id,
+                split=self.split,
+                scene_id=ep.scene_id,
+                episode_id=ep.episode_id,
+                active_env_index=active_env_index,
+                original_env_index=original_env_index,
+                stepk=step_id,
+                ghost_vp_id=ghost_vp_id,
+                front_vp_ids=front_vp_ids,
+                chosen_front_vp_id=chosen_front_vp_id,
+                source_member_index=source_member_index,
+                source_member_real_pos=source_member_real_pos,
+                query_pos=query_pos,
+                query_heading_rad=float(query_heading_rad),
+                pos_strategy=query_pos_strategy,
+                heading_strategy=query_heading_strategy,
+                pipeline=query_pipeline,
+                real_pos_count=len(real_pos_list),
+                real_pos_mean=real_pos_mean,
+            )
+
+            cache_entry = None
+            if self.cache is not None:
+                cache_entry = self.cache.lookup(
+                    ep.scene_id,
+                    query_pos,
+                    query_heading_rad,
+                )
+
+            if cache_entry is not None:
+                cached_embed = cache_entry.embed.detach().clone()
+                cache_meta = cache_entry.meta
+                source_episode_id = cache_meta.get("source_episode_id")
+                result = OracleFeatureResult(
+                    ghost_vp_id=ghost_vp_id,
+                    ok=True,
+                    reason=None,
+                    embed=cached_embed,
+                    embed_dtype=self._dtype_to_name(cached_embed.dtype),
+                    embed_norm=float(cached_embed.norm().item()),
+                    used_pos=tuple(cache_meta.get("used_pos", cache_entry.pos)),
+                    used_heading_rad=float(
+                        cache_entry.heading_rad
+                        if cache_meta.get("used_heading_rad") is None
+                        else cache_meta["used_heading_rad"]
+                    ),
+                    cache_hit=True,
+                    cache_key=self._make_cache_key(
+                        ep.scene_id,
+                        cache_entry.pos,
+                        cache_entry.heading_rad,
+                    ),
+                    latency_ms=0.0,
+                    meta={
+                        "stepk": step_id,
+                        "used_pos": tuple(
+                            cache_meta.get("used_pos", cache_entry.pos)
+                        ),
+                        "used_heading_rad": float(
+                            cache_entry.heading_rad
+                            if cache_meta.get("used_heading_rad") is None
+                            else cache_meta["used_heading_rad"]
+                        ),
+                        "real_pos_count": len(real_pos_list),
+                        "real_pos_mean": real_pos_mean,
+                        "query_source_index": source_member_index,
+                        "query_source_real_pos": source_member_real_pos,
+                        "query_source_front_vp_id": chosen_front_vp_id,
+                        "query_pos_strategy": query_pos_strategy,
+                    },
+                )
+                is_intra_episode_cache_hit = (source_episode_id == ep.episode_id)
+            else:
+                is_intra_episode_cache_hit = False
+                try:
+                    result = self.provider.query(spec=spec)
+                except Exception:
+                    stats["fail_cnt"] += 1
+                    stats["provider_fail_cnt"] += 1
+                    stats["failed_ids"].append(ghost_vp_id)
+                    self._trace_query_event(
+                        env_index=active_env_index,
+                        scene_id=ep.scene_id,
+                        episode_id=ep.episode_id,
+                        stepk=step_id,
+                        original_env_index=original_env_index,
+                        ghost_vp_id=ghost_vp_id,
+                        chosen_front_vp_id=chosen_front_vp_id,
+                        source_member_index=source_member_index,
+                        source_member_real_pos=source_member_real_pos,
+                        pos_strategy=query_pos_strategy,
+                        heading_strategy=query_heading_strategy,
+                        pipeline=query_pipeline,
+                        query_pos=query_pos,
+                        query_heading_rad=query_heading_rad,
+                        ok=False,
+                        reason="provider_query_failed",
+                        cache_hit=False,
+                        used_pos=None,
+                        used_heading_rad=None,
+                        embed_norm=None,
+                    )
+                    continue
+
+                result.meta = {
+                    "stepk": step_id,
+                    "used_pos": result.used_pos,
+                    "used_heading_rad": result.used_heading_rad,
+                    "real_pos_count": len(real_pos_list),
+                    "real_pos_mean": real_pos_mean,
+                    "query_source_index": source_member_index,
+                    "query_source_real_pos": source_member_real_pos,
+                    "query_source_front_vp_id": chosen_front_vp_id,
+                    "query_pos_strategy": query_pos_strategy,
+                }
+                if self.cache is not None and result.ok and result.embed is not None:
+                    self.cache.insert(
+                        ep.scene_id,
+                        query_pos,
+                        query_heading_rad,
+                        result.embed,
+                        meta={
+                            "used_pos": result.used_pos,
+                            "used_heading_rad": result.used_heading_rad,
+                            "source_episode_id": ep.episode_id,
+                            "query_source_index": source_member_index,
+                            "query_source_real_pos": source_member_real_pos,
+                            "query_source_front_vp_id": chosen_front_vp_id,
+                            "query_pos_strategy": query_pos_strategy,
+                        },
+                    )
+
+            stats["query_cnt"] += 1
+            stats["latency_ms_sum"] += result.latency_ms
+            stats["cache_hit_cnt"] += int(result.cache_hit)
+            if result.cache_hit:
+                if is_intra_episode_cache_hit:
+                    stats["intra_episode_cache_hit_cnt"] += 1
+                else:
+                    stats["cross_episode_cache_hit_cnt"] += 1
+
+            if result.ok and result.embed is not None:
+                stats["success_cnt"] += 1
+                stats["returned_ids"].append(ghost_vp_id)
+                results[ghost_vp_id] = result
+            else:
+                stats["fail_cnt"] += 1
+                stats["failed_ids"].append(ghost_vp_id)
+
+            self._trace_query_event(
+                env_index=active_env_index,
+                scene_id=ep.scene_id,
+                episode_id=ep.episode_id,
+                stepk=step_id,
+                original_env_index=original_env_index,
+                ghost_vp_id=ghost_vp_id,
+                chosen_front_vp_id=chosen_front_vp_id,
+                source_member_index=source_member_index,
+                source_member_real_pos=source_member_real_pos,
+                pos_strategy=query_pos_strategy,
+                heading_strategy=query_heading_strategy,
+                pipeline=query_pipeline,
+                query_pos=query_pos,
+                query_heading_rad=query_heading_rad,
+                ok=result.ok,
+                reason=result.reason,
+                cache_hit=result.cache_hit,
+                used_pos=result.used_pos,
+                used_heading_rad=result.used_heading_rad,
+                embed_norm=result.embed_norm,
+            )
+
+        self._last_query_stats = self._finalize_query_stats(stats)
+        return results
+
     def step_update_oracle(self,
                             mode: str,                      # "train"/"eval"/"infer"
                             stepk: int,
@@ -348,268 +704,40 @@ class OracleExperimentManager:
 
 
         else:
-            #初始化一个最小统计
-            stats = {
-                        "query_cnt": 0,
-                        "success_cnt": 0,
-                        "fail_cnt": 0,
-                        "provider_fail_cnt": 0,
-                        "resolve_fail_cnt": 0,
-                        "cache_hit_cnt": 0,
-                        "intra_episode_cache_hit_cnt": 0,
-                        "cross_episode_cache_hit_cnt": 0,
-                        "latency_ms_sum": 0.0,
-                        "skipped_cnt":0,
-                    }
+            stats = self._init_query_stats()
             for active_i, (gmap, ep) in enumerate(zip(gmaps, current_episodes)):
                 original_env_index = env_indices[active_i]
-                ghost_vp_ids = list(gmap.ghost_mean_pos.keys())
-                for ghost_vp_id in ghost_vp_ids:
-                    if (not gmap.has_real_pos) or (ghost_vp_id not in gmap.ghost_real_pos):
-                        continue
-
-                    real_pos_list = gmap.ghost_real_pos[ghost_vp_id]
-                    if len(real_pos_list) == 0:
-                        continue
-
-                    #在当前V1版本，是通过平均真实位置进行预测的
-                    real_pos_mean = tuple(np.mean(real_pos_list, axis=0).tolist())
-
-                    target, resolve_reason = self._resolve_query_target(
-                        active_i,
-                        gmap,
-                        ghost_vp_id,
-                        real_pos_mean,  #这里默认是按照主策略(平均位置)进行选点的
-                    )
-                    if target is None:   #如果是空，则表示选点失败了，失败计数加一。
-                        stats["fail_cnt"] += 1      #总失败次数加一
-                        stats["resolve_fail_cnt"] += 1  #解析失败次数加一
-                        self._trace_query_event(            #用于定位问题出现在哪
-                            env_index=active_i,
-                            scene_id=ep.scene_id,
-                            episode_id=ep.episode_id,
-                            stepk=stepk,
-                            original_env_index=original_env_index,
-                            ghost_vp_id=ghost_vp_id,
-                            chosen_front_vp_id=None,
-                            source_member_index=None,
-                            source_member_real_pos=None,
-                            pos_strategy=self.config_oracle.query_pos_strategy,
-                            heading_strategy=self.config_oracle.query_heading_strategy,
-                            pipeline=self.config_oracle.query_pipeline,
-                            query_pos=None,
-                            query_heading_rad=None,
-                            ok=False,
-                            reason=resolve_reason,      #失败的错误原因
-                            cache_hit=False,
-                            used_pos=None,
-                            used_heading_rad=None,
-                            embed_norm=None,
-                        )
-                        continue
-
-                    query_pos = target["query_pos"]
-                    query_pos_strategy = target["query_pos_strategy"]
-                    source_member_index = target["source_member_index"]
-                    source_member_real_pos = target["source_member_real_pos"]
-                    chosen_front_vp_id = target["source_front_vp_id"]
-
-                    if not self._should_query_ghost(
-                        gmap=gmap,
-                        ghost_vp_id=ghost_vp_id,
-                        real_pos_count=len(real_pos_list),
-                        real_pos_mean=real_pos_mean,
-                        source_member_index=source_member_index,
-                        source_front_vp_id=chosen_front_vp_id,
-                    ):
-                        stats["skipped_cnt"] += 1
-                        continue
-
-                    #接下来计算query_heading，当前V1版本按照真实朝向计算
-                    front_vp_ids = list(gmap.ghost_fronts[ghost_vp_id])
-                    front_pos = gmap.node_pos[chosen_front_vp_id]
-
-                    query_heading_rad, _, _ = calculate_vp_rel_pos_fts(
-                                                        np.asarray(query_pos),
-                                                        np.asarray(front_pos),
-                                                        base_heading=0.0,
-                                                        base_elevation=0.0,
-                                                        to_clock=False,
-                                                    )
-                    
-                    spec = OracleQuerySpec(
-                        run_id=self.run_id,
-                        split=self.split,
-                        scene_id=ep.scene_id,
-                        episode_id=ep.episode_id,
-                        active_env_index=active_i,
-                        original_env_index=original_env_index,
-                        stepk=stepk,
-                        ghost_vp_id=ghost_vp_id,
-                        front_vp_ids=front_vp_ids,
-                        chosen_front_vp_id=chosen_front_vp_id,
-                        source_member_index=source_member_index,
-                        source_member_real_pos=source_member_real_pos,
-                        query_pos=query_pos,
-                        query_heading_rad=float(query_heading_rad),
-                        pos_strategy=query_pos_strategy,
-                        heading_strategy="face_frontier",
-                        pipeline="future_node_avg_pano",
-                        real_pos_count=len(real_pos_list),
-                        real_pos_mean=real_pos_mean,
-                    )
-
-                    cache_entry = None
-                    if self.cache is not None:
-                        cache_entry = self.cache.lookup(
-                            ep.scene_id,
-                            query_pos,
-                            query_heading_rad,
-                        )
-
-                    if cache_entry is not None:
-                        cached_embed = cache_entry.embed.detach().clone()
-                        cache_meta = cache_entry.meta
-                        source_episode_id = cache_meta.get("source_episode_id")
-                        result = OracleFeatureResult(
-                            ghost_vp_id=ghost_vp_id,
-                            ok=True,
-                            reason=None,
-                            embed=cached_embed,
-                            embed_dtype=self._dtype_to_name(cached_embed.dtype),
-                            embed_norm=float(cached_embed.norm().item()),
-                            used_pos=tuple(cache_meta.get("used_pos", cache_entry.pos)),
-                            used_heading_rad=float(
-                                cache_entry.heading_rad
-                                if cache_meta.get("used_heading_rad") is None
-                                else cache_meta["used_heading_rad"]
-                            ),
-                            cache_hit=True,
-                            cache_key=self._make_cache_key(
-                                ep.scene_id,
-                                cache_entry.pos,
-                                cache_entry.heading_rad,
-                            ),
-                            latency_ms=0.0,
-                        )
-                        is_intra_episode_cache_hit = (source_episode_id == ep.episode_id)
-                    else:
-                        is_intra_episode_cache_hit = False
-                        try:
-                            result = self.provider.query(spec=spec) #进行一次查询
-                        except Exception:       #如果失败，记录一次事件
-                            stats["fail_cnt"] += 1
-                            stats["provider_fail_cnt"] += 1
-                            self._trace_query_event(
-                                env_index=active_i,
-                                scene_id=ep.scene_id,
-                                episode_id=ep.episode_id,
-                                stepk=stepk,
-                                original_env_index=original_env_index,
-                                ghost_vp_id=ghost_vp_id,
-                                chosen_front_vp_id=chosen_front_vp_id,
-                                source_member_index=source_member_index,
-                                source_member_real_pos=source_member_real_pos,
-                                pos_strategy=query_pos_strategy,
-                                heading_strategy="face_frontier",
-                                pipeline="future_node_avg_pano",
-                                query_pos=query_pos,
-                                query_heading_rad=query_heading_rad,
-                                ok=False,
-                                reason="provider_query_failed",
-                                cache_hit=False,
-                                used_pos=None,
-                                used_heading_rad=None,
-                                embed_norm=None,
-                            )
-                            continue
-
-                    #如果返回成功就写回GraphMap
-                    if result.ok and result.embed is not None:
-                        gmap.set_oracle_embed(
-                            ghost_vp_id,
-                            result.embed,
-                            meta={
-                                "stepk": stepk,
-                                "used_pos": result.used_pos,
-                                "used_heading_rad": result.used_heading_rad,
-                                "real_pos_count": len(real_pos_list),
-                                "real_pos_mean": real_pos_mean,
-                                "query_source_index": source_member_index,
-                                "query_source_real_pos": source_member_real_pos,
-                                "query_source_front_vp_id": chosen_front_vp_id,
-                                "query_pos_strategy": query_pos_strategy,
-                            },#meta是特征相关的上下文，方便后续统计调试
-                        )
-                        if self.cache is not None and (not result.cache_hit):
-                            self.cache.insert(
-                                ep.scene_id,
-                                query_pos,
-                                query_heading_rad,
-                                result.embed,
-                                meta={
-                                    "used_pos": result.used_pos,
-                                    "used_heading_rad": result.used_heading_rad,
-                                    "source_episode_id": ep.episode_id,
-                                    "query_source_index": source_member_index,
-                                    "query_source_real_pos": source_member_real_pos,
-                                    "query_source_front_vp_id": chosen_front_vp_id,
-                                    "query_pos_strategy": query_pos_strategy,
-                                },
-                            )
-
-                    #更新统计
-                    stats["query_cnt"] += 1
-                    stats["latency_ms_sum"] += result.latency_ms
-                    stats["cache_hit_cnt"] += int(result.cache_hit)
-                    if result.cache_hit:
-                        if is_intra_episode_cache_hit:
-                            stats["intra_episode_cache_hit_cnt"] += 1
-                        else:
-                            stats["cross_episode_cache_hit_cnt"] += 1
-
-                    if result.ok and result.embed is not None:
-                        stats["success_cnt"] += 1
-                    else:
-                        stats["fail_cnt"] += 1
-
-                    self._trace_query_event(    #记录一次成功
-                        env_index=active_i,
-                        scene_id=ep.scene_id,
-                        episode_id=ep.episode_id,
-                        stepk=stepk,
-                        original_env_index=original_env_index,
-                        ghost_vp_id=ghost_vp_id,
-                        chosen_front_vp_id=chosen_front_vp_id,
-                        source_member_index=source_member_index,
-                        source_member_real_pos=source_member_real_pos,
-                        pos_strategy=query_pos_strategy,
-                        heading_strategy="face_frontier",
-                        pipeline="future_node_avg_pano",
-                        query_pos=query_pos,
-                        query_heading_rad=query_heading_rad,
-                        ok=result.ok,
-                        reason=result.reason,
-                        cache_hit=result.cache_hit,
-                        used_pos=result.used_pos,
-                        used_heading_rad=result.used_heading_rad,
-                        embed_norm=result.embed_norm,
-                    )
-                
-            #函数结束前补平均耗时并返回
-            if stats["query_cnt"] > 0:
-                stats["avg_latency_ms"] = stats["latency_ms_sum"] / stats["query_cnt"]
-            else:
-                stats["avg_latency_ms"] = 0.0
-            if stats["cache_hit_cnt"] > 0:
-                stats["intra_episode_cache_hit_pct"] = (
-                    stats["intra_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
+                candidate_ghost_ids = list(gmap.ghost_mean_pos.keys())
+                oracle_results = self.query_ghosts(
+                    mode=mode,
+                    stepk=stepk,
+                    gmap=gmap,
+                    current_episode=ep,
+                    active_env_index=active_i,
+                    original_env_index=original_env_index,
+                    candidate_ghost_ids=candidate_ghost_ids,
+                    current_step=stepk,
                 )
-                stats["cross_episode_cache_hit_pct"] = (
-                    stats["cross_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
+                gmap.apply_oracle_embeds(
+                    ghost_embeds=oracle_results,
+                    allowed_ghost_ids=candidate_ghost_ids,
+                    step_id=stepk,
+                    strict_scope=False,
                 )
-            else:
-                stats["intra_episode_cache_hit_pct"] = 0.0
-                stats["cross_episode_cache_hit_pct"] = 0.0
+                env_stats = self.get_last_query_stats()
+                for key in (
+                    "query_cnt",
+                    "success_cnt",
+                    "fail_cnt",
+                    "provider_fail_cnt",
+                    "resolve_fail_cnt",
+                    "cache_hit_cnt",
+                    "intra_episode_cache_hit_cnt",
+                    "cross_episode_cache_hit_cnt",
+                    "latency_ms_sum",
+                    "skipped_cnt",
+                ):
+                    stats[key] += env_stats.get(key, 0)
 
-            return stats
+            self._last_query_stats = self._finalize_query_stats(stats)
+            return dict(self._last_query_stats)
