@@ -54,6 +54,7 @@ class PolicyViewSelectionETP(ILPolicy):
     ):
         config.defrost()
         config.MODEL.TORCH_GPU_ID = config.TORCH_GPU_ID
+        config.MODEL.ORACLE_SOFT_ALPHA = getattr(config.ORACLE, "soft_alpha", 1.0)
         config.freeze()
 
         return cls(
@@ -74,6 +75,65 @@ class Critic(nn.Module):
 
     def forward(self, state):
         return self.state2value(state).squeeze()
+
+
+class OracleResidualAdapter(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int = 768,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        use_ln: bool = True,
+        identity_init: bool = True,
+        gain_init: float = 1.0,
+    ):
+        super().__init__()
+        if int(num_layers) < 1:
+            raise ValueError(
+                f"OracleResidualAdapter num_layers must be >= 1, got {num_layers}"
+            )
+        self.num_layers = int(num_layers)
+        self.ln = nn.LayerNorm(dim) if use_ln else nn.Identity()
+        self.identity_init = bool(identity_init)
+        self.drop = nn.Dropout(dropout)
+        activation = str(activation).lower()
+        if activation == "gelu":
+            self.act = nn.GELU()
+        elif activation == "relu":
+            self.act = nn.ReLU(inplace=True)
+        else:
+            raise ValueError(f"Unsupported OracleResidualAdapter activation: {activation}")
+        layers = []
+        if self.num_layers == 1:
+            layers.append(nn.Linear(dim, dim))
+        else:
+            layers.append(nn.Linear(dim, hidden_dim))
+            for _ in range(self.num_layers - 2):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.Linear(hidden_dim, dim))
+        self.layers = nn.ModuleList(layers)
+        self.gain = nn.Parameter(torch.tensor(float(gain_init)))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        last_idx = len(self.layers) - 1
+        for idx, layer in enumerate(self.layers):
+            if self.identity_init and idx == last_idx:
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+            else:
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, oracle_raw):
+        x = self.ln(oracle_raw)
+        for idx, layer in enumerate(self.layers):
+            x = layer(x)
+            if idx < len(self.layers) - 1:
+                x = self.drop(self.act(x))
+        return oracle_raw + self.gain * x
 
 
 class EffoNavDinoV2Encoder(nn.Module):
@@ -294,6 +354,7 @@ class ETP(Net):
         self, observation_space: Space, model_config: Config, num_actions,
     ):
         super().__init__()
+        self.model_config = model_config
 
         device = (
             torch.device("cuda", model_config.TORCH_GPU_ID)
@@ -402,6 +463,23 @@ class ETP(Net):
         self._perception_embedding_size = getattr(
             model_config.VISUAL_DIM, "vis_hidden", 768
         )
+        oracle_ft_cfg = getattr(model_config, "ORACLE_FT", None)
+        self.use_oracle_ft = bool(
+            getattr(oracle_ft_cfg, "enable", False) if oracle_ft_cfg is not None else False
+        )
+        if self.use_oracle_ft:
+            self.oracle_adapter = OracleResidualAdapter(
+                dim=self._perception_embedding_size,
+                hidden_dim=getattr(oracle_ft_cfg, "hidden_dim", self._perception_embedding_size),
+                num_layers=getattr(oracle_ft_cfg, "num_layers", 3),
+                dropout=getattr(oracle_ft_cfg, "dropout", 0.1),
+                activation=getattr(oracle_ft_cfg, "activation", "gelu"),
+                use_ln=getattr(oracle_ft_cfg, "use_layer_norm", True),
+                identity_init=getattr(oracle_ft_cfg, "identity_init", True),
+                gain_init=getattr(oracle_ft_cfg, "gain_init", 1.0),
+            )
+        else:
+            self.oracle_adapter = None
 
     @property  # trivial argument, just for init with habitat
     def output_size(self):
@@ -429,7 +507,9 @@ class ETP(Net):
                 rgb_fts=None, dep_fts=None, loc_fts=None, 
                 nav_types=None, view_lens=None,
                 gmap_vp_ids=None, gmap_step_ids=None,
-                gmap_img_fts=None, gmap_pos_fts=None, 
+                gmap_img_fts=None, gmap_base_img_fts=None,
+                gmap_oracle_raw_fts=None, gmap_oracle_masks=None,
+                gmap_pos_fts=None, 
                 gmap_masks=None, gmap_visited_masks=None, gmap_pair_dists=None):
 
         if mode == 'language':
@@ -719,6 +799,51 @@ class ETP(Net):
         #     'gmap_pair_dists': gmap_pair_dists,     #点和点之间有多远
         #     'no_vp_left': batch_no_vp_left,         #还有没有可探索 ghost
         # }
+            if self.use_oracle_ft and gmap_base_img_fts is not None:
+                base = gmap_base_img_fts
+                if gmap_oracle_raw_fts is not None and gmap_oracle_masks is not None:
+                    oracle_proj = self.oracle_adapter(gmap_oracle_raw_fts)
+                    fusion_alpha = getattr(
+                        self.model_config.ORACLE_FT, "fusion_alpha", 0.25
+                    )
+                    if getattr(
+                        self.model_config.ORACLE_FT,
+                        "use_config_soft_alpha",
+                        True,
+                    ):
+                        fusion_alpha = getattr(
+                            self.model_config, "ORACLE_SOFT_ALPHA", fusion_alpha
+                        )
+                    fused = base + fusion_alpha * (oracle_proj - base)
+                    mask = gmap_oracle_masks.unsqueeze(-1).to(base.dtype)
+                    gmap_img_fts = mask * fused + (1.0 - mask) * base
+                    if getattr(
+                        self.model_config.ORACLE_FT, "log_feature_stats", True
+                    ):
+                        oracle_mask_ratio = float(
+                            gmap_oracle_masks.float().mean().item()
+                        )
+                        oracle_ft_stats = {
+                            "gain": float(self.oracle_adapter.gain.detach().item()),
+                            "base_norm": float(base.norm(dim=-1).mean().detach().item()),
+                            "oracle_raw_norm": float(
+                                gmap_oracle_raw_fts.norm(dim=-1).mean().detach().item()
+                            ),
+                            "oracle_proj_norm": float(
+                                oracle_proj.norm(dim=-1).mean().detach().item()
+                            ),
+                            "fused_norm": float(
+                                gmap_img_fts.norm(dim=-1).mean().detach().item()
+                            ),
+                            "oracle_mask_ratio": oracle_mask_ratio,
+                        }
+                    else:
+                        oracle_ft_stats = None
+                else:
+                    gmap_img_fts = base
+                    oracle_ft_stats = None
+            else:
+                oracle_ft_stats = None
             outs = self.vln_bert.forward_navigation(
                 txt_embeds, txt_masks, 
                 gmap_vp_ids, gmap_step_ids,
@@ -729,6 +854,8 @@ class ETP(Net):
         #     'gmap_embeds': gmap_embeds, #经过全局图导航编码器更新后的图节点表示[B, L, H]
         #     'global_logits': global_logits, # 对图中每个可选节点的打分[B, L]
         # }
+            if oracle_ft_stats is not None:
+                outs["oracle_ft_stats"] = oracle_ft_stats
             return outs
 
 class BertLayerNorm(nn.Module):

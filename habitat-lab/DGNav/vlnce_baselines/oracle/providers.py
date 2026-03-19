@@ -48,6 +48,8 @@ class SimulatorPeekOracleProvider(OracleProvider):
 
     def query(self,spec):
         t0 = time.perf_counter()
+        policy_training = self.policy.training
+        net_training = self.policy.net.training if hasattr(self.policy, "net") else None
         try:
             if spec.pipeline != "future_node_avg_pano":
                 raise NotImplementedError(
@@ -80,6 +82,9 @@ class SimulatorPeekOracleProvider(OracleProvider):
             batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
             self.waypoint_predictor.eval()
+            self.policy.eval()
+            if hasattr(self.policy, "net"):
+                self.policy.net.eval()
             with torch.no_grad():
                 wp_outputs = self.policy.net(
                         mode = "waypoint",
@@ -134,6 +139,17 @@ class SimulatorPeekOracleProvider(OracleProvider):
                 f"active_env_index = {spec.active_env_index}/ "
                 f"original_env_index = {spec.original_env_index}"
             ) from e
+        finally:
+            if policy_training:
+                self.policy.train()
+            else:
+                self.policy.eval()
+            if hasattr(self.policy, "net") and net_training is not None:
+                if net_training:
+                    self.policy.net.train()
+                else:
+                    self.policy.net.eval()
+            self.waypoint_predictor.eval()
 
 
     def _vp_feature_variable(self, obs):

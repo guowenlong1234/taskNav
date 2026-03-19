@@ -230,8 +230,8 @@ def run_exp(exp_name: str, exp_config: str,
     config.local_rank = int(os.environ.get("LOCAL_RANK", local_rank))
     config.set_new_allowed(False)
     config.freeze()
-    os.system("mkdir -p data/logs/running_log")
-    logger.add_filehandler('data/logs/running_log/'+config.LOG_FILE)
+    os.makedirs(config.LOG_DIR, exist_ok=True)
+    logger.add_filehandler(os.path.join(config.LOG_DIR, config.LOG_FILE))
 
     random.seed(config.TASK_CONFIG.SEED)
     np.random.seed(config.TASK_CONFIG.SEED)

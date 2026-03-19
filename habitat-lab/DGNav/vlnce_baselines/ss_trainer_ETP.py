@@ -767,6 +767,127 @@ class RLTrainer(BaseVLNCETrainer):
 
         return observation_space, action_space
 
+    def _oracle_ft_enabled(self, config: Config = None) -> bool:
+        cfg = self.config if config is None else config
+        oracle_ft_cfg = getattr(cfg.MODEL, "ORACLE_FT", None)
+        return bool(
+            getattr(oracle_ft_cfg, "enable", False)
+            if oracle_ft_cfg is not None
+            else False
+        )
+
+    @staticmethod
+    def _match_optional_input_proj(name: str) -> bool:
+        patterns = (
+            "img_linear",
+            "img_layer_norm",
+            "loc_linear",
+            "loc_layer_norm",
+            "dep_linear",
+            "dep_layer_norm",
+            "gmap_step_embeddings",
+            "gmap_pos_embeddings",
+            "visn_fc",
+            "visn_layer_norm",
+        )
+        return any(pattern in name for pattern in patterns)
+
+    def _configure_oracle_ft_trainable_params(self) -> None:
+        if not self._oracle_ft_enabled():
+            return
+
+        oracle_ft_cfg = self.config.MODEL.ORACLE_FT
+        for _, param in self.policy.named_parameters():
+            param.requires_grad_(False)
+
+        trainable_names = []
+        for name, param in self.policy.named_parameters():
+            if "oracle_adapter" in name:
+                param.requires_grad_(True)
+            elif (
+                getattr(oracle_ft_cfg, "unfreeze_global_encoder", True)
+                and "vln_bert.global_encoder.encoder.x_layers" in name
+            ):
+                param.requires_grad_(True)
+            elif (
+                getattr(oracle_ft_cfg, "unfreeze_input_proj", False)
+                and self._match_optional_input_proj(name)
+            ):
+                param.requires_grad_(True)
+
+            if param.requires_grad:
+                trainable_names.append(name)
+
+        if self.local_rank < 1:
+            logger.info(
+                "[OracleFT] trainable params configured: "
+                f"{len(trainable_names)} tensors"
+            )
+            for name in trainable_names:
+                logger.info(f"[OracleFT][Trainable] {name}")
+
+    def _build_oracle_ft_param_groups(self):
+        oracle_ft_cfg = self.config.MODEL.ORACLE_FT
+        oracle_adapter_params = []
+        graph_params = []
+        input_proj_params = []
+        other_params = []
+
+        for name, param in self.policy.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "oracle_adapter" in name:
+                oracle_adapter_params.append(param)
+            elif "vln_bert.global_encoder.encoder.x_layers" in name:
+                graph_params.append(param)
+            elif self._match_optional_input_proj(name):
+                input_proj_params.append(param)
+            else:
+                other_params.append(param)
+
+        param_groups = []
+        if oracle_adapter_params:
+            param_groups.append(
+                {
+                    "params": oracle_adapter_params,
+                    "lr": getattr(oracle_ft_cfg, "oracle_mlp_lr", 5e-5),
+                }
+            )
+        if graph_params:
+            param_groups.append(
+                {
+                    "params": graph_params,
+                    "lr": getattr(oracle_ft_cfg, "graph_lr", 5e-6),
+                }
+            )
+        if input_proj_params:
+            param_groups.append(
+                {
+                    "params": input_proj_params,
+                    "lr": getattr(oracle_ft_cfg, "input_proj_lr", 1e-5),
+                }
+            )
+        if other_params:
+            param_groups.append(
+                {
+                    "params": other_params,
+                    "lr": getattr(oracle_ft_cfg, "graph_lr", 5e-6),
+                }
+            )
+
+        return param_groups
+
+    def _compute_grad_norm(self, match_fn) -> float:
+        sq_sum = 0.0
+        for name, param in self.policy.named_parameters():
+            if not match_fn(name):
+                continue
+            if param.grad is None:
+                continue
+            grad_norm = float(param.grad.data.norm(2).item())
+            sq_sum += grad_norm * grad_norm
+        return sq_sum ** 0.5
+
     def _initialize_policy(
         self,
         config: Config,
@@ -821,51 +942,6 @@ class RLTrainer(BaseVLNCETrainer):
             # find_unused_parameters=False fix ddp bug
             self.policy.net = DDP(self.policy.net.to(self.device), device_ids=[self.device],
                 output_device=self.device, find_unused_parameters=False, broadcast_buffers=False)
-        
-        # Setup optimizer, support separate learning rates for dynamic graph and node gating (only created in training mode)
-        if create_optimizer:
-            use_dynamic_graph = getattr(self.config.MODEL, 'use_dynamic_graph', False)
-            use_node_gating = getattr(self.config.MODEL, 'use_node_gating', False)
-            
-            if use_dynamic_graph or use_node_gating:
-                # Separate different parameter groups
-                dynamic_graph_params = []
-                node_gating_params = []
-                other_params = []
-                
-                for name, param in self.policy.named_parameters():
-                    if use_dynamic_graph and ('w1' in name or 'w2' in name or 'w3' in name or 
-                                             'semantic_sim_mlp' in name or 'instruction_rel_mlp' in name):
-                        dynamic_graph_params.append(param)
-                    elif use_node_gating and 'node_gating_mlp' in name:
-                        node_gating_params.append(param)
-                    else:
-                        other_params.append(param)
-                
-                # Create parameter groups
-                param_groups = [
-                    {'params': other_params, 'lr': self.config.IL.lr},
-                ]
-                
-                if use_dynamic_graph and dynamic_graph_params:
-                    dynamic_graph_lr = getattr(self.config.MODEL, 'dynamic_graph_lr', self.config.IL.lr)
-                    param_groups.append({
-                        'params': dynamic_graph_params,
-                        'lr': dynamic_graph_lr
-                    })
-                    logger.info(f'Using separate learning rate {dynamic_graph_lr} for dynamic graph parameters')
-                
-                if use_node_gating and node_gating_params:
-                    node_gating_lr = getattr(self.config.MODEL, 'node_gating_lr', self.config.IL.lr)
-                    param_groups.append({
-                        'params': node_gating_params,
-                        'lr': node_gating_lr
-                    })
-                    logger.info(f'Using separate learning rate {node_gating_lr} for node gating parameters')
-                
-                self.optimizer = torch.optim.AdamW(param_groups)
-            else:
-                self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=self.config.IL.lr)
 
         if load_from_ckpt:
             if config.IL.is_requeue:
@@ -887,15 +963,93 @@ class RLTrainer(BaseVLNCETrainer):
                     device_ids=[self.device], output_device=self.device)
             else:
                 self.policy.load_state_dict(ckpt_dict["state_dict"], strict=False)
-            if config.IL.is_requeue and hasattr(self, 'optimizer'):
-                self.optimizer.load_state_dict(ckpt_dict["optim_state"])
             logger.info(f"Loaded weights from checkpoint: {ckpt_path}, iteration: {start_iter}")
+
+        if create_optimizer:
+            if self._oracle_ft_enabled(config):
+                self._configure_oracle_ft_trainable_params()
+                oracle_ft_cfg = self.config.MODEL.ORACLE_FT
+                param_groups = self._build_oracle_ft_param_groups()
+                self.optimizer = torch.optim.AdamW(
+                    param_groups,
+                    weight_decay=getattr(oracle_ft_cfg, "weight_decay", 0.01),
+                )
+            else:
+                use_dynamic_graph = getattr(self.config.MODEL, 'use_dynamic_graph', False)
+                use_node_gating = getattr(self.config.MODEL, 'use_node_gating', False)
+
+                if use_dynamic_graph or use_node_gating:
+                    # Separate different parameter groups
+                    dynamic_graph_params = []
+                    node_gating_params = []
+                    other_params = []
+
+                    for name, param in self.policy.named_parameters():
+                        if use_dynamic_graph and ('w1' in name or 'w2' in name or 'w3' in name or 
+                                                 'semantic_sim_mlp' in name or 'instruction_rel_mlp' in name):
+                            dynamic_graph_params.append(param)
+                        elif use_node_gating and 'node_gating_mlp' in name:
+                            node_gating_params.append(param)
+                        else:
+                            other_params.append(param)
+
+                    # Create parameter groups
+                    param_groups = [
+                        {'params': other_params, 'lr': self.config.IL.lr},
+                    ]
+
+                    if use_dynamic_graph and dynamic_graph_params:
+                        dynamic_graph_lr = getattr(self.config.MODEL, 'dynamic_graph_lr', self.config.IL.lr)
+                        param_groups.append({
+                            'params': dynamic_graph_params,
+                            'lr': dynamic_graph_lr
+                        })
+                        logger.info(f'Using separate learning rate {dynamic_graph_lr} for dynamic graph parameters')
+
+                    if use_node_gating and node_gating_params:
+                        node_gating_lr = getattr(self.config.MODEL, 'node_gating_lr', self.config.IL.lr)
+                        param_groups.append({
+                            'params': node_gating_params,
+                            'lr': node_gating_lr
+                        })
+                        logger.info(f'Using separate learning rate {node_gating_lr} for node gating parameters')
+
+                    self.optimizer = torch.optim.AdamW(param_groups)
+                else:
+                    self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=self.config.IL.lr)
+
+            if load_from_ckpt and config.IL.is_requeue and hasattr(self, 'optimizer'):
+                try:
+                    self.optimizer.load_state_dict(ckpt_dict["optim_state"])
+                except Exception as e:
+                    logger.warning(
+                        f"Skipping optimizer state restore due to incompatible param groups: {e}"
+                    )
 			
         params = sum(param.numel() for param in self.policy.parameters())
         params_t = sum(
             p.numel() for p in self.policy.parameters() if p.requires_grad
         )
         logger.info(f"Agent parameters: {params/1e6:.2f} MB. Trainable: {params_t/1e6:.2f} MB.")
+        if self._oracle_ft_enabled(config):
+            oracle_adapter_params = sum(
+                p.numel()
+                for name, p in self.policy.named_parameters()
+                if p.requires_grad and "oracle_adapter" in name
+            )
+            global_encoder_params = sum(
+                p.numel()
+                for name, p in self.policy.named_parameters()
+                if p.requires_grad and "vln_bert.global_encoder.encoder.x_layers" in name
+            )
+            logger.info(
+                "[OracleFT] Trainable oracle_adapter params: "
+                f"{oracle_adapter_params/1e6:.2f} MB"
+            )
+            logger.info(
+                "[OracleFT] Trainable global_encoder params: "
+                f"{global_encoder_params/1e6:.2f} MB"
+            )
         logger.info("Finished setting up policy.")
 
         return start_iter
@@ -1028,7 +1182,9 @@ class RLTrainer(BaseVLNCETrainer):
     ):
         #cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
         batch_gmap_vp_ids, batch_gmap_step_ids, batch_gmap_lens = [], [], []
-        batch_gmap_img_fts, batch_gmap_pos_fts = [], []
+        batch_gmap_img_fts, batch_gmap_base_img_fts = [], []
+        batch_gmap_oracle_raw_fts, batch_gmap_oracle_masks = [], []
+        batch_gmap_pos_fts = []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
         batch_no_vp_left = []
 
@@ -1047,17 +1203,53 @@ class RLTrainer(BaseVLNCETrainer):
             if oracle_scope_ids_per_env is not None:
                 allowed_oracle_ghost_ids = set(oracle_scope_ids_per_env[i])
 
-            gmap_img_fts = [gmap.get_node_embeds(vp) for vp in node_vp_ids] + \
-                           [
-                               gmap.get_node_embeds(
-                                   vp,
-                                   use_oracle=use_oracle_embeds,
-                                   allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
-                               )
-                               for vp in ghost_vp_ids
-                           ]
+            gmap_img_fts = [gmap.get_node_embeds(vp) for vp in node_vp_ids]
+            gmap_base_img_fts = []
+            gmap_oracle_raw_fts = []
+            gmap_oracle_masks = []
+            for vp in node_vp_ids + ghost_vp_ids:
+                components = gmap.get_node_embed_components(vp)
+                base = components["base"]
+                oracle_raw = components["oracle_raw"]
+                has_oracle = components["has_oracle"]
+                if (
+                    vp.startswith('g')
+                    and use_oracle_embeds
+                    and has_oracle
+                    and (
+                        allowed_oracle_ghost_ids is None
+                        or vp in allowed_oracle_ghost_ids
+                    )
+                ):
+                    effective = gmap.get_node_embeds(
+                        vp,
+                        use_oracle=True,
+                        allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
+                    )
+                    oracle_mask = 1.0
+                    oracle_raw_tensor = oracle_raw
+                else:
+                    effective = base if vp.startswith('g') else gmap.get_node_embeds(vp)
+                    oracle_mask = 0.0
+                    oracle_raw_tensor = torch.zeros_like(base)
+
+                if vp.startswith('g'):
+                    gmap_img_fts.append(effective)
+                gmap_base_img_fts.append(base)
+                gmap_oracle_raw_fts.append(oracle_raw_tensor)
+                gmap_oracle_masks.append(oracle_mask)
+
             gmap_img_fts = torch.stack(
                 [torch.zeros_like(gmap_img_fts[0])] + gmap_img_fts, dim=0
+            )
+            gmap_base_img_fts = torch.stack(
+                [torch.zeros_like(gmap_base_img_fts[0])] + gmap_base_img_fts, dim=0
+            )
+            gmap_oracle_raw_fts = torch.stack(
+                [torch.zeros_like(gmap_oracle_raw_fts[0])] + gmap_oracle_raw_fts, dim=0
+            )
+            gmap_oracle_masks = torch.tensor(
+                [0.0] + gmap_oracle_masks, dtype=torch.float32
             )
 
             gmap_pos_fts = gmap.get_pos_fts(
@@ -1085,6 +1277,9 @@ class RLTrainer(BaseVLNCETrainer):
             batch_gmap_step_ids.append(torch.LongTensor(gmap_step_ids))
             batch_gmap_lens.append(len(gmap_vp_ids))
             batch_gmap_img_fts.append(gmap_img_fts)
+            batch_gmap_base_img_fts.append(gmap_base_img_fts)
+            batch_gmap_oracle_raw_fts.append(gmap_oracle_raw_fts)
+            batch_gmap_oracle_masks.append(gmap_oracle_masks)
             batch_gmap_pos_fts.append(torch.from_numpy(gmap_pos_fts))
             batch_gmap_pair_dists.append(torch.from_numpy(gmap_pair_dists))
             batch_gmap_visited_masks.append(torch.BoolTensor(gmap_visited_masks))
@@ -1092,6 +1287,11 @@ class RLTrainer(BaseVLNCETrainer):
         # collate
         batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).cuda()
         batch_gmap_img_fts = pad_tensors_wgrad(batch_gmap_img_fts)
+        batch_gmap_base_img_fts = pad_tensors_wgrad(batch_gmap_base_img_fts)
+        batch_gmap_oracle_raw_fts = pad_tensors_wgrad(batch_gmap_oracle_raw_fts)
+        batch_gmap_oracle_masks = pad_sequence(
+            batch_gmap_oracle_masks, batch_first=True
+        ).cuda()
         batch_gmap_pos_fts = pad_tensors_wgrad(batch_gmap_pos_fts).cuda()
         batch_gmap_lens = torch.LongTensor(batch_gmap_lens)
         batch_gmap_masks = gen_seq_masks(batch_gmap_lens).cuda()
@@ -1108,6 +1308,9 @@ class RLTrainer(BaseVLNCETrainer):
             'gmap_vp_ids': batch_gmap_vp_ids, #图里有哪些点
             'gmap_step_ids': batch_gmap_step_ids,   #这些点什么时候来的
             'gmap_img_fts': batch_gmap_img_fts,     #这些点长什么样
+            'gmap_base_img_fts': batch_gmap_base_img_fts,
+            'gmap_oracle_raw_fts': batch_gmap_oracle_raw_fts,
+            'gmap_oracle_masks': batch_gmap_oracle_masks,
             'gmap_pos_fts': batch_gmap_pos_fts,     #这些点相对我在哪
             'gmap_masks': batch_gmap_masks,         #哪些点有效
             'gmap_visited_masks': batch_gmap_visited_masks,     #哪些点已访问
@@ -1227,6 +1430,18 @@ class RLTrainer(BaseVLNCETrainer):
             with autocast():
                 self.rollout('train', ml_weight, sample_ratio)
             self.scaler.scale(self.loss).backward() # self.loss.backward()
+            if self._oracle_ft_enabled():
+                self.logs['grad/oracle_adapter'].append(
+                    self._compute_grad_norm(lambda name: "oracle_adapter" in name)
+                )
+                self.logs['grad/global_encoder_x_layers'].append(
+                    self._compute_grad_norm(
+                        lambda name: "vln_bert.global_encoder.encoder.x_layers" in name
+                    )
+                )
+                self.logs['grad/input_proj'].append(
+                    self._compute_grad_norm(self._match_optional_input_proj)
+                )
             self.scaler.step(self.optimizer)        # self.optimizer.step()
             self.scaler.update()
 
@@ -1926,7 +2141,14 @@ class RLTrainer(BaseVLNCETrainer):
 
             current_eps = self.envs.current_episodes()
             scope_trace_records = []
-            if self.config.ORACLE.enable and mode == 'eval':
+            oracle_mode_enabled = (
+                self.config.ORACLE.enable
+                and (
+                    (mode == 'eval' and getattr(self.config.ORACLE, "enable_in_eval", True))
+                    or (mode == 'train' and getattr(self.config.ORACLE, "enable_in_train", False))
+                )
+            )
+            if oracle_mode_enabled:
                 oracle_stats = self._init_oracle_query_stats()
                 if self._get_oracle_scope_name() == "top1_shadow":
                     planner_cache = self._forward_navigation_once(
@@ -2017,6 +2239,21 @@ class RLTrainer(BaseVLNCETrainer):
                     )
                     self._write_oracle_summary_log(oracle_summary_line)
 
+                if mode == 'train':
+                    self.logs['oracle/query_cnt'].append(float(oracle_stats.get("query_cnt", 0)))
+                    self.logs['oracle/returned_cnt'].append(float(oracle_stats.get("success_cnt", 0)))
+                    self.logs['oracle/failed_cnt'].append(float(oracle_stats.get("fail_cnt", 0)))
+                    self.logs['oracle/cache_hit_cnt'].append(float(oracle_stats.get("cache_hit_cnt", 0)))
+                    self.logs['oracle/cache_hit_pct'].append(
+                        float(oracle_stats.get("cache_hit_cnt", 0)) / max(float(oracle_stats.get("query_cnt", 0)), 1.0)
+                    )
+                    self.logs['oracle/intra_episode_cache_hit_pct'].append(
+                        float(oracle_stats.get("intra_episode_cache_hit_pct", 0.0))
+                    )
+                    self.logs['oracle/cross_episode_cache_hit_pct'].append(
+                        float(oracle_stats.get("cross_episode_cache_hit_pct", 0.0))
+                    )
+
                 for i, trace_record in enumerate(scope_trace_records):
                     planner_top1_after = nav_bundle["top1_vps"][i]
                     trace_record["planner_top1_after"] = planner_top1_after
@@ -2044,6 +2281,9 @@ class RLTrainer(BaseVLNCETrainer):
 
             nav_logits = nav_bundle['nav_logits']
             nav_probs = nav_bundle['nav_probs']
+            if mode == 'train' and "oracle_ft_stats" in nav_outs:
+                for stat_name, stat_value in nav_outs["oracle_ft_stats"].items():
+                    self.logs[f'oracle_ft/{stat_name}'].append(float(stat_value))
             for i, gmap in enumerate(self.gmaps):
                 #给节点打一个适合停止的分数，后面进行全局选择
                 #把当前节点如果选择 STOP 的概率，存成这个节点的 stop score。

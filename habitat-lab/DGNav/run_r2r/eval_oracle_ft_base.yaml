@@ -1,0 +1,33 @@
+IL:
+  back_algo: control
+
+ORACLE:
+  enable: True
+  enable_in_train: False
+  enable_in_eval: True
+  apply_mode: soft
+  soft_alpha: 0.25
+  target_ghost_scope: all
+  refresh_policy: on_change
+  cache_enable: True
+
+MODEL:
+  ORACLE_FT:
+    enable: True
+    hidden_dim: 768
+    num_layers: 3
+    dropout: 0.1
+    activation: gelu
+    use_layer_norm: True
+    identity_init: True
+    gain_init: 1.0
+    fusion_alpha: 0.25
+    use_config_soft_alpha: True
+    unfreeze_global_encoder: True
+    unfreeze_input_proj: False
+    oracle_mlp_lr: 5e-5
+    graph_lr: 5e-6
+    input_proj_lr: 1e-5
+    weight_decay: 0.01
+    log_feature_stats: True
+    eval_with_oracle_off: True

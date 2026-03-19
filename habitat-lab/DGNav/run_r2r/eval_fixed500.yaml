@@ -1,0 +1,2 @@
+EVAL:
+  EPISODE_ID_FILE: run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt

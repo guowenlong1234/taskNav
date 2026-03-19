@@ -1,0 +1,5 @@
+MODEL:
+  ORACLE_FT:
+    enable: True
+    unfreeze_global_encoder: False
+    unfreeze_input_proj: False

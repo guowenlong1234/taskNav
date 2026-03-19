@@ -278,6 +278,24 @@ class GraphMap(object):
     def get_all_alive_ghost_ids(self):
         return list(self.ghost_pos.keys())
 
+    def get_node_embed_components(self, vp_id: str):
+        if not vp_id.startswith('g'):
+            base = self.node_embeds[vp_id]
+            return {
+                "base": base,
+                "oracle_raw": None,
+                "has_oracle": False,
+                "is_ghost": False,
+            }
+        base = self.get_base_ghost_embed(vp_id)
+        oracle_raw = self.get_oracle_embed(vp_id)
+        return {
+            "base": base,
+            "oracle_raw": oracle_raw,
+            "has_oracle": oracle_raw is not None,
+            "is_ghost": True,
+        }
+
     def apply_oracle_embeds(
         self,
         ghost_embeds: dict,

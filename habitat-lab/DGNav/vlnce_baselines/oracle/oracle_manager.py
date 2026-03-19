@@ -408,7 +408,11 @@ class OracleExperimentManager:
         candidate_ghost_ids: List[str],
         current_step: Optional[int] = None,
     ) -> Dict[str, OracleFeatureResult]:
-        if (not self.config_oracle.enable) or (mode != "eval"):
+        allow_mode = (
+            (mode == "eval" and getattr(self.config_oracle, "enable_in_eval", True))
+            or (mode == "train" and getattr(self.config_oracle, "enable_in_train", False))
+        )
+        if (not self.config_oracle.enable) or (not allow_mode):
             self._last_query_stats = self._init_query_stats(candidate_ghost_ids)
             return {}
 
@@ -699,7 +703,11 @@ class OracleExperimentManager:
             4) gmap.set_oracle_embed(ghost_vp_id, result.embed, meta=...)
         - 返回当步统计：query_cnt/cache_hit/avg_latency/fail_cnt 等
         '''
-        if (not self.config_oracle.enable) or (mode != "eval"):
+        allow_mode = (
+            (mode == "eval" and getattr(self.config_oracle, "enable_in_eval", True))
+            or (mode == "train" and getattr(self.config_oracle, "enable_in_train", False))
+        )
+        if (not self.config_oracle.enable) or (not allow_mode):
             return {}
 
 

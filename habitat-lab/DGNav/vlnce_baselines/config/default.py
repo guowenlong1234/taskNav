@@ -27,6 +27,7 @@ _C.TENSORBOARD_DIR = "data/tensorboard_dirs/debug"
 _C.CHECKPOINT_FOLDER = "data/checkpoints/debug"
 _C.EVAL_CKPT_PATH_DIR = "data/checkpoints/debug"
 _C.RESULTS_DIR = "data/checkpoints/pretrained/evals"
+_C.LOG_DIR = "data/logs/running_log"
 _C.LOG_FILE = "train.log"
 
 # -----------------------------------------------------------------------------
@@ -179,6 +180,8 @@ _C.ORACLE.query_pos_strategy = "ghost_real_pos_mean"
 _C.ORACLE.query_pos_fallback = "nearest_real_pos"
 _C.ORACLE.query_heading_strategy = "face_frontier"
 _C.ORACLE.target_ghost_scope = "all"
+_C.ORACLE.enable_in_train = False
+_C.ORACLE.enable_in_eval = True
 _C.ORACLE.apply_mode = "hard"
 _C.ORACLE.soft_alpha = 1.0
 _C.ORACLE.refresh_policy = "on_change"
@@ -256,6 +259,7 @@ _C.MODEL.INSTRUCTION_ENCODER.bidirectional = False
 _C.MODEL.rgb_feature_extractor = "clip"  # options: "clip", "dino"
 _C.MODEL.dino = "EffoNav"
 _C.MODEL.projector_ckpt_path = ""
+_C.MODEL.ORACLE_SOFT_ALPHA = 1.0
 _C.MODEL.spatial_output = True
 _C.MODEL.RGB_ENCODER = CN()
 _C.MODEL.RGB_ENCODER.cnn_type = "TorchVisionResNet50"
@@ -285,6 +289,26 @@ _C.MODEL.SEQ2SEQ.use_prev_action = False
 _C.MODEL.PROGRESS_MONITOR = CN()
 _C.MODEL.PROGRESS_MONITOR.use = False
 _C.MODEL.PROGRESS_MONITOR.alpha = 1.0  # loss multiplier
+
+_C.MODEL.ORACLE_FT = CN()
+_C.MODEL.ORACLE_FT.enable = False
+_C.MODEL.ORACLE_FT.hidden_dim = 768
+_C.MODEL.ORACLE_FT.num_layers = 3
+_C.MODEL.ORACLE_FT.dropout = 0.1
+_C.MODEL.ORACLE_FT.activation = "gelu"
+_C.MODEL.ORACLE_FT.use_layer_norm = True
+_C.MODEL.ORACLE_FT.identity_init = True
+_C.MODEL.ORACLE_FT.gain_init = 1.0
+_C.MODEL.ORACLE_FT.fusion_alpha = 0.25
+_C.MODEL.ORACLE_FT.use_config_soft_alpha = True
+_C.MODEL.ORACLE_FT.unfreeze_global_encoder = True
+_C.MODEL.ORACLE_FT.unfreeze_input_proj = False
+_C.MODEL.ORACLE_FT.oracle_mlp_lr = 5e-5
+_C.MODEL.ORACLE_FT.graph_lr = 5e-6
+_C.MODEL.ORACLE_FT.input_proj_lr = 1e-5
+_C.MODEL.ORACLE_FT.weight_decay = 0.01
+_C.MODEL.ORACLE_FT.log_feature_stats = True
+_C.MODEL.ORACLE_FT.eval_with_oracle_off = True
 
 # Dynamic graph configuration
 _C.MODEL.use_dynamic_graph = False  # Whether to enable dynamic graph method
@@ -326,6 +350,8 @@ _ORACLE_LEGACY_ALIASES = {
     "QUERY_POS_FALLBACK": "query_pos_fallback",
     "QUERY_HEADING_STRATEGY": "query_heading_strategy",
     "TARGET_GHOST_SCOPE": "target_ghost_scope",
+    "ENABLE_IN_TRAIN": "enable_in_train",
+    "ENABLE_IN_EVAL": "enable_in_eval",
     "SCOPE": "target_ghost_scope",
     "APPLY_MODE": "apply_mode",
     "REPLACE_POLICY": "apply_mode",
@@ -490,6 +516,12 @@ def _normalize_oracle_config(config: CN) -> None:
         )
     config.ORACLE.target_ghost_scope = target_ghost_scope
 
+    config.ORACLE.enable_in_train = bool(
+        getattr(config.ORACLE, "enable_in_train", False)
+    )
+    config.ORACLE.enable_in_eval = bool(
+        getattr(config.ORACLE, "enable_in_eval", True)
+    )
     config.ORACLE.strict_scope = bool(
         getattr(config.ORACLE, "strict_scope", True)
     )
@@ -569,6 +601,8 @@ def _normalize_oracle_config(config: CN) -> None:
     config.ORACLE.query_only_new_or_changed = final_bool_pair[0]
     config.ORACLE.requery_on_realpos_update = final_bool_pair[1]
     config.ORACLE.refresh_policy = final_refresh_policy
+    if "MODEL" in config:
+        config.MODEL.ORACLE_SOFT_ALPHA = config.ORACLE.soft_alpha
 
 
 def get_config(

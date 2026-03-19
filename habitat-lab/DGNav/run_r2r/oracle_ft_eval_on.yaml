@@ -1,0 +1,7 @@
+ORACLE:
+  enable: True
+  enable_in_eval: True
+
+MODEL:
+  ORACLE_FT:
+    enable: True
