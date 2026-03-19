@@ -26,10 +26,11 @@ if python -c "import importlib.util as u; raise SystemExit(0 if u.find_spec('tor
 fi
 
 conda_env="${CONDA_ENV:-py3-9}"
-master_port="${MASTER_PORT:-4761}"
+master_port="${MASTER_PORT:-4561}"
 exp_name="${EXP_NAME:-B1_oracle_ft_adapter_only}"
 config_path="${CONFIG_PATH:-run_r2r/iter_train.yaml,run_r2r/train_oracle_ft_base.yaml,run_r2r/oracle_ft_adapter_only.yaml}"
 ckpt_path="${CKPT_PATH:-${dgnav_dir}/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter12000.pth}"
+pretrained_path="${PRETRAINED_PATH-}"
 
 num_environments="${NUM_ENVIRONMENTS:-1}"
 gpu_numbers="${GPU_NUMBERS:-1}"
@@ -64,15 +65,23 @@ oracle_ft_gain_init="${ORACLE_FT_GAIN_INIT-}"
 oracle_ft_mlp_lr="${ORACLE_FT_MLP_LR-}"
 oracle_ft_graph_lr="${ORACLE_FT_GRAPH_LR-}"
 oracle_ft_input_proj_lr="${ORACLE_FT_INPUT_PROJ_LR-}"
+oracle_ft_train_scope="${ORACLE_FT_TRAIN_SCOPE-}"
 oracle_ft_unfreeze_global_encoder="${ORACLE_FT_UNFREEZE_GLOBAL_ENCODER-}"
 oracle_ft_unfreeze_input_proj="${ORACLE_FT_UNFREEZE_INPUT_PROJ-}"
+il_load_from_ckpt="${IL_LOAD_FROM_CKPT:-True}"
 il_iters="${IL_ITERS-}"
+il_lr="${IL_LR-}"
+il_waypoint_aug="${IL_WAYPOINT_AUG-}"
+il_back_algo="${IL_BACK_ALGO-}"
+train_env_refill_policy="${TRAIN_ENV_REFILL_POLICY-}"
 
 echo "[run_oracle_ft_train.bash] EXP_NAME=${exp_name}"
 echo "[run_oracle_ft_train.bash] CONFIG_PATH=${config_path}"
 echo "[run_oracle_ft_train.bash] CKPT_PATH=${ckpt_path}"
+echo "[run_oracle_ft_train.bash] PRETRAINED_PATH=${pretrained_path:-<yaml/default>}"
 echo "[run_oracle_ft_train.bash] NUM_ENVIRONMENTS=${num_environments}"
 echo "[run_oracle_ft_train.bash] MASTER_PORT=${master_port}"
+echo "[run_oracle_ft_train.bash] TRAIN_ENV_REFILL_POLICY=${train_env_refill_policy:-<yaml/default>}"
 
 append_opt() {
       local key="$1"
@@ -96,12 +105,13 @@ flag_train=(
       CHECKPOINT_FOLDER "${checkpoint_folder}"
       VIDEO_DIR "${video_dir}"
       LOG_DIR "${log_dir}"
-      IL.load_from_ckpt True
-      IL.ckpt_to_load "${ckpt_path}"
       IL.is_requeue False
       TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING "${allow_sliding}"
 )
 
+append_opt "IL.load_from_ckpt" "${il_load_from_ckpt}"
+append_opt "IL.ckpt_to_load" "${ckpt_path}"
+append_opt "MODEL.pretrained_path" "${pretrained_path}"
 append_opt "ORACLE.enable" "${oracle_enable}"
 append_opt "ORACLE.enable_in_train" "${oracle_enable_in_train}"
 append_opt "ORACLE.enable_in_eval" "${oracle_enable_in_eval}"
@@ -119,9 +129,14 @@ append_opt "MODEL.ORACLE_FT.gain_init" "${oracle_ft_gain_init}"
 append_opt "MODEL.ORACLE_FT.oracle_mlp_lr" "${oracle_ft_mlp_lr}"
 append_opt "MODEL.ORACLE_FT.graph_lr" "${oracle_ft_graph_lr}"
 append_opt "MODEL.ORACLE_FT.input_proj_lr" "${oracle_ft_input_proj_lr}"
+append_opt "MODEL.ORACLE_FT.train_scope" "${oracle_ft_train_scope}"
 append_opt "MODEL.ORACLE_FT.unfreeze_global_encoder" "${oracle_ft_unfreeze_global_encoder}"
 append_opt "MODEL.ORACLE_FT.unfreeze_input_proj" "${oracle_ft_unfreeze_input_proj}"
 append_opt "IL.iters" "${il_iters}"
+append_opt "IL.lr" "${il_lr}"
+append_opt "IL.waypoint_aug" "${il_waypoint_aug}"
+append_opt "IL.back_algo" "${il_back_algo}"
+append_opt "IL.TRAIN_ENV_REFILL_POLICY" "${train_env_refill_policy}"
 
 run_oracle_ft_train() {
       local port="$1"
@@ -140,3 +155,5 @@ cd "${dgnav_dir}"
 
 echo "###### oracle ft train mode ######"
 run_oracle_ft_train "${master_port}" "${flag_train[@]}"
+
+#MPLCONFIGDIR=/tmp/mpl CONDA_ENV=py3-9 EXP_NAME=release_r2r_dino_best_nav_streaming_full CONFIG_PATH=run_r2r/iter_train.yaml,run_r2r/train_streaming_refill_smoke.yaml PRETRAINED_PATH=/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2_clean/ckpts/model_step_97500.pt NUM_ENVIRONMENTS=4 GPU_NUMBERS=1 SIMULATOR_GPU_IDS='[0]' TORCH_GPU_IDS='[0]' TORCH_GPU_ID=0 MASTER_PORT=4793 IL_ITERS=30000 IL_LR=1e-5 IL_LOAD_FROM_CKPT=False IL_WAYPOINT_AUG=True IL_BACK_ALGO=teleport TRAIN_ENV_REFILL_POLICY=streaming_refill ALLOW_SLIDING=True ORACLE_ENABLE=False ORACLE_ENABLE_IN_TRAIN=False ORACLE_ENABLE_IN_EVAL=False bash habitat-lab/DGNav/run_r2r/run_oracle_ft_train.bash

@@ -4,7 +4,7 @@ import sys
 import random
 import warnings
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 import jsonlines
 
 import lmdb
@@ -42,7 +42,7 @@ from .utils import get_camera_orientations12
 from .utils import (
     length2mask, dir_angle_feature_with_ele,
 )
-from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
+from vlnce_baselines.common.utils import dis_to_con
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -132,6 +132,9 @@ class RLTrainer(BaseVLNCETrainer):
         self._perf_timing_path = None
         self._train_rollout_counter = 0
         self._warned_missing_collisions = False
+        self._warned_duplicate_eval_episode = False
+        self._train_pbar = None
+        self._train_progress_state = {}
         self._oracle_summary_path = None
         self._oracle_scope_trace_path = None
         self._oracle_scope_summary_path = None
@@ -202,7 +205,7 @@ class RLTrainer(BaseVLNCETrainer):
             summary_dir = os.path.join("data", "logs", "oracle_summaries")
             os.makedirs(summary_dir, exist_ok=True)
             exp_name = getattr(self.config, "EXP_NAME", "exp")
-            split = getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval")
+            split = self._get_current_dataset_split()
             ts = time.strftime("%Y%m%d_%H%M%S")
             self._oracle_summary_path = os.path.join(
                 summary_dir,
@@ -234,6 +237,12 @@ class RLTrainer(BaseVLNCETrainer):
     def _get_oracle_scope_name(self) -> str:
         return str(getattr(self.config.ORACLE, "target_ghost_scope", "all")).lower()
 
+    def _get_current_dataset_split(self) -> str:
+        dataset_cfg = getattr(getattr(self.config, "TASK_CONFIG", None), "DATASET", None)
+        if dataset_cfg is not None and getattr(dataset_cfg, "SPLIT", None) is not None:
+            return str(dataset_cfg.SPLIT)
+        return str(getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval"))
+
     def _get_oracle_scope_trace_path(self):
         if self.local_rank != 0 or not getattr(self.config.ORACLE, "scope_trace_enable", False):
             return None
@@ -245,7 +254,7 @@ class RLTrainer(BaseVLNCETrainer):
             )
             os.makedirs(trace_dir, exist_ok=True)
             exp_name = getattr(self.config, "EXP_NAME", "exp")
-            split = getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval")
+            split = self._get_current_dataset_split()
             scope = self._get_oracle_scope_name()
             ts = time.strftime("%Y%m%d_%H%M%S")
             self._oracle_scope_trace_path = os.path.join(
@@ -272,7 +281,7 @@ class RLTrainer(BaseVLNCETrainer):
             )
             os.makedirs(summary_dir, exist_ok=True)
             exp_name = getattr(self.config, "EXP_NAME", "exp")
-            split = getattr(getattr(self.config, "EVAL", None), "SPLIT", "eval")
+            split = self._get_current_dataset_split()
             scope = self._get_oracle_scope_name()
             ts = time.strftime("%Y%m%d_%H%M%S")
             self._oracle_scope_summary_path = os.path.join(
@@ -462,6 +471,7 @@ class RLTrainer(BaseVLNCETrainer):
         stepk,
         env_idx,
         original_env_index,
+        slot_id,
         gmap,
         current_episode,
         current_real_vp,
@@ -480,6 +490,7 @@ class RLTrainer(BaseVLNCETrainer):
             current_episode=current_episode,
             active_env_index=env_idx,
             original_env_index=original_env_index,
+            slot_id=slot_id,
             candidate_ghost_ids=scope_ids,
             current_step=gmap.graph_step,
         )
@@ -501,6 +512,12 @@ class RLTrainer(BaseVLNCETrainer):
 
         trace_record = {
             "episode_id": str(current_episode.episode_id),
+            "episode_instance_seq": oracle_manager.get_slot_episode_instance_seq(
+                slot_id
+            ),
+            "active_env_index": int(env_idx),
+            "original_env_index": int(original_env_index),
+            "slot_id": int(slot_id),
             "step": int(stepk),
             "current_real_vp": current_real_vp,
             "oracle_scope": self._get_oracle_scope_name(),
@@ -515,6 +532,550 @@ class RLTrainer(BaseVLNCETrainer):
             "target_changed": False,
         }
         return trace_record, query_stats
+
+    def _validate_env_refill_policy(self, policy: str, where: str) -> None:
+        allowed = {"legacy_batch", "streaming_refill"}
+        if policy not in allowed:
+            raise ValueError(
+                f"Invalid {where} env refill policy: {policy}. "
+                f"Supported values: {sorted(allowed)}"
+            )
+
+    def _is_oracle_effective_for_mode(self, mode: str) -> bool:
+        if not self.config.ORACLE.enable:
+            return False
+        if mode == "eval":
+            return bool(getattr(self.config.ORACLE, "enable_in_eval", True))
+        if mode == "train":
+            return bool(getattr(self.config.ORACLE, "enable_in_train", False))
+        return False
+
+    def _get_eval_env_refill_policy(self) -> str:
+        policy = str(
+            getattr(self.config.EVAL, "ENV_REFILL_POLICY", "legacy_batch")
+        ).lower()
+        self._validate_env_refill_policy(policy, "eval")
+        return policy
+
+    def _get_train_env_refill_policy(self) -> str:
+        policy = str(
+            getattr(self.config.IL, "TRAIN_ENV_REFILL_POLICY", "legacy_batch")
+        ).lower()
+        self._validate_env_refill_policy(policy, "train")
+        return policy
+
+    def _get_instr_pad_id(self) -> int:
+        return 1 if self.config.MODEL.task_type == "rxr" else 0
+
+    def _tokenize_observations(self, observations: List[Dict]) -> List[Dict]:
+        if len(observations) == 0:
+            return observations
+        return extract_instruction_tokens(
+            observations,
+            self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
+            max_length=self.config.IL.max_text_len,
+            pad_id=self._get_instr_pad_id(),
+        )
+
+    def _observations_to_batch(self, observations: List[Dict]) -> Dict[str, torch.Tensor]:
+        batch = batch_obs(observations, self.device)
+        return apply_obs_transforms_batch(batch, self.obs_transforms)
+
+    def _stream_have_real_pos(self, mode: str) -> bool:
+        return (
+            mode == "train"
+            or bool(self.config.VIDEO_OPTION)
+            or (
+                mode == "eval"
+                and self._is_oracle_effective_for_mode("eval")
+                and self.config.ORACLE.force_have_real_pos
+            )
+        )
+
+    def _make_stream_graph_map(self, mode: str) -> GraphMap:
+        ghost_aug = self.config.IL.ghost_aug if mode == "train" else 0.0
+        return GraphMap(
+            self._stream_have_real_pos(mode),
+            self.config.IL.loc_noise,
+            self.config.MODEL.merge_ghost,
+            ghost_aug,
+            oracle_cfg=self.config.ORACLE,
+        )
+
+    def _encode_text_from_observation(
+        self, observation: Dict
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        instr_uuid = self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID
+        if instr_uuid not in observation:
+            raise KeyError(
+                f"Missing instruction field in observation: {instr_uuid}"
+            )
+        txt_ids = torch.as_tensor(
+            observation[instr_uuid], dtype=torch.long, device=self.device
+        )
+        if txt_ids.dim() == 1:
+            txt_ids = txt_ids.unsqueeze(0)
+        txt_masks = txt_ids != self._get_instr_pad_id()
+        txt_embeds = self.policy.net(
+            mode="language",
+            txt_ids=txt_ids,
+            txt_masks=txt_masks,
+        )
+        return txt_masks.squeeze(0), txt_embeds.squeeze(0)
+
+    def _build_oracle_manager(
+        self, mode: str, slot_ids: Optional[List[int]] = None
+    ):
+        if not self._is_oracle_effective_for_mode(mode):
+            return None
+        oracle_manager = OracleExperimentManager(
+            config=self.config,
+            envs=self.envs,
+            policy=self.policy,
+            waypoint_predictor=self.waypoint_predictor,
+            obs_transforms=self.obs_transforms,
+            device=self.device,
+            run_id=getattr(self.config, "EXP_NAME", "exp"),
+            split=self.config.TASK_CONFIG.DATASET.SPLIT,
+            trace_dir=self.config.ORACLE.trace.dir,
+            vp_feature_builder=self._vp_feature_variable,
+        )
+        current_eps = self.envs.current_episodes()
+        if slot_ids is None:
+            slot_ids = list(range(len(current_eps)))
+        for i, ep in enumerate(current_eps):
+            slot_id = int(slot_ids[i])
+            oracle_manager.bind_active_env_to_slot(
+                active_env_index=i,
+                slot_id=slot_id,
+            )
+            oracle_manager.one_episode_reset(
+                slot_id=slot_id,
+                scene_id=ep.scene_id,
+                episode_id=ep.episode_id,
+                active_env_index=i,
+            )
+        return oracle_manager
+
+    def _build_initial_stream_slot_state(
+        self, observations: List[Dict], mode: str
+    ):
+        observations = self._tokenize_observations(observations)
+        slot_ids = list(range(len(observations)))
+        gmaps = [self._make_stream_graph_map(mode) for _ in observations]
+        prev_vp = [None] * len(observations)
+        slot_txt_masks = []
+        slot_txt_embeds = []
+        for observation in observations:
+            txt_mask, txt_embed = self._encode_text_from_observation(observation)
+            slot_txt_masks.append(txt_mask)
+            slot_txt_embeds.append(txt_embed)
+        slot_episode_steps = [0] * len(observations)
+        if mode == "eval":
+            for ep in self.envs.current_episodes():
+                ep_id = str(ep.episode_id)
+                if ep_id not in self.episode_start_times:
+                    self.episode_start_times[ep_id] = time.time()
+        oracle_manager = self._build_oracle_manager(mode=mode, slot_ids=slot_ids)
+        return (
+            observations,
+            gmaps,
+            prev_vp,
+            slot_ids,
+            slot_txt_masks,
+            slot_txt_embeds,
+            slot_episode_steps,
+            oracle_manager,
+        )
+
+    def _normalize_reset_at_output(self, reset_out):
+        if isinstance(reset_out, dict):
+            return reset_out
+        if isinstance(reset_out, (list, tuple)):
+            if len(reset_out) == 0:
+                raise ValueError("reset_at returned an empty result")
+            return reset_out[0]
+        raise TypeError(
+            f"Unsupported reset_at output type: {type(reset_out).__name__}"
+        )
+
+    def _get_env_episode_id(self, env_index: int) -> str:
+        return str(self.envs.current_episodes()[env_index].episode_id)
+
+    def _get_active_episode_ids(self) -> Set[str]:
+        return {
+            str(ep.episode_id)
+            for ep in self.envs.current_episodes()
+        }
+
+    @staticmethod
+    def _tail_indices_to_trim(
+        active_count: int,
+        keep_count: int,
+        exclude: Optional[List[int]] = None,
+    ) -> List[int]:
+        keep_count = max(0, min(int(keep_count), int(active_count)))
+        excluded = set(exclude or [])
+        effective_active = max(active_count - len(excluded), 0)
+        trim_count = max(effective_active - keep_count, 0)
+        trim = []
+        for idx in range(active_count - 1, -1, -1):
+            if idx in excluded:
+                continue
+            trim.append(idx)
+            if len(trim) >= trim_count:
+                break
+        return trim
+
+    @staticmethod
+    def _pause_stream_observations_only(
+        envs_to_pause: List[int],
+        envs,
+        observations: List[Dict],
+    ) -> List[Dict]:
+        if len(envs_to_pause) == 0:
+            return observations
+
+        pause_indices = sorted(set(envs_to_pause), reverse=True)
+        state_index = list(range(envs.num_envs))
+        for idx in pause_indices:
+            state_index.pop(idx)
+            envs.pause_at(idx)
+        return [observations[i] for i in state_index]
+
+    @staticmethod
+    def _pause_stream_slots(
+        envs_to_pause: List[int],
+        envs,
+        observations: List[Dict],
+        gmaps: List[GraphMap],
+        prev_vp: List[Optional[str]],
+        extra_state: Optional[Dict[str, Any]] = None,
+        oracle_manager=None,
+    ):
+        extra_state = {} if extra_state is None else dict(extra_state)
+        if len(envs_to_pause) == 0:
+            return observations, gmaps, prev_vp, extra_state
+
+        pause_indices = sorted(set(envs_to_pause), reverse=True)
+        state_index = list(range(envs.num_envs))
+        for idx in pause_indices:
+            state_index.pop(idx)
+            envs.pause_at(idx)
+
+        observations = [observations[i] for i in state_index]
+        gmaps = [gmaps[i] for i in state_index]
+        prev_vp = [prev_vp[i] for i in state_index]
+
+        new_extra_state = {}
+        for key, value in extra_state.items():
+            if torch.is_tensor(value):
+                new_extra_state[key] = value[state_index]
+            elif isinstance(value, list):
+                new_extra_state[key] = [value[i] for i in state_index]
+            else:
+                raise TypeError(
+                    f"Unsupported extra_state type for key={key}: {type(value).__name__}"
+                )
+
+        return observations, gmaps, prev_vp, new_extra_state
+
+    def _reset_eval_stream_slot(
+        self,
+        env_index: int,
+        observations: List[Dict],
+        gmaps: List[GraphMap],
+        prev_vp: List[Optional[str]],
+        slot_ids: List[int],
+        slot_txt_masks: List[torch.Tensor],
+        slot_txt_embeds: List[torch.Tensor],
+        slot_episode_steps: List[int],
+        active_episode_ids: Set[str],
+        oracle_manager=None,
+    ) -> Optional[str]:
+        obs_i = self._normalize_reset_at_output(self.envs.reset_at(env_index))
+        obs_i = self._tokenize_observations([obs_i])[0]
+        observations[env_index] = obs_i
+        gmaps[env_index] = self._make_stream_graph_map("eval")
+        prev_vp[env_index] = None
+        slot_episode_steps[env_index] = 0
+        txt_mask, txt_embed = self._encode_text_from_observation(obs_i)
+        slot_txt_masks[env_index] = txt_mask
+        slot_txt_embeds[env_index] = txt_embed
+
+        slot_id = int(slot_ids[env_index])
+        current_ep = self.envs.current_episodes()[env_index]
+        new_ep_id = str(current_ep.episode_id)
+        if new_ep_id in self.stat_eps or new_ep_id in active_episode_ids:
+            return None
+
+        self.episode_start_times[new_ep_id] = time.time()
+        if oracle_manager is not None:
+            oracle_manager.one_episode_reset(
+                slot_id=slot_id,
+                scene_id=current_ep.scene_id,
+                episode_id=current_ep.episode_id,
+                active_env_index=env_index,
+            )
+        return new_ep_id
+
+    def _reset_train_stream_slot(
+        self,
+        env_index: int,
+        observations: List[Dict],
+        gmaps: List[GraphMap],
+        prev_vp: List[Optional[str]],
+        slot_ids: List[int],
+        slot_episode_steps: List[int],
+        slot_txt_masks: List[torch.Tensor],
+        slot_txt_embeds: List[torch.Tensor],
+        oracle_manager=None,
+    ) -> bool:
+        obs_i = self._normalize_reset_at_output(self.envs.reset_at(env_index))
+        obs_i = self._tokenize_observations([obs_i])[0]
+        observations[env_index] = obs_i
+        gmaps[env_index] = self._make_stream_graph_map("train")
+        prev_vp[env_index] = None
+        slot_episode_steps[env_index] = 0
+        txt_mask, txt_embed = self._encode_text_from_observation(obs_i)
+        slot_txt_masks[env_index] = txt_mask
+        slot_txt_embeds[env_index] = txt_embed
+
+        if oracle_manager is not None:
+            slot_id = int(slot_ids[env_index])
+            current_ep = self.envs.current_episodes()[env_index]
+            oracle_manager.one_episode_reset(
+                slot_id=slot_id,
+                scene_id=current_ep.scene_id,
+                episode_id=current_ep.episode_id,
+                active_env_index=env_index,
+            )
+        return True
+
+    def _record_eval_done_episode(
+        self,
+        env_index: int,
+        observations: List[Dict],
+        infos: List[Dict],
+        gmaps: List[GraphMap],
+    ) -> Optional[str]:
+        del observations  # kept for signature parity with the dev doc
+        info = infos[env_index]
+        current_eps = self.envs.current_episodes()
+        ep_id = str(current_eps[env_index].episode_id)
+        if ep_id in self.stat_eps:
+            self.episode_start_times.pop(ep_id, None)
+            if not self._warned_duplicate_eval_episode:
+                logger.warning(
+                    "Duplicate eval episode completed more than once; "
+                    "ignoring repeated metric/pbar update for this run."
+                )
+                self._warned_duplicate_eval_episode = True
+            return None
+        gt_path = np.array(self.gt_data[str(ep_id)]["locations"]).astype(np.float64)
+        pred_path = np.array(info["position"]["position"])
+        distances = np.array(info["position"]["distance"])
+
+        metric = {}
+        metric["steps_taken"] = info["steps_taken"]
+        metric["distance_to_goal"] = distances[-1]
+        metric["success"] = 1.0 if distances[-1] <= 3.0 else 0.0
+        metric["oracle_success"] = 1.0 if (distances <= 3.0).any() else 0.0
+        metric["path_length"] = float(
+            np.linalg.norm(pred_path[1:] - pred_path[:-1], axis=1).sum()
+        )
+        metric["collisions"], has_collision_info = _get_collision_rate(
+            info, len(pred_path)
+        )
+        if not has_collision_info and not self._warned_missing_collisions:
+            logger.warning(
+                "Missing collision metrics in env info; defaulting collisions to 0 for this run."
+            )
+            self._warned_missing_collisions = True
+        gt_length = distances[0]
+        metric["spl"] = (
+            metric["success"]
+            * gt_length
+            / max(gt_length, metric["path_length"])
+        )
+        dtw_distance = fastdtw(
+            pred_path, gt_path, dist=NDTW.euclidean_distance
+        )[0]
+        metric["ndtw"] = np.exp(-dtw_distance / (len(gt_path) * 3.0))
+        metric["sdtw"] = metric["ndtw"] * metric["success"]
+        metric["ghost_cnt"] = gmaps[env_index].ghost_cnt
+        if ep_id in self.episode_start_times:
+            metric["episode_time"] = time.time() - self.episode_start_times[ep_id]
+            del self.episode_start_times[ep_id]
+        else:
+            metric["episode_time"] = 0.0
+        self.stat_eps[ep_id] = metric
+        if self.pbar is not None:
+            self.pbar.update()
+        return ep_id
+
+    def _new_eval_runtime_stats(self, eps_to_eval: int) -> Dict[str, Any]:
+        return {
+            "episodes_target": int(eps_to_eval),
+            "active_envs_series": [],
+            "num_refills": 0,
+            "num_reset_at_calls": 0,
+            "num_budget_trims": 0,
+            "num_duplicate_pauses": 0,
+            "start_time": time.time(),
+        }
+
+    def _write_eval_runtime_stats(
+        self,
+        checkpoint_index: int,
+        split: str,
+        policy: str,
+        oracle_enabled: bool,
+        runtime_stats: Dict[str, Any],
+    ) -> None:
+        active_envs_series = list(runtime_stats.get("active_envs_series", []))
+        if len(active_envs_series) > 0:
+            mean_active_envs = float(np.mean(active_envs_series))
+            min_active_envs = int(np.min(active_envs_series))
+            max_active_envs = int(np.max(active_envs_series))
+            tail_n = int(len(active_envs_series) * 0.1)
+            active_envs_ex_tail10 = (
+                active_envs_series[:-tail_n]
+                if tail_n > 0 and len(active_envs_series) > tail_n
+                else active_envs_series
+            )
+            mean_active_envs_ex_tail10 = float(
+                np.mean(active_envs_ex_tail10)
+            )
+        else:
+            mean_active_envs = 0.0
+            mean_active_envs_ex_tail10 = 0.0
+            min_active_envs = 0
+            max_active_envs = 0
+
+        payload = {
+            "checkpoint_index": int(checkpoint_index),
+            "split": str(split),
+            "policy": str(policy),
+            "oracle_enabled": bool(oracle_enabled),
+            "rank": int(self.local_rank),
+            "world_size": int(self.world_size),
+            "episodes_target": int(runtime_stats.get("episodes_target", 0)),
+            "episodes_recorded": int(len(self.stat_eps)),
+            "episodes_overshoot": int(
+                max(
+                    len(self.stat_eps)
+                    - int(runtime_stats.get("episodes_target", 0)),
+                    0,
+                )
+            ),
+            "eval_loop_wall_clock_sec": float(
+                time.time() - runtime_stats.get("start_time", time.time())
+            ),
+            "mean_active_envs": mean_active_envs,
+            "mean_active_envs_ex_tail10": mean_active_envs_ex_tail10,
+            "min_active_envs": min_active_envs,
+            "max_active_envs": max_active_envs,
+            "num_refills": int(runtime_stats.get("num_refills", 0)),
+            "num_reset_at_calls": int(
+                runtime_stats.get("num_reset_at_calls", 0)
+            ),
+            "num_budget_trims": int(runtime_stats.get("num_budget_trims", 0)),
+            "num_duplicate_pauses": int(
+                runtime_stats.get("num_duplicate_pauses", 0)
+            ),
+        }
+        os.makedirs(self.config.RESULTS_DIR, exist_ok=True)
+        fname = os.path.join(
+            self.config.RESULTS_DIR,
+            f"stats_runtime_ckpt_{checkpoint_index}_{split}_{policy}_"
+            f"oracle{1 if oracle_enabled else 0}_r{self.local_rank}_w{self.world_size}.json",
+        )
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    def _compute_train_action_budget(self, initial_active_envs: int) -> int:
+        return int(initial_active_envs) * int(self.max_len)
+
+    def _aggregate_eval_metrics_ddp(self) -> Tuple[Dict[str, float], int]:
+        num_episodes = len(self.stat_eps)
+        if num_episodes > 0:
+            stat_keys = list(next(iter(self.stat_eps.values())).keys())
+            local_sums = {
+                stat_key: float(
+                    sum(v[stat_key] for v in self.stat_eps.values())
+                )
+                for stat_key in stat_keys
+            }
+            local_means = {
+                stat_key: local_sums[stat_key] / num_episodes
+                for stat_key in stat_keys
+            }
+        else:
+            local_sums = {}
+            local_means = {}
+
+        if self.world_size > 1:
+            logger.info(
+                f"rank {self.local_rank}'s {num_episodes}-episode results: "
+                f"{local_means}"
+            )
+            payload = {
+                "num_episodes": int(num_episodes),
+                "stat_sums": local_sums,
+            }
+            gathered_payloads = [None for _ in range(self.world_size)]
+            distr.all_gather_object(gathered_payloads, payload)
+            total_episodes = int(
+                sum(item["num_episodes"] for item in gathered_payloads)
+            )
+            aggregated_states: Dict[str, float] = {}
+            if total_episodes > 0:
+                all_keys = sorted(
+                    {
+                        key
+                        for item in gathered_payloads
+                        for key in item["stat_sums"].keys()
+                    }
+                )
+                for key in all_keys:
+                    aggregated_states[key] = (
+                        sum(
+                            float(item["stat_sums"].get(key, 0.0))
+                            for item in gathered_payloads
+                        )
+                        / total_episodes
+                    )
+            return aggregated_states, total_episodes
+
+        return local_means, num_episodes
+
+    def _assert_eval_episode_target_met(
+        self, eps_to_eval: int, policy: str
+    ) -> None:
+        recorded = int(len(self.stat_eps))
+        target = int(eps_to_eval)
+        if recorded != target:
+            raise RuntimeError(
+                "Eval episode target not met under "
+                f"{policy}: recorded={recorded}, target={target}. "
+                "Refusing to write silently incomplete evaluation results."
+            )
+
+    def _update_train_progress(
+        self,
+        *,
+        iter_label: Optional[str] = None,
+        active_envs: Optional[int] = None,
+    ) -> None:
+        if iter_label is not None:
+            self._train_progress_state["iter"] = str(iter_label)
+        if active_envs is not None:
+            self._train_progress_state["active_envs"] = int(active_envs)
+        if self.local_rank < 1 and self._train_pbar is not None:
+            self._train_pbar.set_postfix(
+                dict(self._train_progress_state), refresh=True
+            )
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
@@ -562,8 +1123,14 @@ class RLTrainer(BaseVLNCETrainer):
                             if hasattr(layer, 'w3'):
                                 self.dynamic_graph_weight_history[layer_idx]['w3'].append(float(layer.w3.item()))
         except Exception as e:
-            # Fail silently, do not affect training
-            pass
+            if not getattr(
+                self, "_warned_dynamic_graph_record_failure", False
+            ):
+                logger.warning(
+                    "Failed to record dynamic graph weights; "
+                    f"continuing without this telemetry. Error: {e}"
+                )
+                self._warned_dynamic_graph_record_failure = True
 
     def save_dynamic_graph_weights(self, iteration: int):
         """
@@ -776,6 +1343,23 @@ class RLTrainer(BaseVLNCETrainer):
             else False
         )
 
+    def _oracle_ft_train_scope(self, config: Config = None) -> str:
+        cfg = self.config if config is None else config
+        oracle_ft_cfg = getattr(cfg.MODEL, "ORACLE_FT", None)
+        scope = "oracle_only"
+        if oracle_ft_cfg is not None:
+            scope = str(
+                getattr(oracle_ft_cfg, "train_scope", "oracle_only")
+            ).lower()
+
+        valid_scopes = {"oracle_only", "baseline_plus_oracle_adapter"}
+        if scope not in valid_scopes:
+            logger.warning(
+                f"[OracleFT] Unsupported train_scope={scope}, fallback to oracle_only"
+            )
+            scope = "oracle_only"
+        return scope
+
     @staticmethod
     def _match_optional_input_proj(name: str) -> bool:
         patterns = (
@@ -792,39 +1376,132 @@ class RLTrainer(BaseVLNCETrainer):
         )
         return any(pattern in name for pattern in patterns)
 
+    @staticmethod
+    def _match_rgb_projector(name: str) -> bool:
+        return "rgb_projector" in name
+
+    @staticmethod
+    def _match_dino_backbone(name: str) -> bool:
+        return "rgb_encoder.backbone" in name
+
+    @staticmethod
+    def _match_downstream_sample(name: str) -> bool:
+        return "global_sap_head" in name
+
+    def _log_oracle_ft_trainable_summary(self, train_scope: str) -> None:
+        trainable_names = [
+            name for name, param in self.policy.named_parameters() if param.requires_grad
+        ]
+        if self.local_rank >= 1:
+            return
+
+        logger.info(f"[OracleFT] train_scope={train_scope}")
+        logger.info(
+            "[OracleFT] trainable params configured: "
+            f"{len(trainable_names)} tensors"
+        )
+        logger.info(
+            "[OracleFT] trainable summary: "
+            f"rgb_projector={sum(self._match_rgb_projector(n) for n in trainable_names)}, "
+            f"oracle_adapter={sum(('oracle_adapter' in n) for n in trainable_names)}, "
+            f"downstream_sample={sum(self._match_downstream_sample(n) for n in trainable_names)}, "
+            f"dino_backbone={sum(self._match_dino_backbone(n) for n in trainable_names)}"
+        )
+        for name in trainable_names:
+            logger.info(f"[OracleFT][Trainable] {name}")
+
     def _configure_oracle_ft_trainable_params(self) -> None:
         if not self._oracle_ft_enabled():
             return
 
         oracle_ft_cfg = self.config.MODEL.ORACLE_FT
-        for _, param in self.policy.named_parameters():
-            param.requires_grad_(False)
+        train_scope = self._oracle_ft_train_scope()
 
-        trainable_names = []
+        if train_scope == "oracle_only":
+            for _, param in self.policy.named_parameters():
+                param.requires_grad_(False)
+
+            for name, param in self.policy.named_parameters():
+                if "oracle_adapter" in name:
+                    param.requires_grad_(True)
+                elif (
+                    getattr(oracle_ft_cfg, "unfreeze_global_encoder", True)
+                    and "vln_bert.global_encoder.encoder.x_layers" in name
+                ):
+                    param.requires_grad_(True)
+                elif (
+                    getattr(oracle_ft_cfg, "unfreeze_input_proj", False)
+                    and self._match_optional_input_proj(name)
+                ):
+                    param.requires_grad_(True)
+        elif train_scope == "baseline_plus_oracle_adapter":
+            # Keep baseline trainable params intact and only ensure oracle_adapter is trainable.
+            for name, param in self.policy.named_parameters():
+                if "oracle_adapter" in name:
+                    param.requires_grad_(True)
+
+            if self.local_rank < 1:
+                logger.info(
+                    "[OracleFT] baseline_plus_oracle_adapter keeps baseline "
+                    "trainable params and ignores unfreeze_global_encoder/"
+                    "unfreeze_input_proj gating."
+                )
+
+        self._log_oracle_ft_trainable_summary(train_scope)
+
+    def _build_baseline_param_groups(self):
+        use_dynamic_graph = getattr(self.config.MODEL, 'use_dynamic_graph', False)
+        use_node_gating = getattr(self.config.MODEL, 'use_node_gating', False)
+
+        dynamic_graph_params = []
+        node_gating_params = []
+        other_params = []
+
         for name, param in self.policy.named_parameters():
-            if "oracle_adapter" in name:
-                param.requires_grad_(True)
-            elif (
-                getattr(oracle_ft_cfg, "unfreeze_global_encoder", True)
-                and "vln_bert.global_encoder.encoder.x_layers" in name
+            if not param.requires_grad:
+                continue
+            if use_dynamic_graph and (
+                'w1' in name
+                or 'w2' in name
+                or 'w3' in name
+                or 'semantic_sim_mlp' in name
+                or 'instruction_rel_mlp' in name
             ):
-                param.requires_grad_(True)
-            elif (
-                getattr(oracle_ft_cfg, "unfreeze_input_proj", False)
-                and self._match_optional_input_proj(name)
-            ):
-                param.requires_grad_(True)
+                dynamic_graph_params.append(param)
+            elif use_node_gating and 'node_gating_mlp' in name:
+                node_gating_params.append(param)
+            else:
+                other_params.append(param)
 
-            if param.requires_grad:
-                trainable_names.append(name)
+        param_groups = []
+        if other_params:
+            param_groups.append({'params': other_params, 'lr': self.config.IL.lr})
 
-        if self.local_rank < 1:
-            logger.info(
-                "[OracleFT] trainable params configured: "
-                f"{len(trainable_names)} tensors"
+        if use_dynamic_graph and dynamic_graph_params:
+            dynamic_graph_lr = getattr(
+                self.config.MODEL, 'dynamic_graph_lr', self.config.IL.lr
             )
-            for name in trainable_names:
-                logger.info(f"[OracleFT][Trainable] {name}")
+            param_groups.append({
+                'params': dynamic_graph_params,
+                'lr': dynamic_graph_lr
+            })
+            logger.info(
+                f'Using separate learning rate {dynamic_graph_lr} for dynamic graph parameters'
+            )
+
+        if use_node_gating and node_gating_params:
+            node_gating_lr = getattr(
+                self.config.MODEL, 'node_gating_lr', self.config.IL.lr
+            )
+            param_groups.append({
+                'params': node_gating_params,
+                'lr': node_gating_lr
+            })
+            logger.info(
+                f'Using separate learning rate {node_gating_lr} for node gating parameters'
+            )
+
+        return param_groups
 
     def _build_oracle_ft_param_groups(self):
         oracle_ft_cfg = self.config.MODEL.ORACLE_FT
@@ -968,55 +1645,20 @@ class RLTrainer(BaseVLNCETrainer):
         if create_optimizer:
             if self._oracle_ft_enabled(config):
                 self._configure_oracle_ft_trainable_params()
-                oracle_ft_cfg = self.config.MODEL.ORACLE_FT
-                param_groups = self._build_oracle_ft_param_groups()
-                self.optimizer = torch.optim.AdamW(
-                    param_groups,
-                    weight_decay=getattr(oracle_ft_cfg, "weight_decay", 0.01),
-                )
-            else:
-                use_dynamic_graph = getattr(self.config.MODEL, 'use_dynamic_graph', False)
-                use_node_gating = getattr(self.config.MODEL, 'use_node_gating', False)
-
-                if use_dynamic_graph or use_node_gating:
-                    # Separate different parameter groups
-                    dynamic_graph_params = []
-                    node_gating_params = []
-                    other_params = []
-
-                    for name, param in self.policy.named_parameters():
-                        if use_dynamic_graph and ('w1' in name or 'w2' in name or 'w3' in name or 
-                                                 'semantic_sim_mlp' in name or 'instruction_rel_mlp' in name):
-                            dynamic_graph_params.append(param)
-                        elif use_node_gating and 'node_gating_mlp' in name:
-                            node_gating_params.append(param)
-                        else:
-                            other_params.append(param)
-
-                    # Create parameter groups
-                    param_groups = [
-                        {'params': other_params, 'lr': self.config.IL.lr},
-                    ]
-
-                    if use_dynamic_graph and dynamic_graph_params:
-                        dynamic_graph_lr = getattr(self.config.MODEL, 'dynamic_graph_lr', self.config.IL.lr)
-                        param_groups.append({
-                            'params': dynamic_graph_params,
-                            'lr': dynamic_graph_lr
-                        })
-                        logger.info(f'Using separate learning rate {dynamic_graph_lr} for dynamic graph parameters')
-
-                    if use_node_gating and node_gating_params:
-                        node_gating_lr = getattr(self.config.MODEL, 'node_gating_lr', self.config.IL.lr)
-                        param_groups.append({
-                            'params': node_gating_params,
-                            'lr': node_gating_lr
-                        })
-                        logger.info(f'Using separate learning rate {node_gating_lr} for node gating parameters')
-
+                train_scope = self._oracle_ft_train_scope(config)
+                if train_scope == "baseline_plus_oracle_adapter":
+                    param_groups = self._build_baseline_param_groups()
                     self.optimizer = torch.optim.AdamW(param_groups)
                 else:
-                    self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=self.config.IL.lr)
+                    oracle_ft_cfg = self.config.MODEL.ORACLE_FT
+                    param_groups = self._build_oracle_ft_param_groups()
+                    self.optimizer = torch.optim.AdamW(
+                        param_groups,
+                        weight_decay=getattr(oracle_ft_cfg, "weight_decay", 0.01),
+                    )
+            else:
+                param_groups = self._build_baseline_param_groups()
+                self.optimizer = torch.optim.AdamW(param_groups)
 
             if load_from_ckpt and config.IL.is_requeue and hasattr(self, 'optimizer'):
                 try:
@@ -1032,23 +1674,52 @@ class RLTrainer(BaseVLNCETrainer):
         )
         logger.info(f"Agent parameters: {params/1e6:.2f} MB. Trainable: {params_t/1e6:.2f} MB.")
         if self._oracle_ft_enabled(config):
+            train_scope = self._oracle_ft_train_scope(config)
             oracle_adapter_params = sum(
                 p.numel()
                 for name, p in self.policy.named_parameters()
                 if p.requires_grad and "oracle_adapter" in name
+            )
+            rgb_projector_params = sum(
+                p.numel()
+                for name, p in self.policy.named_parameters()
+                if p.requires_grad and self._match_rgb_projector(name)
             )
             global_encoder_params = sum(
                 p.numel()
                 for name, p in self.policy.named_parameters()
                 if p.requires_grad and "vln_bert.global_encoder.encoder.x_layers" in name
             )
+            downstream_sample_params = sum(
+                p.numel()
+                for name, p in self.policy.named_parameters()
+                if p.requires_grad and self._match_downstream_sample(name)
+            )
+            dino_backbone_params = sum(
+                p.numel()
+                for name, p in self.policy.named_parameters()
+                if p.requires_grad and self._match_dino_backbone(name)
+            )
+            logger.info(f"[OracleFT] Train scope: {train_scope}")
             logger.info(
                 "[OracleFT] Trainable oracle_adapter params: "
                 f"{oracle_adapter_params/1e6:.2f} MB"
             )
             logger.info(
+                "[OracleFT] Trainable rgb_projector params: "
+                f"{rgb_projector_params/1e6:.2f} MB"
+            )
+            logger.info(
                 "[OracleFT] Trainable global_encoder params: "
                 f"{global_encoder_params/1e6:.2f} MB"
+            )
+            logger.info(
+                "[OracleFT] Trainable downstream sample params: "
+                f"{downstream_sample_params/1e6:.2f} MB"
+            )
+            logger.info(
+                "[OracleFT] Trainable dino backbone params: "
+                f"{dino_backbone_params/1e6:.2f} MB"
             )
         logger.info("Finished setting up policy.")
 
@@ -1207,17 +1878,20 @@ class RLTrainer(BaseVLNCETrainer):
             gmap_base_img_fts = []
             gmap_oracle_raw_fts = []
             gmap_oracle_masks = []
+
             for vp in node_vp_ids + ghost_vp_ids:
+                #对节点和ghost节点都进行遍历，获取节点的特征值。
                 components = gmap.get_node_embed_components(vp)
                 base = components["base"]
                 oracle_raw = components["oracle_raw"]
                 has_oracle = components["has_oracle"]
+
                 if (
-                    vp.startswith('g')
-                    and use_oracle_embeds
-                    and has_oracle
+                    vp.startswith('g')  #是ghost节点
+                    and use_oracle_embeds   #前向整体允许使用Orcal
+                    and has_oracle      #当前ghost已经有了Orcale特征
                     and (
-                        allowed_oracle_ghost_ids is None
+                        allowed_oracle_ghost_ids is None    #如果设置了scope，只有scope内部的允许使用
                         or vp in allowed_oracle_ghost_ids
                     )
                 ):
@@ -1225,13 +1899,13 @@ class RLTrainer(BaseVLNCETrainer):
                         vp,
                         use_oracle=True,
                         allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
-                    )
+                    )   #获取orcale
                     oracle_mask = 1.0
                     oracle_raw_tensor = oracle_raw
-                else:
+                else:#不允许使用orcale的话
                     effective = base if vp.startswith('g') else gmap.get_node_embeds(vp)
                     oracle_mask = 0.0
-                    oracle_raw_tensor = torch.zeros_like(base)
+                    oracle_raw_tensor = torch.zeros_like(base)  #返回原始节点特征。并且orcale特征全部置0
 
                 if vp.startswith('g'):
                     gmap_img_fts.append(effective)
@@ -1239,6 +1913,7 @@ class RLTrainer(BaseVLNCETrainer):
                 gmap_oracle_raw_fts.append(oracle_raw_tensor)
                 gmap_oracle_masks.append(oracle_mask)
 
+            #构造一个可以直接送进后续导航的张量类型
             gmap_img_fts = torch.stack(
                 [torch.zeros_like(gmap_img_fts[0])] + gmap_img_fts, dim=0
             )
@@ -1308,9 +1983,9 @@ class RLTrainer(BaseVLNCETrainer):
             'gmap_vp_ids': batch_gmap_vp_ids, #图里有哪些点
             'gmap_step_ids': batch_gmap_step_ids,   #这些点什么时候来的
             'gmap_img_fts': batch_gmap_img_fts,     #这些点长什么样
-            'gmap_base_img_fts': batch_gmap_base_img_fts,
-            'gmap_oracle_raw_fts': batch_gmap_oracle_raw_fts,
-            'gmap_oracle_masks': batch_gmap_oracle_masks,
+            'gmap_base_img_fts': batch_gmap_base_img_fts,   #基础特征
+            'gmap_oracle_raw_fts': batch_gmap_oracle_raw_fts,   #原始Orcale特征
+            'gmap_oracle_masks': batch_gmap_oracle_masks,       #Orcale——Mask
             'gmap_pos_fts': batch_gmap_pos_fts,     #这些点相对我在哪
             'gmap_masks': batch_gmap_masks,         #哪些点有效
             'gmap_visited_masks': batch_gmap_visited_masks,     #哪些点已访问
@@ -1415,44 +2090,61 @@ class RLTrainer(BaseVLNCETrainer):
             )
         else:
             pbar = range(interval)
+        if self.local_rank < 1:
+            self._train_pbar = pbar
+            self._train_progress_state = {}
 
         #前这段训练区间里的标量日志收集器
         self.logs = defaultdict(list)
 
-        #对于每一个循环
-        for idx in pbar:
+        try:
+            #对于每一个循环
+            for idx in pbar:
+                self._update_train_progress(iter_label=f'{idx+1}/{interval}')
 
-            #清空损失和梯度累积
-            self.optimizer.zero_grad()
-            self.loss = 0.
+                #清空损失和梯度累积
+                self.optimizer.zero_grad()
+                self.loss = 0.
 
-            #自动混合精度反向传播
-            with autocast():
-                self.rollout('train', ml_weight, sample_ratio)
-            self.scaler.scale(self.loss).backward() # self.loss.backward()
-            if self._oracle_ft_enabled():
-                self.logs['grad/oracle_adapter'].append(
-                    self._compute_grad_norm(lambda name: "oracle_adapter" in name)
-                )
-                self.logs['grad/global_encoder_x_layers'].append(
-                    self._compute_grad_norm(
-                        lambda name: "vln_bert.global_encoder.encoder.x_layers" in name
+                #自动混合精度反向传播
+                with autocast():
+                    policy = self._get_train_env_refill_policy()
+                    if policy == "legacy_batch":
+                        loss = self._rollout_legacy('train', ml_weight, sample_ratio)
+                    elif policy == "streaming_refill":
+                        loss = self._rollout_train_streaming(ml_weight, sample_ratio)
+                    else:
+                        raise ValueError(f"Invalid train env refill policy: {policy}")
+                self.loss = loss
+                self.scaler.scale(loss).backward() # self.loss.backward()
+                if self._oracle_ft_enabled():
+                    self.logs['grad/oracle_adapter'].append(
+                        self._compute_grad_norm(lambda name: "oracle_adapter" in name)
                     )
-                )
-                self.logs['grad/input_proj'].append(
-                    self._compute_grad_norm(self._match_optional_input_proj)
-                )
-            self.scaler.step(self.optimizer)        # self.optimizer.step()
-            self.scaler.update()
+                    self.logs['grad/rgb_projector'].append(
+                        self._compute_grad_norm(self._match_rgb_projector)
+                    )
+                    self.logs['grad/downstream_sample'].append(
+                        self._compute_grad_norm(self._match_downstream_sample)
+                    )
+                    self.logs['grad/global_encoder_x_layers'].append(
+                        self._compute_grad_norm(
+                            lambda name: "vln_bert.global_encoder.encoder.x_layers" in name
+                        )
+                    )
+                    self.logs['grad/input_proj'].append(
+                        self._compute_grad_norm(self._match_optional_input_proj)
+                    )
+                self.scaler.step(self.optimizer)        # self.optimizer.step()
+                self.scaler.update()
 
-            # If dynamic graph is enabled, record weight values (for statistics)
-            if self.local_rank < 1 and getattr(self.config.MODEL, 'use_dynamic_graph', False):
-                self._record_dynamic_graph_weights()
+                # If dynamic graph is enabled, record weight values (for statistics)
+                if self.local_rank < 1 and getattr(self.config.MODEL, 'use_dynamic_graph', False):
+                    self._record_dynamic_graph_weights()
+        finally:
+            self._train_pbar = None
+            self._train_progress_state = {}
 
-            if self.local_rank < 1:
-                #主进程显示训练进度
-                pbar.set_postfix({'iter': f'{idx+1}/{interval}'})
-            
         return deepcopy(self.logs)
 
     @torch.no_grad()
@@ -1520,6 +2212,7 @@ class RLTrainer(BaseVLNCETrainer):
         print('local rank:', self.local_rank, '|', 'dataset length:', dataset_length)
 
         obs_transforms = get_active_obs_transforms(self.config)
+        self.obs_transforms = obs_transforms
         observation_space = apply_obs_transforms_obs_space(
             self.envs.observation_spaces[0], obs_transforms
         )
@@ -1548,31 +2241,28 @@ class RLTrainer(BaseVLNCETrainer):
             if self.config.use_pbar
             else None
         )
+        self._stream_eval_checkpoint_index = checkpoint_index
 
-        while len(self.stat_eps) < eps_to_eval:
-            self.rollout('eval')
-        self.envs.close()
+        policy = self._get_eval_env_refill_policy()
+        try:
+            if policy == "legacy_batch":
+                while len(self.stat_eps) < eps_to_eval:
+                    self._rollout_legacy('eval')
+            elif policy == "streaming_refill":
+                self._rollout_eval_streaming(eps_to_eval)
+                self._assert_eval_episode_target_met(
+                    eps_to_eval, "streaming_refill"
+                )
+            else:
+                raise ValueError(f"Invalid eval env refill policy: {policy}")
+        finally:
+            self.envs.close()
+            if self.pbar is not None:
+                self.pbar.close()
 
         if self.world_size > 1:
             distr.barrier()
-        aggregated_states = {}
-        num_episodes = len(self.stat_eps)
-        for stat_key in next(iter(self.stat_eps.values())).keys():
-            aggregated_states[stat_key] = (
-                sum(v[stat_key] for v in self.stat_eps.values()) / num_episodes
-            )
-        total = torch.tensor(num_episodes).cuda()
-        if self.world_size > 1:
-            distr.reduce(total,dst=0)
-        total = total.item()
-
-        if self.world_size > 1:
-            logger.info(f"rank {self.local_rank}'s {num_episodes}-episode results: {aggregated_states}")
-            for k,v in aggregated_states.items():
-                v = torch.tensor(v*num_episodes).cuda()
-                cat_v = gather_list_and_concat(v,self.world_size)
-                v = (sum(cat_v)/total).item()
-                aggregated_states[k] = v
+        aggregated_states, total = self._aggregate_eval_metrics_ddp()
         
         split = self.config.TASK_CONFIG.DATASET.SPLIT
         
@@ -1606,7 +2296,10 @@ class RLTrainer(BaseVLNCETrainer):
             for k, v in aggregated_states.items():
                 logger.info(f"Average episode {k}: {v:.6f}")
                 writer.add_scalar(f"eval_{k}/{split}", v, checkpoint_num)
-            if self.config.ORACLE.enable and self.config.ORACLE.scope_summary_enable:
+            if (
+                self._is_oracle_effective_for_mode("eval")
+                and self.config.ORACLE.scope_summary_enable
+            ):
                 self._write_oracle_scope_summary(total)
 
     @torch.no_grad()
@@ -1744,7 +2437,956 @@ class RLTrainer(BaseVLNCETrainer):
         ori = [x[1] for x in pos_ori]
         return pos, ori
 
+    def _rollout_step_core(
+        self,
+        mode: str,
+        observations: List[Dict],
+        gmaps: List[GraphMap],
+        prev_vp: List[Optional[str]],
+        slot_ids: List[int],
+        slot_txt_masks: List[torch.Tensor],
+        slot_txt_embeds: List[torch.Tensor],
+        slot_episode_steps: List[int],
+        oracle_manager=None,
+        sample_ratio: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if mode == "train":
+            feedback = "sample"
+        elif mode == "eval":
+            feedback = "argmax"
+        else:
+            raise NotImplementedError(f"Unsupported stream mode: {mode}")
+
+        timing = {
+            "waypoint": 0.0,
+            "env_call_at": 0.0,
+            "navigation": 0.0,
+            "env_step": 0.0,
+            "env_call_at_requests": 0,
+        }
+
+        batch = self._observations_to_batch(observations)
+        self.gmaps = gmaps
+        txt_masks = torch.stack(slot_txt_masks, dim=0)
+        txt_embeds = torch.stack(slot_txt_embeds, dim=0)
+        have_real_pos = self._stream_have_real_pos(mode)
+        actions_issued = self.envs.num_envs
+        loss_contribution = (
+            torch.zeros((), device=self.device)
+            if mode == "train"
+            else None
+        )
+
+        t_waypoint = time.perf_counter()
+        wp_outputs = self.policy.net(
+            mode="waypoint",
+            waypoint_predictor=self.waypoint_predictor,
+            observations=batch,
+            in_train=(mode == "train" and self.config.IL.waypoint_aug),
+        )
+        vp_inputs = self._vp_feature_variable(wp_outputs)
+        vp_inputs.update({"mode": "panorama"})
+        pano_embeds, pano_masks = self.policy.net(**vp_inputs)
+        avg_pano_embeds = torch.sum(
+            pano_embeds * pano_masks.unsqueeze(2), 1
+        ) / torch.sum(pano_masks, 1, keepdim=True)
+        timing["waypoint"] += time.perf_counter() - t_waypoint
+
+        cur_pos, cur_ori = self.get_pos_ori()
+        cur_vp, cand_vp, cand_pos = [], [], []
+        for i in range(self.envs.num_envs):
+            cur_vp_i, cand_vp_i, cand_pos_i = gmaps[i].identify_node(
+                cur_pos[i],
+                cur_ori[i],
+                wp_outputs["cand_angles"][i],
+                wp_outputs["cand_distances"][i],
+            )
+            cur_vp.append(cur_vp_i)
+            cand_vp.append(cand_vp_i)
+            cand_pos.append(cand_pos_i)
+
+        if have_real_pos:
+            t_call_at = time.perf_counter()
+            cand_real_pos = []
+            for i in range(self.envs.num_envs):
+                timing["env_call_at_requests"] += len(wp_outputs["cand_angles"][i])
+                cand_real_pos_i = [
+                    self.envs.call_at(
+                        i,
+                        "get_cand_real_pos",
+                        {"angle": ang, "forward": dis},
+                    )
+                    for ang, dis in zip(
+                        wp_outputs["cand_angles"][i],
+                        wp_outputs["cand_distances"][i],
+                    )
+                ]
+                cand_real_pos.append(cand_real_pos_i)
+            timing["env_call_at"] += time.perf_counter() - t_call_at
+        else:
+            cand_real_pos = [None] * self.envs.num_envs
+
+        use_dynamic_loc_noise = getattr(
+            self.config.IL, "use_dynamic_loc_noise", False
+        )
+        use_random_loc_noise = getattr(
+            self.config.IL, "use_random_loc_noise", False
+        )
+        loc_noise_values = [None] * self.envs.num_envs
+
+        if use_dynamic_loc_noise:
+            loc_noise_min = getattr(
+                self.config.IL, "dynamic_loc_noise_min", 0.40
+            )
+            loc_noise_max = getattr(
+                self.config.IL, "dynamic_loc_noise_max", 0.60
+            )
+            loc_noise_base = getattr(self.config.IL, "loc_noise", 0.5)
+            alpha = getattr(self.config.IL, "dynamic_loc_noise_alpha", 0.65)
+            beta = getattr(self.config.IL, "dynamic_loc_noise_beta", 0.25)
+            mapping_type = getattr(
+                self.config.IL, "dynamic_loc_noise_mapping", "linear"
+            )
+            sigmoid_k = getattr(
+                self.config.IL, "dynamic_loc_noise_sigmoid_k", 12.0
+            )
+            exponential_k = getattr(
+                self.config.IL, "dynamic_loc_noise_exponential_k", 4.0
+            )
+
+            def compute_loc_noise_from_std(std_val, mapping="linear"):
+                std_ref = (
+                    (alpha - loc_noise_min) / beta if beta > 0 else 1.0
+                )
+
+                if mapping == "linear":
+                    loc_noise = alpha - beta * std_val
+                elif mapping == "sigmoid":
+                    if std_val <= 0:
+                        return loc_noise_max
+                    if std_val >= std_ref:
+                        return loc_noise_min
+                    x_norm = std_val / std_ref
+                    x_mapped = sigmoid_k * (x_norm - 0.5)
+                    sigmoid_val = 1 / (1 + np.exp(-x_mapped))
+                    s_min = 1 / (1 + np.exp(-sigmoid_k * (-0.5)))
+                    s_max_val = 1 / (1 + np.exp(-sigmoid_k * (0.5)))
+                    ratio = (
+                        (sigmoid_val - s_min) / (s_max_val - s_min)
+                        if (s_max_val - s_min) > 0
+                        else 0
+                    )
+                    total_drop = loc_noise_max - loc_noise_min
+                    loc_noise = loc_noise_max - total_drop * ratio
+                elif mapping == "exponential":
+                    if std_val <= 0:
+                        return loc_noise_max
+                    if std_val >= std_ref:
+                        return loc_noise_min
+                    x_norm = std_val / std_ref
+                    exp_ratio = (
+                        np.exp(exponential_k * x_norm) - 1
+                    ) / (np.exp(exponential_k) - 1)
+                    total_drop = loc_noise_max - loc_noise_min
+                    loc_noise = loc_noise_max - total_drop * exp_ratio
+                else:
+                    loc_noise = alpha - beta * std_val
+
+                return np.clip(loc_noise, loc_noise_min, loc_noise_max)
+
+            for i in range(self.envs.num_envs):
+                cand_angles_i = wp_outputs["cand_angles"][i]
+                if len(cand_angles_i) > 1:
+                    std_val = float(np.std(cand_angles_i))
+                    loc_noise_values[i] = float(
+                        compute_loc_noise_from_std(
+                            std_val, mapping=mapping_type
+                        )
+                    )
+                else:
+                    loc_noise_values[i] = loc_noise_base
+
+                if mode == "eval":
+                    ep_id = self._get_env_episode_id(i)
+                    std_val = (
+                        float(np.std(cand_angles_i))
+                        if len(cand_angles_i) > 1
+                        else 0.0
+                    )
+                    self.loc_noise_history[ep_id].append(
+                        {
+                            "step": int(slot_episode_steps[i]),
+                            "std": std_val,
+                            "loc_noise": loc_noise_values[i],
+                            "type": "dynamic",
+                            "mapping": mapping_type,
+                        }
+                    )
+        elif use_random_loc_noise:
+            random_loc_noise_min = getattr(
+                self.config.IL, "random_loc_noise_min", 0.40
+            )
+            random_loc_noise_max = getattr(
+                self.config.IL, "random_loc_noise_max", 0.60
+            )
+            for i in range(self.envs.num_envs):
+                loc_noise_values[i] = float(
+                    random.uniform(
+                        random_loc_noise_min, random_loc_noise_max
+                    )
+                )
+                if mode == "eval":
+                    ep_id = self._get_env_episode_id(i)
+                    self.loc_noise_history[ep_id].append(
+                        {
+                            "step": int(slot_episode_steps[i]),
+                            "loc_noise": loc_noise_values[i],
+                            "type": "random",
+                        }
+                    )
+        else:
+            fixed_loc_noise = getattr(self.config.IL, "loc_noise", 0.5)
+            if mode == "eval":
+                for i in range(self.envs.num_envs):
+                    ep_id = self._get_env_episode_id(i)
+                    self.loc_noise_history[ep_id].append(
+                        {
+                            "step": int(slot_episode_steps[i]),
+                            "loc_noise": fixed_loc_noise,
+                            "type": "fixed",
+                        }
+                    )
+
+        for i in range(self.envs.num_envs):
+            cur_embeds = avg_pano_embeds[i]
+            cand_embeds = pano_embeds[i][vp_inputs["nav_types"][i] == 1]
+            loc_noise_to_use = (
+                loc_noise_values[i]
+                if (use_dynamic_loc_noise or use_random_loc_noise)
+                else None
+            )
+            gmaps[i].update_graph(
+                prev_vp[i],
+                slot_episode_steps[i] + 1,
+                cur_vp[i],
+                cur_pos[i],
+                cur_embeds,
+                cand_vp[i],
+                cand_pos[i],
+                cand_embeds,
+                cand_real_pos[i],
+                loc_noise=loc_noise_to_use,
+            )
+
+        t_navigation = time.perf_counter()
+        current_eps = self.envs.current_episodes()
+        scope_trace_records = []
+        oracle_mode_enabled = self._is_oracle_effective_for_mode(mode)
+        batch_stepk = max(slot_episode_steps) if len(slot_episode_steps) > 0 else 0
+
+        if oracle_mode_enabled:
+            oracle_stats = self._init_oracle_query_stats()
+            if self._get_oracle_scope_name() == "top1_shadow":
+                planner_cache = self._forward_navigation_once(
+                    cur_vp,
+                    cur_pos,
+                    cur_ori,
+                    txt_embeds,
+                    txt_masks,
+                    use_oracle_embeds=False,
+                )
+                top1_shadow_scope_ids = []
+                for i, gmap in enumerate(gmaps):
+                    slot_id = int(slot_ids[i])
+                    trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
+                        oracle_manager=oracle_manager,
+                        mode=mode,
+                        stepk=slot_episode_steps[i],
+                        env_idx=i,
+                        original_env_index=slot_id,
+                        slot_id=slot_id,
+                        gmap=gmap,
+                        current_episode=current_eps[i],
+                        current_real_vp=cur_vp[i],
+                        planner_cache=planner_cache,
+                    )
+                    scope_trace_records.append(trace_record)
+                    top1_shadow_scope_ids.append(
+                        list(trace_record.get("selected_scope_ids", []))
+                    )
+                    self._merge_oracle_query_stats(
+                        oracle_stats, env_oracle_stats
+                    )
+                if self.config.ORACLE.shadow_rerun_planner:
+                    nav_bundle = self._forward_navigation_once(
+                        cur_vp,
+                        cur_pos,
+                        cur_ori,
+                        txt_embeds,
+                        txt_masks,
+                        use_oracle_embeds=True,
+                        oracle_scope_ids_per_env=top1_shadow_scope_ids,
+                    )
+                else:
+                    nav_bundle = planner_cache
+            else:
+                scoped_oracle_ids_per_env = []
+                for i, gmap in enumerate(gmaps):
+                    slot_id = int(slot_ids[i])
+                    trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
+                        oracle_manager=oracle_manager,
+                        mode=mode,
+                        stepk=slot_episode_steps[i],
+                        env_idx=i,
+                        original_env_index=slot_id,
+                        slot_id=slot_id,
+                        gmap=gmap,
+                        current_episode=current_eps[i],
+                        current_real_vp=cur_vp[i],
+                        planner_cache=None,
+                    )
+                    scope_trace_records.append(trace_record)
+                    scoped_oracle_ids_per_env.append(
+                        list(trace_record.get("selected_scope_ids", []))
+                    )
+                    self._merge_oracle_query_stats(
+                        oracle_stats, env_oracle_stats
+                    )
+                nav_bundle = self._forward_navigation_once(
+                    cur_vp,
+                    cur_pos,
+                    cur_ori,
+                    txt_embeds,
+                    txt_masks,
+                    use_oracle_embeds=True,
+                    oracle_scope_ids_per_env=scoped_oracle_ids_per_env,
+                )
+
+            if self.local_rank < 1:
+                query_cnt = int(oracle_stats.get("query_cnt", 0))
+                cache_hit_cnt = int(oracle_stats.get("cache_hit_cnt", 0))
+                intra_hit_cnt = int(
+                    oracle_stats.get("intra_episode_cache_hit_cnt", 0)
+                )
+                cross_hit_cnt = int(
+                    oracle_stats.get("cross_episode_cache_hit_cnt", 0)
+                )
+                cache_hit_pct = (
+                    cache_hit_cnt / query_cnt if query_cnt > 0 else 0.0
+                )
+                oracle_summary_line = (
+                    "[OracleSummary] "
+                    f"step={batch_stepk} query={query_cnt} "
+                    f"success={int(oracle_stats.get('success_cnt', 0))} "
+                    f"fail={int(oracle_stats.get('fail_cnt', 0))} "
+                    f"skipped={int(oracle_stats.get('skipped_cnt', 0))} "
+                    f"cache_hit={cache_hit_cnt} ({cache_hit_pct:.2%}) "
+                    f"intra_ep_hit={intra_hit_cnt} "
+                    f"({float(oracle_stats.get('intra_episode_cache_hit_pct', 0.0)):.2%}) "
+                    f"cross_ep_hit={cross_hit_cnt} "
+                    f"({float(oracle_stats.get('cross_episode_cache_hit_pct', 0.0)):.2%}) "
+                    f"resolve_fail={int(oracle_stats.get('resolve_fail_cnt', 0))} "
+                    f"provider_fail={int(oracle_stats.get('provider_fail_cnt', 0))} "
+                    f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f}"
+                )
+                self._write_oracle_summary_log(oracle_summary_line)
+
+            if mode == "train":
+                self.logs["oracle/query_cnt"].append(
+                    float(oracle_stats.get("query_cnt", 0))
+                )
+                self.logs["oracle/returned_cnt"].append(
+                    float(oracle_stats.get("success_cnt", 0))
+                )
+                self.logs["oracle/failed_cnt"].append(
+                    float(oracle_stats.get("fail_cnt", 0))
+                )
+                self.logs["oracle/cache_hit_cnt"].append(
+                    float(oracle_stats.get("cache_hit_cnt", 0))
+                )
+                self.logs["oracle/cache_hit_pct"].append(
+                    float(oracle_stats.get("cache_hit_cnt", 0))
+                    / max(float(oracle_stats.get("query_cnt", 0)), 1.0)
+                )
+                self.logs["oracle/intra_episode_cache_hit_pct"].append(
+                    float(
+                        oracle_stats.get(
+                            "intra_episode_cache_hit_pct", 0.0
+                        )
+                    )
+                )
+                self.logs["oracle/cross_episode_cache_hit_pct"].append(
+                    float(
+                        oracle_stats.get(
+                            "cross_episode_cache_hit_pct", 0.0
+                        )
+                    )
+                )
+
+            for i, trace_record in enumerate(scope_trace_records):
+                planner_top1_after = nav_bundle["top1_vps"][i]
+                trace_record["planner_top1_after"] = planner_top1_after
+                planner_top1_before = trace_record.get("planner_top1_before")
+                if planner_top1_before is not None:
+                    trace_record["target_changed"] = (
+                        planner_top1_before != planner_top1_after
+                    )
+                self._log_oracle_scope_trace(trace_record)
+        else:
+            nav_bundle = self._forward_navigation_once(
+                cur_vp, cur_pos, cur_ori, txt_embeds, txt_masks
+            )
+
+        nav_inputs = nav_bundle["nav_inputs"]
+        no_vp_left = nav_bundle["no_vp_left"]
+        nav_outs = nav_bundle["nav_outs"]
+        timing["navigation"] += time.perf_counter() - t_navigation
+
+        nav_logits = nav_bundle["nav_logits"]
+        nav_probs = nav_bundle["nav_probs"]
+        if mode == "train" and "oracle_ft_stats" in nav_outs:
+            for stat_name, stat_value in nav_outs["oracle_ft_stats"].items():
+                self.logs[f"oracle_ft/{stat_name}"].append(float(stat_value))
+
+        for i, gmap in enumerate(gmaps):
+            gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item()
+
+        teacher_actions = None
+        if mode == "train" or self.config.VIDEO_OPTION:
+            teacher_actions = self._teacher_action_new(
+                nav_inputs["gmap_vp_ids"], no_vp_left
+            )
+        if mode == "train":
+            loss_contribution = loss_contribution + F.cross_entropy(
+                nav_logits,
+                teacher_actions,
+                reduction="sum",
+                ignore_index=-100,
+            )
+
+        if feedback == "sample":
+            c = torch.distributions.Categorical(nav_probs)
+            a_t = c.sample().detach()
+            ratio = 0.0 if sample_ratio is None else sample_ratio
+            a_t = torch.where(
+                torch.rand_like(a_t, dtype=torch.float) <= ratio,
+                teacher_actions,
+                a_t,
+            )
+        else:
+            a_t = nav_logits.argmax(dim=-1)
+        cpu_a_t = a_t.cpu().numpy()
+
+        env_actions = []
+        use_tryout = (
+            self.config.IL.tryout
+            and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING
+        )
+        for i, gmap in enumerate(gmaps):
+            if (
+                cpu_a_t[i] == 0
+                or slot_episode_steps[i] >= self.max_len - 1
+                or no_vp_left[i]
+            ):
+                vp_stop_scores = [
+                    (vp, stop_score)
+                    for vp, stop_score in gmap.node_stop_scores.items()
+                ]
+                stop_scores = [s[1] for s in vp_stop_scores]
+                stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                stop_pos = gmap.node_pos[stop_vp]
+
+                if self.config.IL.back_algo == "control":
+                    back_path = [
+                        (vp, gmap.node_pos[vp])
+                        for vp in gmap.shortest_path[cur_vp[i]][stop_vp]
+                    ]
+                    back_path = back_path[1:]
+                else:
+                    back_path = None
+
+                vis_info = {
+                    "nodes": list(gmap.node_pos.values()),
+                    "ghosts": list(gmap.ghost_aug_pos.values()),
+                    "predict_ghost": stop_pos,
+                }
+                env_actions.append(
+                    {
+                        "action": {
+                            "act": 0,
+                            "cur_vp": cur_vp[i],
+                            "stop_vp": stop_vp,
+                            "stop_pos": stop_pos,
+                            "back_path": back_path,
+                            "tryout": use_tryout,
+                        },
+                        "vis_info": vis_info,
+                    }
+                )
+            else:
+                ghost_vp = nav_inputs["gmap_vp_ids"][i][cpu_a_t[i]]
+                ghost_pos = gmap.ghost_aug_pos[ghost_vp]
+                _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
+                front_pos = gmap.node_pos[front_vp]
+                if self.config.VIDEO_OPTION:
+                    teacher_action_cpu = teacher_actions[i].cpu().item()
+                    if teacher_action_cpu in [0, -100]:
+                        teacher_ghost = None
+                    else:
+                        teacher_ghost = gmap.ghost_aug_pos[
+                            nav_inputs["gmap_vp_ids"][i][teacher_action_cpu]
+                        ]
+                    vis_info = {
+                        "nodes": list(gmap.node_pos.values()),
+                        "ghosts": list(gmap.ghost_aug_pos.values()),
+                        "predict_ghost": ghost_pos,
+                        "teacher_ghost": teacher_ghost,
+                    }
+                else:
+                    vis_info = None
+                if self.config.IL.back_algo == "control":
+                    back_path = [
+                        (vp, gmap.node_pos[vp])
+                        for vp in gmap.shortest_path[cur_vp[i]][front_vp]
+                    ]
+                    back_path = back_path[1:]
+                else:
+                    back_path = None
+                env_actions.append(
+                    {
+                        "action": {
+                            "act": 4,
+                            "cur_vp": cur_vp[i],
+                            "front_vp": front_vp,
+                            "front_pos": front_pos,
+                            "ghost_vp": ghost_vp,
+                            "ghost_pos": ghost_pos,
+                            "back_path": back_path,
+                            "tryout": use_tryout,
+                        },
+                        "vis_info": vis_info,
+                    }
+                )
+                prev_vp[i] = front_vp
+                if self.config.MODEL.consume_ghost:
+                    gmap.delete_ghost(ghost_vp)
+
+        t_env_step = time.perf_counter()
+        outputs = self.envs.step(env_actions)
+        timing["env_step"] += time.perf_counter() - t_env_step
+        observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+
+        if mode == "eval" and self.pbar is not None:
+            self.pbar.set_postfix(
+                {
+                    "active_envs": self.envs.num_envs,
+                    "rollout_step": (batch_stepk + 1),
+                },
+                refresh=False,
+            )
+
+        observations = self._tokenize_observations(observations)
+        return {
+            "observations": observations,
+            "infos": infos,
+            "dones": dones,
+            "gmaps": gmaps,
+            "prev_vp": prev_vp,
+            "loss_contribution": loss_contribution,
+            "actions_issued": actions_issued,
+            "timing": timing,
+        }
+
+    def _rollout_eval_streaming(self, eps_to_eval: int) -> None:
+        runtime_stats = self._new_eval_runtime_stats(eps_to_eval)
+        self.envs.resume_all()
+        observations = list(self.envs.reset())
+        current_eps = self.envs.current_episodes()
+        remaining_budget = eps_to_eval - len(self.stat_eps)
+
+        initial_budget_trims = []
+        if remaining_budget < len(observations):
+            initial_budget_trims = self._tail_indices_to_trim(
+                len(observations), remaining_budget
+            )
+            runtime_stats["num_budget_trims"] += len(initial_budget_trims)
+
+        active_episode_ids = set()
+        initial_duplicate_pauses = []
+        excluded = set(initial_budget_trims)
+        for i, ep in enumerate(current_eps):
+            if i in excluded:
+                continue
+            ep_id = str(ep.episode_id)
+            if ep_id in self.stat_eps or ep_id in active_episode_ids:
+                initial_duplicate_pauses.append(i)
+            else:
+                active_episode_ids.add(ep_id)
+
+        if len(initial_duplicate_pauses) > 0:
+            runtime_stats["num_duplicate_pauses"] += len(
+                initial_duplicate_pauses
+            )
+
+        initial_envs_to_pause = sorted(
+            set(initial_budget_trims + initial_duplicate_pauses)
+        )
+        if len(initial_envs_to_pause) > 0:
+            observations = self._pause_stream_observations_only(
+                initial_envs_to_pause,
+                self.envs,
+                observations,
+            )
+
+        (
+            observations,
+            gmaps,
+            prev_vp,
+            slot_ids,
+            slot_txt_masks,
+            slot_txt_embeds,
+            slot_episode_steps,
+            oracle_manager,
+        ) = self._build_initial_stream_slot_state(observations, mode="eval")
+        active_episode_ids = self._get_active_episode_ids()
+        self.gmaps = gmaps
+
+        while len(observations) > 0 and len(self.stat_eps) < eps_to_eval:
+            runtime_stats["active_envs_series"].append(len(observations))
+            step_out = self._rollout_step_core(
+                mode="eval",
+                observations=observations,
+                gmaps=gmaps,
+                prev_vp=prev_vp,
+                slot_ids=slot_ids,
+                slot_txt_masks=slot_txt_masks,
+                slot_txt_embeds=slot_txt_embeds,
+                slot_episode_steps=slot_episode_steps,
+                oracle_manager=oracle_manager,
+            )
+            observations = step_out["observations"]
+            infos = step_out["infos"]
+            dones = step_out["dones"]
+            gmaps = step_out["gmaps"]
+            prev_vp = step_out["prev_vp"]
+            for i in range(len(observations)):
+                slot_episode_steps[i] += 1
+            self.gmaps = gmaps
+
+            done_envs = [i for i, done in enumerate(dones) if done]
+            done_envs.sort()
+            envs_to_pause = []
+            for i in done_envs:
+                completed_ep_id = self._record_eval_done_episode(
+                    i, observations, infos, gmaps
+                )
+                active_episode_ids.discard(completed_ep_id)
+
+            remaining_budget = eps_to_eval - len(self.stat_eps)
+            surviving_active = max(len(observations) - len(done_envs), 0)
+            refill_quota = max(0, remaining_budget - surviving_active)
+            refill_quota = min(refill_quota, len(done_envs))
+            refill_used = 0
+
+            for i in done_envs:
+                if refill_used >= refill_quota:
+                    envs_to_pause.append(i)
+                    continue
+
+                runtime_stats["num_reset_at_calls"] += 1
+                new_ep_id = self._reset_eval_stream_slot(
+                    i,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    slot_ids,
+                    slot_txt_masks,
+                    slot_txt_embeds,
+                    slot_episode_steps,
+                    active_episode_ids=active_episode_ids,
+                    oracle_manager=oracle_manager,
+                )
+                if new_ep_id is None:
+                    envs_to_pause.append(i)
+                    runtime_stats["num_duplicate_pauses"] += 1
+                else:
+                    active_episode_ids.add(new_ep_id)
+                    runtime_stats["num_refills"] += 1
+                    refill_used += 1
+
+            remaining_budget = eps_to_eval - len(self.stat_eps)
+            if remaining_budget < (len(observations) - len(set(envs_to_pause))):
+                trim = self._tail_indices_to_trim(
+                    len(observations),
+                    remaining_budget,
+                    exclude=envs_to_pause,
+                )
+                envs_to_pause.extend(trim)
+                runtime_stats["num_budget_trims"] += len(trim)
+
+            if len(envs_to_pause) > 0:
+                (
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state,
+                ) = self._pause_stream_slots(
+                    envs_to_pause,
+                    self.envs,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state={
+                        "slot_ids": slot_ids,
+                        "slot_txt_masks": slot_txt_masks,
+                        "slot_txt_embeds": slot_txt_embeds,
+                        "slot_episode_steps": slot_episode_steps,
+                    },
+                    oracle_manager=oracle_manager,
+                )
+                slot_ids = extra_state["slot_ids"]
+                slot_txt_masks = extra_state["slot_txt_masks"]
+                slot_txt_embeds = extra_state["slot_txt_embeds"]
+                slot_episode_steps = extra_state["slot_episode_steps"]
+                self.gmaps = gmaps
+                if oracle_manager is not None:
+                    oracle_manager.rebind_after_pause(slot_ids)
+                active_episode_ids = self._get_active_episode_ids()
+
+        if len(observations) > 0 and len(self.stat_eps) >= eps_to_eval:
+            (
+                observations,
+                gmaps,
+                prev_vp,
+                extra_state,
+            ) = self._pause_stream_slots(
+                list(range(len(observations))),
+                self.envs,
+                observations,
+                gmaps,
+                prev_vp,
+                extra_state={
+                    "slot_ids": slot_ids,
+                    "slot_txt_masks": slot_txt_masks,
+                    "slot_txt_embeds": slot_txt_embeds,
+                    "slot_episode_steps": slot_episode_steps,
+                },
+                oracle_manager=oracle_manager,
+            )
+            slot_ids = extra_state["slot_ids"]
+            slot_txt_masks = extra_state["slot_txt_masks"]
+            slot_txt_embeds = extra_state["slot_txt_embeds"]
+            slot_episode_steps = extra_state["slot_episode_steps"]
+            self.gmaps = gmaps
+            if oracle_manager is not None:
+                oracle_manager.rebind_after_pause(slot_ids)
+            active_episode_ids = self._get_active_episode_ids()
+
+        split = self.config.TASK_CONFIG.DATASET.SPLIT
+        self._write_eval_runtime_stats(
+            checkpoint_index=getattr(self, "_stream_eval_checkpoint_index", 0),
+            split=split,
+            policy="streaming_refill",
+            oracle_enabled=self._is_oracle_effective_for_mode("eval"),
+            runtime_stats=runtime_stats,
+        )
+
+    def _rollout_train_streaming(
+        self, ml_weight: float, sample_ratio: float
+    ) -> torch.Tensor:
+        self.envs.resume_all()
+        observations = list(self.envs.reset())
+        (
+            observations,
+            gmaps,
+            prev_vp,
+            slot_ids,
+            slot_txt_masks,
+            slot_txt_embeds,
+            slot_episode_steps,
+            oracle_manager,
+        ) = self._build_initial_stream_slot_state(observations, mode="train")
+        self.gmaps = gmaps
+
+        initial_active_envs = len(observations)
+        action_budget = self._compute_train_action_budget(initial_active_envs)
+        total_actions = 0
+        loss_sum = torch.zeros((), device=self.device)
+
+        timing_enabled = self.local_rank == 0 and self._perf_timing_fh is not None
+        if timing_enabled:
+            rollout_t0 = time.perf_counter()
+            timing_acc = {
+                "waypoint": 0.0,
+                "env_call_at": 0.0,
+                "navigation": 0.0,
+                "env_step": 0.0,
+            }
+            step_counter = 0
+            env_instance_sum = 0
+            env_call_at_requests = 0
+
+        while len(observations) > 0 and total_actions < action_budget:
+            self._update_train_progress(active_envs=len(observations))
+            remaining_actions = action_budget - total_actions
+            if remaining_actions < len(observations):
+                trim = self._tail_indices_to_trim(
+                    len(observations), remaining_actions
+                )
+                (
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state,
+                ) = self._pause_stream_slots(
+                    trim,
+                    self.envs,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state={
+                        "slot_ids": slot_ids,
+                        "slot_txt_masks": slot_txt_masks,
+                        "slot_txt_embeds": slot_txt_embeds,
+                        "slot_episode_steps": slot_episode_steps,
+                    },
+                    oracle_manager=oracle_manager,
+                )
+                slot_ids = extra_state["slot_ids"]
+                slot_txt_masks = extra_state["slot_txt_masks"]
+                slot_txt_embeds = extra_state["slot_txt_embeds"]
+                slot_episode_steps = extra_state["slot_episode_steps"]
+                self.gmaps = gmaps
+                if oracle_manager is not None:
+                    oracle_manager.rebind_after_pause(slot_ids)
+                if len(observations) == 0:
+                    break
+
+            if timing_enabled:
+                step_counter += 1
+                env_instance_sum += len(observations)
+
+            step_out = self._rollout_step_core(
+                mode="train",
+                observations=observations,
+                gmaps=gmaps,
+                prev_vp=prev_vp,
+                slot_ids=slot_ids,
+                slot_txt_masks=slot_txt_masks,
+                slot_txt_embeds=slot_txt_embeds,
+                slot_episode_steps=slot_episode_steps,
+                oracle_manager=oracle_manager,
+                sample_ratio=sample_ratio,
+            )
+            observations = step_out["observations"]
+            dones = step_out["dones"]
+            gmaps = step_out["gmaps"]
+            prev_vp = step_out["prev_vp"]
+            loss_sum = loss_sum + step_out["loss_contribution"]
+            total_actions += step_out["actions_issued"]
+            self.gmaps = gmaps
+
+            if timing_enabled:
+                timing = step_out["timing"]
+                timing_acc["waypoint"] += timing["waypoint"]
+                timing_acc["env_call_at"] += timing["env_call_at"]
+                timing_acc["navigation"] += timing["navigation"]
+                timing_acc["env_step"] += timing["env_step"]
+                env_call_at_requests += timing["env_call_at_requests"]
+
+            envs_to_pause = []
+            refill_candidates = []
+            for i in range(len(observations)):
+                slot_episode_steps[i] += 1
+                if dones[i] and slot_episode_steps[i] < self.max_len:
+                    refill_candidates.append(i)
+                elif slot_episode_steps[i] >= self.max_len:
+                    envs_to_pause.append(i)
+
+            remaining_actions = max(action_budget - total_actions, 0)
+            surviving_active_after_step = max(
+                len(observations)
+                - len(refill_candidates)
+                - len(envs_to_pause),
+                0,
+            )
+            refill_quota = max(
+                0, remaining_actions - surviving_active_after_step
+            )
+            refill_quota = min(refill_quota, len(refill_candidates))
+
+            for refill_idx, i in enumerate(refill_candidates):
+                if refill_idx >= refill_quota:
+                    envs_to_pause.append(i)
+                    continue
+                self._reset_train_stream_slot(
+                    i,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    slot_ids,
+                    slot_episode_steps,
+                    slot_txt_masks,
+                    slot_txt_embeds,
+                    oracle_manager=oracle_manager,
+                )
+
+            if len(envs_to_pause) > 0:
+                (
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state,
+                ) = self._pause_stream_slots(
+                    envs_to_pause,
+                    self.envs,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state={
+                        "slot_ids": slot_ids,
+                        "slot_txt_masks": slot_txt_masks,
+                        "slot_txt_embeds": slot_txt_embeds,
+                        "slot_episode_steps": slot_episode_steps,
+                    },
+                    oracle_manager=oracle_manager,
+                )
+                slot_ids = extra_state["slot_ids"]
+                slot_txt_masks = extra_state["slot_txt_masks"]
+                slot_txt_embeds = extra_state["slot_txt_embeds"]
+                slot_episode_steps = extra_state["slot_episode_steps"]
+                self.gmaps = gmaps
+                if oracle_manager is not None:
+                    oracle_manager.rebind_after_pause(slot_ids)
+
+        if timing_enabled:
+            self._train_rollout_counter += 1
+            rollout_total = time.perf_counter() - rollout_t0
+            self._write_perf_timing_log(
+                {
+                    "rollout_id": self._train_rollout_counter,
+                    "steps": step_counter,
+                    "env_instances_avg": env_instance_sum / max(step_counter, 1),
+                    "total_actions": total_actions,
+                    "waypoint": timing_acc["waypoint"],
+                    "env_call_at": timing_acc["env_call_at"],
+                    "navigation": timing_acc["navigation"],
+                    "env_step": timing_acc["env_step"],
+                    "rollout_total": rollout_total,
+                    "env_call_at_requests": env_call_at_requests,
+                }
+            )
+
+        assert total_actions > 0
+        loss = ml_weight * loss_sum / total_actions
+        self.loss = loss
+        self.logs["IL_loss"].append(loss.item())
+        return loss
+
     def rollout(self, mode, ml_weight=None, sample_ratio=None):
+        return self._rollout_legacy(mode, ml_weight, sample_ratio)
+
+    def _rollout_legacy(self, mode, ml_weight=None, sample_ratio=None):
         #真正的训练循环与环境交互
 
         if mode == 'train':
@@ -1776,13 +3418,18 @@ class RLTrainer(BaseVLNCETrainer):
         if mode == 'eval':
             curr_eps = self.envs.current_episodes()
             # Record start time of new episode
+            active_episode_ids = set()
+            env_to_pause = []
             for i, ep in enumerate(curr_eps):
                 ep_id = ep.episode_id
-                if ep_id not in self.episode_start_times:
-                    self.episode_start_times[ep_id] = time.time()
-            
-            env_to_pause = [i for i, ep in enumerate(curr_eps) 
-                            if ep.episode_id in self.stat_eps]    
+                if ep_id in self.stat_eps or ep_id in active_episode_ids:
+                    env_to_pause.append(i)
+                    self.episode_start_times.pop(ep_id, None)
+                else:
+                    active_episode_ids.add(ep_id)
+                    if ep_id not in self.episode_start_times:
+                        self.episode_start_times[ep_id] = time.time()
+
             self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
             if self.envs.num_envs == 0: return
         if mode == 'infer':
@@ -1814,7 +3461,15 @@ class RLTrainer(BaseVLNCETrainer):
 
         #如果开启了视频或者是训练模式，就获取真实位置信息
         #或者在验证阶段开启了上帝模式，也可以获得真实位置信息
-        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION) or (mode == "eval" and self.config.ORACLE.enable and self.config.ORACLE.force_have_real_pos)
+        have_real_pos = (
+            mode == 'train'
+            or self.config.VIDEO_OPTION
+            or (
+                mode == "eval"
+                and self._is_oracle_effective_for_mode("eval")
+                and self.config.ORACLE.force_have_real_pos
+            )
+        )
 
         ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
 
@@ -1825,26 +3480,10 @@ class RLTrainer(BaseVLNCETrainer):
                                ghost_aug,oracle_cfg=self.config.ORACLE) for _ in range(self.envs.num_envs)]   #ghost 位置扰动强度
         
         #实例化一个oracle_manager
-        if self.config.ORACLE.enable:
-            oracle_manager = OracleExperimentManager(
-                config=self.config,
-                envs=self.envs,
-                policy=self.policy,
-                waypoint_predictor=self.waypoint_predictor,
-                obs_transforms=self.obs_transforms,
-                device=self.device,
-                run_id=getattr(self.config,"EXP_NAME", "exp"),
-                split=self.config.TASK_CONFIG.DATASET.SPLIT,
-                trace_dir=self.config.ORACLE.trace.dir,
-                vp_feature_builder=self._vp_feature_variable,
-            )
-            curr_eps = self.envs.current_episodes()
-            for i, ep in enumerate(curr_eps):
-                oracle_manager.one_episode_reset(
-                    env_index=i,
-                    scene_id=ep.scene_id,
-                    episode_id=ep.episode_id,
-                )
+        oracle_manager = self._build_oracle_manager(
+            mode=mode,
+            slot_ids=list(range(self.envs.num_envs)),
+        )
         
 
         #初始化每个环境上一时刻所在 viewpoint
@@ -1869,6 +3508,8 @@ class RLTrainer(BaseVLNCETrainer):
 
         #对于每一个时间步K
         for stepk in range(self.max_len):
+            if mode == 'train':
+                self._update_train_progress(active_envs=self.envs.num_envs)
             total_actions += self.envs.num_envs
             #性能分析使用
             if timing_enabled:
@@ -2141,13 +3782,7 @@ class RLTrainer(BaseVLNCETrainer):
 
             current_eps = self.envs.current_episodes()
             scope_trace_records = []
-            oracle_mode_enabled = (
-                self.config.ORACLE.enable
-                and (
-                    (mode == 'eval' and getattr(self.config.ORACLE, "enable_in_eval", True))
-                    or (mode == 'train' and getattr(self.config.ORACLE, "enable_in_train", False))
-                )
-            )
+            oracle_mode_enabled = self._is_oracle_effective_for_mode(mode)
             if oracle_mode_enabled:
                 oracle_stats = self._init_oracle_query_stats()
                 if self._get_oracle_scope_name() == "top1_shadow":
@@ -2161,12 +3796,14 @@ class RLTrainer(BaseVLNCETrainer):
                     )
                     top1_shadow_scope_ids = []
                     for i, gmap in enumerate(self.gmaps):
+                        slot_id = not_done_index[i]
                         trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
                             oracle_manager=oracle_manager,
                             mode=mode,
                             stepk=stepk,
                             env_idx=i,
                             original_env_index=not_done_index[i],
+                            slot_id=slot_id,
                             gmap=gmap,
                             current_episode=current_eps[i],
                             current_real_vp=cur_vp[i],
@@ -2192,12 +3829,14 @@ class RLTrainer(BaseVLNCETrainer):
                 else:
                     scoped_oracle_ids_per_env = []
                     for i, gmap in enumerate(self.gmaps):
+                        slot_id = not_done_index[i]
                         trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
                             oracle_manager=oracle_manager,
                             mode=mode,
                             stepk=stepk,
                             env_idx=i,
                             original_env_index=not_done_index[i],
+                            slot_id=slot_id,
                             gmap=gmap,
                             current_episode=current_eps[i],
                             current_real_vp=cur_vp[i],
@@ -2424,46 +4063,12 @@ class RLTrainer(BaseVLNCETrainer):
             # calculate metric
             if mode == 'eval':
                 #在评估模式下，负责把每个 episode 的结果统计、保存和收尾处理做好
-                curr_eps = self.envs.current_episodes()
                 for i in range(self.envs.num_envs):
                     if not dones[i]:
                         continue
-                    info = infos[i]
-                    ep_id = curr_eps[i].episode_id
-                    gt_path = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float64)
-                    pred_path = np.array(info['position']['position'])
-                    distances = np.array(info['position']['distance'])
-                    metric = {}
-                    metric['steps_taken'] = info['steps_taken']
-                    metric['distance_to_goal'] = distances[-1]
-                    metric['success'] = 1. if distances[-1] <= 3. else 0.
-                    metric['oracle_success'] = 1. if (distances <= 3.).any() else 0.
-                    metric['path_length'] = float(np.linalg.norm(pred_path[1:] - pred_path[:-1],axis=1).sum())
-                    metric['collisions'], has_collision_info = _get_collision_rate(
-                        info, len(pred_path)
+                    self._record_eval_done_episode(
+                        i, observations, infos, self.gmaps
                     )
-                    if not has_collision_info and not self._warned_missing_collisions:
-                        logger.warning(
-                            "Missing collision metrics in env info; defaulting collisions to 0 for this run."
-                        )
-                        self._warned_missing_collisions = True
-                    gt_length = distances[0]
-                    metric['spl'] = metric['success'] * gt_length / max(gt_length, metric['path_length'])
-                    dtw_distance = fastdtw(pred_path, gt_path, dist=NDTW.euclidean_distance)[0]
-                    metric['ndtw'] = np.exp(-dtw_distance / (len(gt_path) * 3.))
-                    metric['sdtw'] = metric['ndtw'] * metric['success']
-                    metric['ghost_cnt'] = self.gmaps[i].ghost_cnt
-                    # Calculate episode duration (in seconds)
-                    if ep_id in self.episode_start_times:
-                        episode_duration = time.time() - self.episode_start_times[ep_id]
-                        metric['episode_time'] = episode_duration
-                        # Clean up start time record for completed episode
-                        del self.episode_start_times[ep_id]
-                    else:
-                        # If start time is not recorded, set to 0 (should not happen theoretically)
-                        metric['episode_time'] = 0.0
-                    self.stat_eps[ep_id] = metric
-                    self.pbar.update()
 
             # record path
             if mode == 'infer':
@@ -2489,7 +4094,8 @@ class RLTrainer(BaseVLNCETrainer):
                             })
                     self.path_eps[ep_id] = self.path_eps[ep_id][:500]
                     self.path_eps[ep_id][-1]['stop'] = True
-                    self.pbar.update()
+                    if self.pbar is not None:
+                        self.pbar.update()
 
             # pause env
             if sum(dones) > 0:#当前并行环境里，每个环境这一步执行后是否已经结束 episode 的标记列表
@@ -2503,6 +4109,10 @@ class RLTrainer(BaseVLNCETrainer):
                         # graph stop
                         self.gmaps.pop(i)
                         prev_vp.pop(i)
+                if oracle_manager is not None:
+                    oracle_manager.rebind_after_pause(not_done_index)
+                if mode == 'train' and self.envs.num_envs > 0:
+                    self._update_train_progress(active_envs=self.envs.num_envs)
 
             if self.envs.num_envs == 0:#所有环境都停止后，循环结束
                 break
@@ -2535,3 +4145,6 @@ class RLTrainer(BaseVLNCETrainer):
             loss = ml_weight * loss / total_actions
             self.loss += loss
             self.logs['IL_loss'].append(loss.item())
+            return loss
+
+        return None

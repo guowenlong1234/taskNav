@@ -45,6 +45,7 @@ _C.EVAL.SAVE_RESULTS = True
 _C.EVAL.CKPT_PATH_DIR = ""
 _C.EVAL.fast_eval = False
 _C.EVAL.EVAL_NONLEARNING = False
+_C.EVAL.ENV_REFILL_POLICY = "legacy_batch"
 _C.EVAL.NONLEARNING = CN()
 _C.EVAL.NONLEARNING.AGENT = "RandomAgent"
 
@@ -91,6 +92,7 @@ _C.IL.max_text_len = 80
 _C.IL.ghost_aug = 0.0
 _C.IL.back_algo = "teleport"
 _C.IL.tryout = True
+_C.IL.TRAIN_ENV_REFILL_POLICY = "legacy_batch"
 # it True, start training from the saved epoch
 # loc_noise configuration (fixed, dynamic, random are parallel, priority: dynamic > random > fixed)
 _C.IL.loc_noise = 0.5  # Fixed loc_noise value (used when both dynamic and random are disabled)
@@ -301,6 +303,7 @@ _C.MODEL.ORACLE_FT.identity_init = True
 _C.MODEL.ORACLE_FT.gain_init = 1.0
 _C.MODEL.ORACLE_FT.fusion_alpha = 0.25
 _C.MODEL.ORACLE_FT.use_config_soft_alpha = True
+_C.MODEL.ORACLE_FT.train_scope = "oracle_only"
 _C.MODEL.ORACLE_FT.unfreeze_global_encoder = True
 _C.MODEL.ORACLE_FT.unfreeze_input_proj = False
 _C.MODEL.ORACLE_FT.oracle_mlp_lr = 5e-5
@@ -605,6 +608,31 @@ def _normalize_oracle_config(config: CN) -> None:
         config.MODEL.ORACLE_SOFT_ALPHA = config.ORACLE.soft_alpha
 
 
+def _normalize_env_refill_policies(config: CN) -> None:
+    allowed = {"legacy_batch", "streaming_refill"}
+
+    eval_policy = str(
+        getattr(config.EVAL, "ENV_REFILL_POLICY", "legacy_batch")
+    ).lower()
+    if eval_policy not in allowed:
+        raise ValueError(
+            f"Invalid EVAL.ENV_REFILL_POLICY={config.EVAL.ENV_REFILL_POLICY!r}. "
+            f"Supported values: {sorted(allowed)}"
+        )
+    config.EVAL.ENV_REFILL_POLICY = eval_policy
+
+    train_policy = str(
+        getattr(config.IL, "TRAIN_ENV_REFILL_POLICY", "legacy_batch")
+    ).lower()
+    if train_policy not in allowed:
+        raise ValueError(
+            "Invalid IL.TRAIN_ENV_REFILL_POLICY="
+            f"{config.IL.TRAIN_ENV_REFILL_POLICY!r}. "
+            f"Supported values: {sorted(allowed)}"
+        )
+    config.IL.TRAIN_ENV_REFILL_POLICY = train_policy
+
+
 def get_config(
     config_paths: Optional[Union[List[str], str]] = None,
     opts: Optional[list] = None,
@@ -645,6 +673,7 @@ def get_config(
         config.merge_from_list(normalized_opts)
 
     _normalize_oracle_config(config)
+    _normalize_env_refill_policies(config)
     config.set_new_allowed(False)
     config.freeze()
     return config

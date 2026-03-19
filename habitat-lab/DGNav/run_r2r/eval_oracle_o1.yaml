@@ -25,6 +25,7 @@ EVAL:
   USE_CKPT_CONFIG: False
   SPLIT: val_unseen
   EPISODE_COUNT: -1
+  ENV_REFILL_POLICY: legacy_batch
   EPISODE_ID_FILE: run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt
   CKPT_PATH_DIR: /home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter18600.pth
   fast_eval: False

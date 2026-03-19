@@ -12,6 +12,8 @@ class OracleQuerySpec:
     episode_id: str     #当前导航episode的id
     active_env_index: int      #当前 active 子批次环境索引
     original_env_index: int  #原始 vec env 槽位索引，用于调试/审计
+    slot_id: int             #稳定逻辑槽位 id
+    episode_instance_seq: int  #同一 slot 上当前 episode 的 occurrence 序号
     stepk: int          #第几个高层决策步
 
     ghost_vp_id: str    #目标ghost节点id

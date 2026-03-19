@@ -134,10 +134,12 @@ class SimulatorPeekOracleProvider(OracleProvider):
             )
         except Exception as e:
             raise RuntimeError(
-                f"query过程报错,episode_id = {spec.episode_id}/ "
-                f"ghost_vp_id = {spec.ghost_vp_id}/ "
-                f"active_env_index = {spec.active_env_index}/ "
-                f"original_env_index = {spec.original_env_index}"
+                f"query过程报错, episode_id={spec.episode_id} / "
+                f"episode_instance_seq={spec.episode_instance_seq} / "
+                f"ghost_vp_id={spec.ghost_vp_id} / "
+                f"slot_id={spec.slot_id} / "
+                f"active_env_index={spec.active_env_index} / "
+                f"original_env_index={spec.original_env_index}"
             ) from e
         finally:
             if policy_training:

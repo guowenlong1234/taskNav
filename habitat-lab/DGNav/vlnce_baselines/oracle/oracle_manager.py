@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import math
 import os
@@ -51,8 +51,12 @@ class OracleExperimentManager:
                 max_items_per_scene=self.config_oracle.cache_max_items_per_scene,
             )
 
-        self._episode_key = {}
-        self._trace_paths = {}
+        self._slot_episode_key: Dict[int, Tuple[str, str]] = {}
+        self._slot_trace_paths: Dict[int, str] = {}
+        self._slot_episode_instance_seq: Dict[int, int] = {}
+        self._active_env_to_slot: Dict[int, int] = {}
+        self._slot_to_active_env: Dict[int, int] = {}
+        self._slot_last_query_stats: Dict[int, Dict[str, Any]] = {}
         self._last_query_stats: Dict[str, Any] = {}
         if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
             os.makedirs(self.trace_dir, exist_ok=True)
@@ -74,16 +78,34 @@ class OracleExperimentManager:
         log_every_n_steps = max(int(self.trace_cfg.log_every_n_steps), 1)
         return stepk % log_every_n_steps == 0
 
-    def _write_trace_record(self, env_index: int, record: Dict[str, Any]) -> None:  #写日志到文件的辅助函数，record要写入的一条 trace 记录
-        if env_index not in self._trace_paths:
+    def _build_trace_path(
+        self,
+        scene_id: str,
+        episode_id: str,
+        episode_instance_seq: int,
+    ) -> str:
+        scene_token = self._sanitize_trace_token(scene_id)
+        episode_token = self._sanitize_trace_token(episode_id)
+        occ_token = self._sanitize_trace_token(f"occ{int(episode_instance_seq)}")
+        run_token = self._sanitize_trace_token(self.run_id)
+        split_token = self._sanitize_trace_token(self.split)
+        return os.path.join(
+            self.trace_dir,
+            f"{run_token}__{split_token}__{scene_token}__{episode_token}__{occ_token}.jsonl",
+        )
+
+    def _write_trace_record(self, slot_id: int, record: Dict[str, Any]) -> None:  #写日志到文件的辅助函数，record要写入的一条 trace 记录
+        if slot_id not in self._slot_trace_paths:
             return
-        with open(self._trace_paths[env_index], "a", encoding="utf-8") as f:
+        with open(self._slot_trace_paths[slot_id], "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _trace_query_event(     #完成一条信息的组装和写入
         self,
         *,
-        env_index: int,
+        active_env_index: int,
+        slot_id: int,
+        episode_instance_seq: int,
         scene_id: str,
         episode_id: str,
         stepk: int,
@@ -114,8 +136,10 @@ class OracleExperimentManager:
             "split": self.split,
             "scene_id": scene_id,
             "episode_id": episode_id,
-            "active_env_index": env_index,
+            "active_env_index": active_env_index,
             "original_env_index": original_env_index,
+            "slot_id": int(slot_id),
+            "episode_instance_seq": int(episode_instance_seq),
             "stepk": stepk,
             "ghost_vp_id": ghost_vp_id,
             "chosen_front_vp_id": chosen_front_vp_id,
@@ -138,7 +162,7 @@ class OracleExperimentManager:
         if self.trace_cfg.include_embed_norm:
             record["embed_norm"] = embed_norm
 
-        self._write_trace_record(env_index, record)
+        self._write_trace_record(slot_id, record)
 
     def _is_navigable(self, env_index: int, pos) -> bool:
         #给定一个点，检查这个位置是否可导航
@@ -344,20 +368,125 @@ class OracleExperimentManager:
         return f"{scene_id}:{tuple(pos)}:{normalized_heading:.6f}"
         
 
-    def one_episode_reset(self, env_index: int, scene_id: str, episode_id: str):
-        '''
-        用于缓存和清理统计
-        '''
-        self._episode_key[env_index] = (scene_id, episode_id)
-        if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
-            scene_token = self._sanitize_trace_token(scene_id)
-            episode_token = self._sanitize_trace_token(episode_id)
-            run_token = self._sanitize_trace_token(self.run_id)
-            split_token = self._sanitize_trace_token(self.split)
-            self._trace_paths[env_index] = os.path.join(        #组织json文件的路径
-                self.trace_dir,
-                f"{run_token}__{split_token}__{scene_token}__{episode_token}.jsonl",
+    def bind_active_env_to_slot(self, active_env_index: int, slot_id: int) -> None:
+        active_env_index = int(active_env_index)
+        slot_id = int(slot_id)
+        if active_env_index < 0 or slot_id < 0:
+            raise RuntimeError(
+                f"Invalid slot binding: active_env_index={active_env_index}, "
+                f"slot_id={slot_id}"
             )
+
+        old_slot = self._active_env_to_slot.get(active_env_index)
+        if old_slot is not None and old_slot != slot_id:
+            raise RuntimeError(
+                f"active_env_index={active_env_index} already bound to "
+                f"slot_id={old_slot}, cannot rebind to slot_id={slot_id}"
+            )
+
+        old_active = self._slot_to_active_env.get(slot_id)
+        if old_active is not None and old_active != active_env_index:
+            raise RuntimeError(
+                f"slot_id={slot_id} already bound to active_env_index={old_active}, "
+                f"cannot rebind to active_env_index={active_env_index}"
+            )
+
+        self._active_env_to_slot[active_env_index] = slot_id
+        self._slot_to_active_env[slot_id] = active_env_index
+
+    def rebind_after_pause(self, active_slot_ids: List[int]) -> None:
+        normalized = [int(x) for x in active_slot_ids]
+        if len(normalized) != len(set(normalized)):
+            raise RuntimeError(
+                f"Duplicate slot_id after pause/compact: {normalized}"
+            )
+        if any(slot_id < 0 for slot_id in normalized):
+            raise RuntimeError(
+                f"Negative slot_id after pause/compact: {normalized}"
+            )
+
+        self._active_env_to_slot = {
+            active_env_index: slot_id
+            for active_env_index, slot_id in enumerate(normalized)
+        }
+        self._slot_to_active_env = {
+            slot_id: active_env_index
+            for active_env_index, slot_id in enumerate(normalized)
+        }
+
+    def one_episode_reset(
+        self,
+        *,
+        slot_id: int,
+        scene_id: str,
+        episode_id: str,
+        active_env_index: Optional[int] = None,
+    ) -> int:
+        if active_env_index is not None:
+            self.bind_active_env_to_slot(active_env_index, slot_id)
+
+        slot_id = int(slot_id)
+        next_seq = int(self._slot_episode_instance_seq.get(slot_id, 0)) + 1
+        self._slot_episode_instance_seq[slot_id] = next_seq
+        self._slot_episode_key[slot_id] = (scene_id, episode_id)
+        self._slot_last_query_stats.pop(slot_id, None)
+
+        if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
+            self._slot_trace_paths[slot_id] = self._build_trace_path(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_instance_seq=next_seq,
+            )
+        return next_seq
+
+    def get_slot_episode_instance_seq(self, slot_id: int) -> int:
+        slot_id = int(slot_id)
+        if slot_id not in self._slot_episode_instance_seq:
+            raise RuntimeError(
+                f"Missing episode_instance_seq for slot_id={slot_id}"
+            )
+        return int(self._slot_episode_instance_seq[slot_id])
+
+    def _assert_slot_binding(
+        self,
+        *,
+        slot_id: int,
+        active_env_index: int,
+        current_episode,
+    ) -> int:
+        slot_id = int(slot_id)
+        active_env_index = int(active_env_index)
+
+        if self._active_env_to_slot.get(active_env_index) != slot_id:
+            raise RuntimeError(
+                f"Slot binding mismatch: active_env_to_slot[{active_env_index}]="
+                f"{self._active_env_to_slot.get(active_env_index)} != {slot_id}"
+            )
+        if self._slot_to_active_env.get(slot_id) != active_env_index:
+            raise RuntimeError(
+                f"Slot binding mismatch: slot_to_active_env[{slot_id}]="
+                f"{self._slot_to_active_env.get(slot_id)} != {active_env_index}"
+            )
+
+        expected = self._slot_episode_key.get(slot_id)
+        actual = (current_episode.scene_id, current_episode.episode_id)
+        if expected != actual:
+            raise RuntimeError(
+                f"Episode binding mismatch for slot_id={slot_id}: "
+                f"manager={expected}, current={actual}"
+            )
+
+        seq = self._slot_episode_instance_seq.get(slot_id)
+        if seq is None or int(seq) < 1:
+            raise RuntimeError(
+                f"Invalid episode_instance_seq for slot_id={slot_id}: {seq}"
+            )
+        return int(seq)
+
+    def remap_active_env_indices(self, paused_env_indices: List[int]) -> None:
+        raise RuntimeError(
+            "Deprecated: use rebind_after_pause(active_slot_ids) under stable-slot"
+        )
 
     def get_last_query_stats(self) -> Dict[str, Any]:
         return dict(self._last_query_stats)
@@ -405,6 +534,7 @@ class OracleExperimentManager:
         current_episode,
         active_env_index: int,
         original_env_index: int,
+        slot_id: int,
         candidate_ghost_ids: List[str],
         current_step: Optional[int] = None,
     ) -> Dict[str, OracleFeatureResult]:
@@ -413,12 +543,19 @@ class OracleExperimentManager:
             or (mode == "train" and getattr(self.config_oracle, "enable_in_train", False))
         )
         if (not self.config_oracle.enable) or (not allow_mode):
-            self._last_query_stats = self._init_query_stats(candidate_ghost_ids)
+            empty_stats = self._init_query_stats(candidate_ghost_ids)
+            self._slot_last_query_stats[int(slot_id)] = dict(empty_stats)
+            self._last_query_stats = dict(empty_stats)
             return {}
 
         step_id = stepk if current_step is None else current_step
         ep = current_episode
         results: Dict[str, OracleFeatureResult] = {}
+        episode_instance_seq = self._assert_slot_binding(
+            slot_id=slot_id,
+            active_env_index=active_env_index,
+            current_episode=current_episode,
+        )
         stats = self._init_query_stats(candidate_ghost_ids)
 
         for ghost_vp_id in candidate_ghost_ids:
@@ -446,7 +583,9 @@ class OracleExperimentManager:
                 stats["resolve_fail_cnt"] += 1
                 stats["failed_ids"].append(ghost_vp_id)
                 self._trace_query_event(
-                    env_index=active_env_index,
+                    active_env_index=active_env_index,
+                    slot_id=slot_id,
+                    episode_instance_seq=episode_instance_seq,
                     scene_id=ep.scene_id,
                     episode_id=ep.episode_id,
                     stepk=step_id,
@@ -514,6 +653,8 @@ class OracleExperimentManager:
                 episode_id=ep.episode_id,
                 active_env_index=active_env_index,
                 original_env_index=original_env_index,
+                slot_id=slot_id,
+                episode_instance_seq=episode_instance_seq,
                 stepk=step_id,
                 ghost_vp_id=ghost_vp_id,
                 front_vp_ids=front_vp_ids,
@@ -589,7 +730,9 @@ class OracleExperimentManager:
                     stats["provider_fail_cnt"] += 1
                     stats["failed_ids"].append(ghost_vp_id)
                     self._trace_query_event(
-                        env_index=active_env_index,
+                        active_env_index=active_env_index,
+                        slot_id=slot_id,
+                        episode_instance_seq=episode_instance_seq,
                         scene_id=ep.scene_id,
                         episode_id=ep.episode_id,
                         stepk=step_id,
@@ -658,7 +801,9 @@ class OracleExperimentManager:
                 stats["failed_ids"].append(ghost_vp_id)
 
             self._trace_query_event(
-                env_index=active_env_index,
+                active_env_index=active_env_index,
+                slot_id=slot_id,
+                episode_instance_seq=episode_instance_seq,
                 scene_id=ep.scene_id,
                 episode_id=ep.episode_id,
                 stepk=step_id,
@@ -680,7 +825,9 @@ class OracleExperimentManager:
                 embed_norm=result.embed_norm,
             )
 
-        self._last_query_stats = self._finalize_query_stats(stats)
+        finalized = self._finalize_query_stats(stats)
+        self._slot_last_query_stats[int(slot_id)] = dict(finalized)
+        self._last_query_stats = dict(finalized)
         return results
 
     def step_update_oracle(self,
@@ -689,6 +836,7 @@ class OracleExperimentManager:
                             gmaps: List[GraphMap],
                             current_episodes,
                             env_indices: List[int],         # not_done_index 映射回真实 env index
+                            slot_ids: Optional[List[int]] = None,
                             batch_gmap_vp_ids = None,
                             batch_gmap_lens = None,
                             
@@ -713,8 +861,14 @@ class OracleExperimentManager:
 
         else:
             stats = self._init_query_stats()
+            if slot_ids is None:
+                raise RuntimeError(
+                    "step_update_oracle requires explicit slot_ids under "
+                    "stable-slot semantics"
+                )
             for active_i, (gmap, ep) in enumerate(zip(gmaps, current_episodes)):
                 original_env_index = env_indices[active_i]
+                slot_id = slot_ids[active_i]
                 candidate_ghost_ids = list(gmap.ghost_mean_pos.keys())
                 oracle_results = self.query_ghosts(
                     mode=mode,
@@ -723,6 +877,7 @@ class OracleExperimentManager:
                     current_episode=ep,
                     active_env_index=active_i,
                     original_env_index=original_env_index,
+                    slot_id=slot_id,
                     candidate_ghost_ids=candidate_ghost_ids,
                     current_step=stepk,
                 )

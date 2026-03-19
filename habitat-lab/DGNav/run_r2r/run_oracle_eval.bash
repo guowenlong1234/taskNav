@@ -81,6 +81,7 @@ log_dir="${LOG_DIR:-data/logs/running_log/}"
 # 可选覆盖项。
 # 变量未设置时，保持 YAML 配置栈中的原值，不额外覆盖。
 oracle_enable="${ORACLE_ENABLE-}"
+eval_env_refill_policy="${EVAL_ENV_REFILL_POLICY-}"
 oracle_cache_enable="${ORACLE_CACHE_ENABLE-}"
 oracle_trace_enable="${ORACLE_TRACE_ENABLE-}"
 oracle_apply_mode="${ORACLE_APPLY_MODE-}"
@@ -101,6 +102,7 @@ oracle_ft_gain_init="${ORACLE_FT_GAIN_INIT-}"
 oracle_ft_mlp_lr="${ORACLE_FT_MLP_LR-}"
 oracle_ft_graph_lr="${ORACLE_FT_GRAPH_LR-}"
 oracle_ft_input_proj_lr="${ORACLE_FT_INPUT_PROJ_LR-}"
+oracle_ft_train_scope="${ORACLE_FT_TRAIN_SCOPE-}"
 oracle_ft_unfreeze_global_encoder="${ORACLE_FT_UNFREEZE_GLOBAL_ENCODER-}"
 oracle_ft_unfreeze_input_proj="${ORACLE_FT_UNFREEZE_INPUT_PROJ-}"
 
@@ -116,6 +118,7 @@ echo "[run_oracle_eval.bash] NUM_ENVIRONMENTS=${num_environments}"
 echo "[run_oracle_eval.bash] EPISODE_COUNT=${episode_count}"
 echo "[run_oracle_eval.bash] MASTER_PORT=${master_port}"
 echo "[run_oracle_eval.bash] CPU_SET=${cpu_set:-<disabled>}"
+echo "[run_oracle_eval.bash] EVAL_ENV_REFILL_POLICY=${eval_env_refill_policy:-<yaml/default>}"
 
 append_opt() {
       local key="$1"
@@ -147,6 +150,7 @@ flag_eval=(
 
 append_opt "EVAL.EPISODE_ID_FILE" "${episode_id_file}"
 append_opt "ORACLE.enable" "${oracle_enable}"
+append_opt "EVAL.ENV_REFILL_POLICY" "${eval_env_refill_policy}"
 append_opt "ORACLE.cache_enable" "${oracle_cache_enable}"
 append_opt "ORACLE.enable_in_train" "${oracle_enable_in_train}"
 append_opt "ORACLE.enable_in_eval" "${oracle_enable_in_eval}"
@@ -167,6 +171,7 @@ append_opt "MODEL.ORACLE_FT.gain_init" "${oracle_ft_gain_init}"
 append_opt "MODEL.ORACLE_FT.oracle_mlp_lr" "${oracle_ft_mlp_lr}"
 append_opt "MODEL.ORACLE_FT.graph_lr" "${oracle_ft_graph_lr}"
 append_opt "MODEL.ORACLE_FT.input_proj_lr" "${oracle_ft_input_proj_lr}"
+append_opt "MODEL.ORACLE_FT.train_scope" "${oracle_ft_train_scope}"
 append_opt "MODEL.ORACLE_FT.unfreeze_global_encoder" "${oracle_ft_unfreeze_global_encoder}"
 append_opt "MODEL.ORACLE_FT.unfreeze_input_proj" "${oracle_ft_unfreeze_input_proj}"
 

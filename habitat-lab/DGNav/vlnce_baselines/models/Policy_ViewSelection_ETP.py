@@ -98,7 +98,7 @@ class OracleResidualAdapter(nn.Module):
         self.ln = nn.LayerNorm(dim) if use_ln else nn.Identity()
         self.identity_init = bool(identity_init)
         self.drop = nn.Dropout(dropout)
-        activation = str(activation).lower()
+        activation = str(activation).lower()        #传进来的激活函数变成小写
         if activation == "gelu":
             self.act = nn.GELU()
         elif activation == "relu":
@@ -118,6 +118,7 @@ class OracleResidualAdapter(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        #尽量在一开始时候接近恒等映射
         last_idx = len(self.layers) - 1
         for idx, layer in enumerate(self.layers):
             if self.identity_init and idx == last_idx:

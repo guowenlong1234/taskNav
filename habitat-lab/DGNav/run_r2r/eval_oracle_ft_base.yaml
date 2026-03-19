@@ -1,3 +1,6 @@
+EVAL:
+  ENV_REFILL_POLICY: legacy_batch
+
 IL:
   back_algo: control
 
@@ -23,6 +26,7 @@ MODEL:
     gain_init: 1.0
     fusion_alpha: 0.25
     use_config_soft_alpha: True
+    train_scope: oracle_only
     unfreeze_global_encoder: True
     unfreeze_input_proj: False
     oracle_mlp_lr: 5e-5

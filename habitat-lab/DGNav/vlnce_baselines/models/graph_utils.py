@@ -279,6 +279,7 @@ class GraphMap(object):
         return list(self.ghost_pos.keys())
 
     def get_node_embed_components(self, vp_id: str):
+        #返回两个张量，一个基础张量，一个oracle张量
         if not vp_id.startswith('g'):
             base = self.node_embeds[vp_id]
             return {

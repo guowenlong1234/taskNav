@@ -1,0 +1,6 @@
+EVAL:
+  ENV_REFILL_POLICY: streaming_refill
+
+ORACLE:
+  enable: True
+  enable_in_eval: True

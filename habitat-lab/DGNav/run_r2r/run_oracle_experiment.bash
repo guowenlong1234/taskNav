@@ -26,6 +26,10 @@ usage() {
   b2_eval_off_fixed500
   b2_eval_on_full
   b2_eval_off_full
+  full_oracle_train
+  full_oracle_eval_on_fixed500
+  streaming_train_oracle_smoke
+  streaming_eval_oracle_smoke
 EOF
 }
 
@@ -56,6 +60,8 @@ TENSORBOARD_DIR="data/logs/tensorboard_dirs/"
 CHECKPOINT_FOLDER="data/logs/checkpoints/"
 VIDEO_DIR="data/logs/video/"
 LOG_DIR="data/logs/running_log/"
+train_env_refill_policy="${TRAIN_ENV_REFILL_POLICY-}"
+eval_env_refill_policy="${EVAL_ENV_REFILL_POLICY-}"
 
 # 共享 checkpoint 目录。
 # 具体使用哪个 checkpoint，在各自 preset 配置块里显式写出。
@@ -79,8 +85,13 @@ master_port=""
 exp_name=""
 config_path=""
 ckpt_path=""
+pretrained_path=""
 train_iters=""
 num_environments=""
+il_load_from_ckpt=""
+il_lr=""
+il_waypoint_aug=""
+il_back_algo=""
 oracle_enable=""
 oracle_enable_in_train=""
 oracle_enable_in_eval=""
@@ -98,10 +109,58 @@ oracle_ft_gain_init=""
 oracle_ft_mlp_lr=""
 oracle_ft_graph_lr=""
 oracle_ft_input_proj_lr=""
+oracle_ft_train_scope=""
 oracle_ft_unfreeze_global_encoder=""
 oracle_ft_unfreeze_input_proj=""
 
 case "${preset}" in
+      streaming_train_oracle_smoke)
+            # streaming + Oracle on 最小训练冒烟:
+            # - 使用 stable-slot 语义
+            # - 关闭 Oracle-FT adapter，聚焦 slot 绑定正确性
+            runner="${train_entry}"
+            master_port="4783"
+            exp_name="streaming_train_oracle_smoke"
+            config_path="run_r2r/iter_train.yaml,run_r2r/train_oracle_ft_base.yaml,run_r2r/oracle_ft_disabled.yaml,run_r2r/train_streaming_refill_oracle_smoke.yaml"
+            ckpt_path="${release_ckpt_dir}/ckpt.iter18600.pth"
+            train_iters="20"
+            num_environments="2"
+            oracle_enable="True"
+            oracle_enable_in_train="True"
+            oracle_enable_in_eval="True"
+            oracle_apply_mode="soft"
+            oracle_soft_alpha="0.25"
+            oracle_target_ghost_scope="all"
+            oracle_refresh_policy="on_change"
+            oracle_cache_enable="True"
+            oracle_trace_enable="True"
+            oracle_scope_trace_enable="True"
+            oracle_scope_summary_enable="True"
+            oracle_ft_enable="False"
+            ;;
+      streaming_eval_oracle_smoke)
+            # streaming + Oracle on 最小评测冒烟:
+            # - 使用 stable-slot 语义
+            # - 关闭 Oracle-FT adapter，聚焦 slot / trace 正确性
+            runner="${eval_entry}"
+            master_port="4784"
+            exp_name="streaming_eval_oracle_smoke"
+            config_path="run_r2r/iter_train.yaml,run_r2r/eval_oracle_ft_base.yaml,run_r2r/oracle_ft_disabled.yaml,run_r2r/eval_fixed500.yaml,run_r2r/eval_streaming_refill_oracle_smoke.yaml"
+            ckpt_path="${release_ckpt_dir}/ckpt.iter18600.pth"
+            num_environments="2"
+            oracle_enable="True"
+            oracle_enable_in_train="False"
+            oracle_enable_in_eval="True"
+            oracle_apply_mode="soft"
+            oracle_soft_alpha="0.25"
+            oracle_target_ghost_scope="all"
+            oracle_refresh_policy="on_change"
+            oracle_cache_enable="True"
+            oracle_trace_enable="True"
+            oracle_scope_trace_enable="True"
+            oracle_scope_summary_enable="True"
+            oracle_ft_enable="False"
+            ;;
       b0_train)
             # B0 冒烟实验:
             # - 训练态打开 Oracle query/writeback
@@ -353,6 +412,69 @@ case "${preset}" in
             ckpt_path=""
             num_environments="1"
             ;;
+      full_oracle_train)
+            # 全量 Oracle 训练:
+            # - 从 release_r2r_dino_best_nav 当年使用的同一预训练基座起跑
+            # - 训练/评测 Oracle 打开, cache 打开
+            # - baseline 风格 Oracle-FT：保留 baseline 可训练集合，再额外训练 oracle_adapter
+            # - DINO backbone 继续冻结；让视觉 MLP、Oracle MLP 和下游网络一起适应 Oracle 特征
+            # - 学习率与 baseline/B2 主 LR 保持一致
+            # - full val_unseen Oracle 上限参考：oracle_success ~= 0.6585 (release_r2r_dino_best_nav/ckpt.iter21800)
+            runner="${train_entry}"
+            master_port="4781"
+            exp_name="full_oracle_train"
+            config_path="run_r2r/iter_train.yaml"
+            ckpt_path=""
+            pretrained_path="/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2_clean/ckpts/model_step_97500.pt"
+            train_iters="25000"
+            num_environments="6"
+            il_load_from_ckpt="False"
+            il_lr="1e-5"
+            il_waypoint_aug="True"
+            il_back_algo="teleport"
+            oracle_enable="True"
+            oracle_enable_in_train="True"
+            oracle_enable_in_eval="True"
+            oracle_apply_mode="soft"
+            oracle_soft_alpha="0.25"
+            oracle_target_ghost_scope="all"
+            oracle_refresh_policy="on_change"
+            oracle_cache_enable="True"
+            oracle_trace_enable="True"
+            oracle_scope_trace_enable="True"
+            oracle_scope_summary_enable="True"
+            oracle_ft_enable="True"
+            oracle_ft_gain_init="1.0"
+            oracle_ft_train_scope="baseline_plus_oracle_adapter"
+            ;;
+      full_oracle_eval_on_fixed500)
+            # 全量 Oracle 训练产物验证:
+            # - 评测口径对齐 B2_eval_on_fixed500
+            # - fixed500 val_unseen
+            # - Oracle 打开, cache 打开
+            # - 与 full_oracle_train 一致，评测时保持 Oracle-FT 打开
+            runner="${eval_entry}"
+            master_port="4782"
+            exp_name="full_oracle_eval_on_fixed500"
+            config_path="run_r2r/iter_train.yaml,run_r2r/eval_oracle_ft_base.yaml,run_r2r/eval_fixed500.yaml"
+            # 显式填写按 baseline_plus_oracle_adapter 新逻辑重新训练后产出的 checkpoint。
+            ckpt_path=""
+            num_environments="1"
+            oracle_enable="True"
+            oracle_enable_in_train="True"
+            oracle_enable_in_eval="True"
+            oracle_apply_mode="soft"
+            oracle_soft_alpha="0.25"
+            oracle_target_ghost_scope="all"
+            oracle_refresh_policy="on_change"
+            oracle_cache_enable="True"
+            oracle_trace_enable="True"
+            oracle_scope_trace_enable="True"
+            oracle_scope_summary_enable="True"
+            oracle_ft_enable="True"
+            oracle_ft_gain_init="1.0"
+            oracle_ft_train_scope="baseline_plus_oracle_adapter"
+            ;;
       *)
             echo "[run_oracle_experiment.bash] 未知预设: ${preset}" >&2
             usage >&2
@@ -360,15 +482,22 @@ case "${preset}" in
             ;;
 esac
 
-require_existing_file "${ckpt_path}" "CKPT_PATH"
+if [[ "${il_load_from_ckpt:-True}" == "False" ]]; then
+      require_existing_file "${pretrained_path}" "PRETRAINED_PATH"
+else
+      require_existing_file "${ckpt_path}" "CKPT_PATH"
+fi
 
 echo "[run_oracle_experiment.bash] preset=${preset}"
 echo "[run_oracle_experiment.bash] runner=${runner##*/}"
 echo "[run_oracle_experiment.bash] exp_name=${exp_name}"
 echo "[run_oracle_experiment.bash] config_path=${config_path}"
 echo "[run_oracle_experiment.bash] ckpt_path=${ckpt_path}"
+echo "[run_oracle_experiment.bash] pretrained_path=${pretrained_path:-<not-used>}"
 echo "[run_oracle_experiment.bash] train_iters=${train_iters:-<not-used>}"
 echo "[run_oracle_experiment.bash] num_environments=${num_environments}"
+echo "[run_oracle_experiment.bash] TRAIN_ENV_REFILL_POLICY=${train_env_refill_policy:-<yaml/default>}"
+echo "[run_oracle_experiment.bash] EVAL_ENV_REFILL_POLICY=${eval_env_refill_policy:-<yaml/default>}"
 
 env \
       CONDA_ENV="${CONDA_ENV}" \
@@ -376,6 +505,7 @@ env \
       EXP_NAME="${exp_name}" \
       CONFIG_PATH="${config_path}" \
       CKPT_PATH="${ckpt_path}" \
+      PRETRAINED_PATH="${pretrained_path}" \
       NUM_ENVIRONMENTS="${num_environments}" \
       GPU_NUMBERS="${GPU_NUMBERS}" \
       SIMULATOR_GPU_IDS="${SIMULATOR_GPU_IDS}" \
@@ -387,7 +517,13 @@ env \
       CHECKPOINT_FOLDER="${CHECKPOINT_FOLDER}" \
       VIDEO_DIR="${VIDEO_DIR}" \
       LOG_DIR="${LOG_DIR}" \
+      TRAIN_ENV_REFILL_POLICY="${train_env_refill_policy}" \
+      EVAL_ENV_REFILL_POLICY="${eval_env_refill_policy}" \
+      IL_LOAD_FROM_CKPT="${il_load_from_ckpt}" \
       IL_ITERS="${train_iters}" \
+      IL_LR="${il_lr}" \
+      IL_WAYPOINT_AUG="${il_waypoint_aug}" \
+      IL_BACK_ALGO="${il_back_algo}" \
       ORACLE_ENABLE="${oracle_enable}" \
       ORACLE_ENABLE_IN_TRAIN="${oracle_enable_in_train}" \
       ORACLE_ENABLE_IN_EVAL="${oracle_enable_in_eval}" \
@@ -405,6 +541,7 @@ env \
       ORACLE_FT_MLP_LR="${oracle_ft_mlp_lr}" \
       ORACLE_FT_GRAPH_LR="${oracle_ft_graph_lr}" \
       ORACLE_FT_INPUT_PROJ_LR="${oracle_ft_input_proj_lr}" \
+      ORACLE_FT_TRAIN_SCOPE="${oracle_ft_train_scope}" \
       ORACLE_FT_UNFREEZE_GLOBAL_ENCODER="${oracle_ft_unfreeze_global_encoder}" \
       ORACLE_FT_UNFREEZE_INPUT_PROJ="${oracle_ft_unfreeze_input_proj}" \
       bash "${runner}"
