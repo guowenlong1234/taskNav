@@ -45,21 +45,31 @@ usage() {
   <preset> 选择实验配置块。
 
 可用 preset:
-  batch_oracle_eval_stream_cache
-  serial_oracle_eval_stream_cache
+  A1  batch Oracle eval, streaming_refill + cache + batch_query
+  A2  serial Oracle eval, streaming_refill + cache
+  T1  Oracle train, streaming_refill + cache + batch_query + Oracle-FT
 
 默认对齐口径:
-  - ckpt.iter18600
-  - Oracle 打开
-  - soft 注入 alpha=0.25
-  - cache 打开
-  - streaming_refill 打开
-  - NUM_ENVIRONMENTS=4
-  - fixed500 val_unseen
+  - A1/A2:
+    ckpt.iter18600
+    Oracle 打开
+    soft 注入 alpha=0.25
+    cache 打开
+    streaming_refill 打开
+    NUM_ENVIRONMENTS=4
+    fixed500 val_unseen
+  - T1:
+    best_nav 同口径训练超参
+    从 best_nav 预训练底座开始
+    Oracle train/eval 打开
+    cache + batch_query 打开
+    TRAIN_ENV_REFILL_POLICY=streaming_refill
+    NUM_ENVIRONMENTS=6
+    IL.log_every=100（每 100 iter 保存一次 ckpt）
 
 命令行覆盖:
   直接在 preset 后面追加 run.py 支持的 KEY VALUE 覆盖，例如:
-    bash habitat-lab/DGNav/run_r2r/main.bash batch_oracle_eval_stream_cache \
+    bash habitat-lab/DGNav/run_r2r/main.bash A1 \
       EVAL.EPISODE_COUNT 10 ORACLE.trace.enable False
 EOF
 }
@@ -87,7 +97,9 @@ video_dir="${VIDEO_DIR:-data/logs/video/}"
 log_dir="${LOG_DIR:-data/logs/running_log/}"
 
 release_ckpt_iter18600="${dgnav_dir}/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter18600.pth"
+best_nav_pretrain_base="/home/gwl/project/DGNav_new/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s/ckpts/model_step_22500.pt"
 fixed500_file="run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt"
+fixed500_file_path="${dgnav_dir}/${fixed500_file}"
 oracle_stack="run_r2r/r2r_oracle.yaml"
 
 run_type="eval"
@@ -96,6 +108,7 @@ exp_config="${oracle_stack}"
 preset_master_port=""
 preset_num_environments="4"
 preset_opts=()
+required_paths=()
 
 case "${preset}" in
       A1)
@@ -114,6 +127,7 @@ case "${preset}" in
                   "ORACLE.batch_query_enable" "True"
                   "MODEL.ORACLE_FT.enable" "False"
             )
+            required_paths+=("${release_ckpt_iter18600}" "${fixed500_file_path}")
             ;;
       A2)
             exp_name="serial_oracle_eval_stream_cache"
@@ -131,6 +145,38 @@ case "${preset}" in
                   "ORACLE.batch_query_enable" "False"
                   "MODEL.ORACLE_FT.enable" "False"
             )
+            required_paths+=("${release_ckpt_iter18600}" "${fixed500_file_path}")
+            ;;
+      T1)
+            run_type="train"
+            exp_name="oracle_train_stream_batch_cache_ft"
+            preset_master_port="4861"
+            preset_num_environments="4"
+            preset_opts=(
+                  "IL.iters" "20000"
+                  "IL.log_every" "100"
+                  "IL.lr" "1e-5"
+                  "IL.sample_ratio" "0.75"
+                  "IL.decay_interval" "3000"
+                  "IL.waypoint_aug" "True"
+                  "IL.load_from_ckpt" "False"
+                  "IL.is_requeue" "False"
+                  "IL.TRAIN_ENV_REFILL_POLICY" "streaming_refill"
+                  "MODEL.pretrained_path" "${best_nav_pretrain_base}"
+                  "ORACLE.enable" "True"
+                  "ORACLE.enable_in_train" "True"
+                  "ORACLE.enable_in_eval" "True"
+                  "ORACLE.apply_mode" "soft"
+                  "ORACLE.soft_alpha" "0.25"
+                  "ORACLE.cache_enable" "True"
+                  "ORACLE.batch_query_enable" "True"
+                  "ORACLE.trace.enable" "False"
+                  "ORACLE.scope_trace_enable" "False"
+                  "ORACLE.scope_summary_enable" "False"
+                  "MODEL.ORACLE_FT.enable" "True"
+                  "MODEL.ORACLE_FT.train_scope" "baseline_plus_oracle_adapter"
+            )
+            required_paths+=("${best_nav_pretrain_base}")
             ;;
       *)
             echo "[main.bash] Unknown preset: ${preset}" >&2
@@ -156,10 +202,12 @@ common_opts=(
       "TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING" "${allow_sliding}"
 )
 
-if [[ ! -f "${release_ckpt_iter18600}" ]]; then
-      echo "[main.bash] Missing checkpoint: ${release_ckpt_iter18600}" >&2
-      exit 1
-fi
+for required_path in "${required_paths[@]}"; do
+      if [[ ! -f "${required_path}" ]]; then
+            echo "[main.bash] Missing required file: ${required_path}" >&2
+            exit 1
+      fi
+done
 
 run_dgnav() {
       local -a cmd=(
