@@ -624,31 +624,35 @@ class RLTrainer(BaseVLNCETrainer):
         return txt_masks.squeeze(0), txt_embeds.squeeze(0)
 
     def _build_oracle_manager(
-        self, mode: str, slot_ids: Optional[List[int]] = None
+        self,
+        mode: str,
+        slot_ids: Optional[List[int]] = None,
+        existing_manager: Optional[OracleExperimentManager] = None,
     ):
         if not self._is_oracle_effective_for_mode(mode):
             return None
-        oracle_manager = OracleExperimentManager(
-            config=self.config,
-            envs=self.envs,
-            policy=self.policy,
-            waypoint_predictor=self.waypoint_predictor,
-            obs_transforms=self.obs_transforms,
-            device=self.device,
-            run_id=getattr(self.config, "EXP_NAME", "exp"),
-            split=self.config.TASK_CONFIG.DATASET.SPLIT,
-            trace_dir=self.config.ORACLE.trace.dir,
-            vp_feature_builder=self._vp_feature_variable,
-        )
+        oracle_manager = existing_manager
+        if oracle_manager is None:
+            oracle_manager = OracleExperimentManager(
+                config=self.config,
+                envs=self.envs,
+                policy=self.policy,
+                waypoint_predictor=self.waypoint_predictor,
+                obs_transforms=self.obs_transforms,
+                device=self.device,
+                run_id=getattr(self.config, "EXP_NAME", "exp"),
+                split=self.config.TASK_CONFIG.DATASET.SPLIT,
+                trace_dir=self.config.ORACLE.trace.dir,
+                vp_feature_builder=self._vp_feature_variable,
+            )
         current_eps = self.envs.current_episodes()
         if slot_ids is None:
             slot_ids = list(range(len(current_eps)))
+        else:
+            slot_ids = [int(x) for x in slot_ids]
+        oracle_manager.rebind_after_pause(slot_ids)
         for i, ep in enumerate(current_eps):
             slot_id = int(slot_ids[i])
-            oracle_manager.bind_active_env_to_slot(
-                active_env_index=i,
-                slot_id=slot_id,
-            )
             oracle_manager.one_episode_reset(
                 slot_id=slot_id,
                 scene_id=ep.scene_id,
@@ -2244,6 +2248,7 @@ class RLTrainer(BaseVLNCETrainer):
         self._stream_eval_checkpoint_index = checkpoint_index
 
         policy = self._get_eval_env_refill_policy()
+        self._legacy_eval_oracle_manager = None
         try:
             if policy == "legacy_batch":
                 while len(self.stat_eps) < eps_to_eval:
@@ -2256,6 +2261,7 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 raise ValueError(f"Invalid eval env refill policy: {policy}")
         finally:
+            self._legacy_eval_oracle_manager = None
             self.envs.close()
             if self.pbar is not None:
                 self.pbar.close()
@@ -3480,10 +3486,18 @@ class RLTrainer(BaseVLNCETrainer):
                                ghost_aug,oracle_cfg=self.config.ORACLE) for _ in range(self.envs.num_envs)]   #ghost 位置扰动强度
         
         #实例化一个oracle_manager
+        shared_eval_oracle_manager = None
+        if mode == 'eval':
+            shared_eval_oracle_manager = getattr(
+                self, "_legacy_eval_oracle_manager", None
+            )
         oracle_manager = self._build_oracle_manager(
             mode=mode,
             slot_ids=list(range(self.envs.num_envs)),
+            existing_manager=shared_eval_oracle_manager,
         )
+        if mode == 'eval' and oracle_manager is not None:
+            self._legacy_eval_oracle_manager = oracle_manager
         
 
         #初始化每个环境上一时刻所在 viewpoint
