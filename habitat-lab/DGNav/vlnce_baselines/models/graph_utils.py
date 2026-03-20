@@ -183,12 +183,29 @@ class GraphMap(object):
         '''
         return vp_id in self.ghost_oracle_embeds
         
+    @staticmethod
+    def _extract_oracle_embed(payload):
+        if payload is None:
+            return None
+        if isinstance(payload, torch.Tensor):
+            return payload
+        if isinstance(payload, dict):
+            payload = payload.get("embed")
+        elif hasattr(payload, "embed"):
+            payload = getattr(payload, "embed")
+        return payload if isinstance(payload, torch.Tensor) else None
 
-    def get_oracle_embed(self, vp_id:str):
+    def get_oracle_embed(self, vp_id:str, transient_oracle_embeds=None):
         '''
         返回 oracle embedding 或 None。
         异常KeyError 不抛出统一返回None。
         '''
+        if transient_oracle_embeds is not None and vp_id in transient_oracle_embeds:
+            transient_embed = self._extract_oracle_embed(
+                transient_oracle_embeds[vp_id]
+            )
+            if transient_embed is not None:
+                return transient_embed
         return self.ghost_oracle_embeds.get(vp_id, None)
 
     def get_base_ghost_embed(self, vp_id: str):
@@ -199,14 +216,19 @@ class GraphMap(object):
         vp_id: str,
         use_oracle: bool = True,
         allowed_oracle_ghost_ids=None,
+        transient_oracle_embeds=None,
     ):
         e_base = self.get_base_ghost_embed(vp_id)
+        oracle_embed = self.get_oracle_embed(
+            vp_id,
+            transient_oracle_embeds=transient_oracle_embeds,
+        )
         if (
             use_oracle
             and
             self.oracle_cfg is not None
             and self.oracle_cfg.enable
-            and vp_id in self.ghost_oracle_embeds
+            and oracle_embed is not None
         ):
             if (
                 allowed_oracle_ghost_ids is not None
@@ -219,9 +241,8 @@ class GraphMap(object):
             if apply_mode == "soft":
                 alpha = float(getattr(self.oracle_cfg, "soft_alpha", 1.0))
                 alpha = max(0.0, min(1.0, alpha))
-                e_oracle = self.get_oracle_embed(vp_id)
-                return (1.0 - alpha) * e_base + alpha * e_oracle
-            return self.get_oracle_embed(vp_id)
+                return (1.0 - alpha) * e_base + alpha * oracle_embed
+            return oracle_embed
         return e_base
 
 
@@ -278,7 +299,7 @@ class GraphMap(object):
     def get_all_alive_ghost_ids(self):
         return list(self.ghost_pos.keys())
 
-    def get_node_embed_components(self, vp_id: str):
+    def get_node_embed_components(self, vp_id: str, transient_oracle_embeds=None):
         #返回两个张量，一个基础张量，一个oracle张量
         if not vp_id.startswith('g'):
             base = self.node_embeds[vp_id]
@@ -289,7 +310,10 @@ class GraphMap(object):
                 "is_ghost": False,
             }
         base = self.get_base_ghost_embed(vp_id)
-        oracle_raw = self.get_oracle_embed(vp_id)
+        oracle_raw = self.get_oracle_embed(
+            vp_id,
+            transient_oracle_embeds=transient_oracle_embeds,
+        )
         return {
             "base": base,
             "oracle_raw": oracle_raw,
@@ -551,7 +575,13 @@ class GraphMap(object):
                 min_front = front_vp
         return min_dis, min_front
 
-    def get_node_embeds(self, vp, use_oracle: bool = True, allowed_oracle_ghost_ids=None):
+    def get_node_embeds(
+        self,
+        vp,
+        use_oracle: bool = True,
+        allowed_oracle_ghost_ids=None,
+        transient_oracle_embeds=None,
+    ):
         if not vp.startswith('g'):  #如果p是以g开头的，说明是普通节点
             return self.node_embeds[vp] #直接返回节点保存的特征
         else:   #如果是以g开头的，说明是ghost节点，返回最终送入planner的ghost特征。
@@ -559,6 +589,7 @@ class GraphMap(object):
                 vp,
                 use_oracle=use_oracle,
                 allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
+                transient_oracle_embeds=transient_oracle_embeds,
             )
 
     def get_pos_fts(self, cur_vp, cur_pos, cur_ori, gmap_vp_ids):

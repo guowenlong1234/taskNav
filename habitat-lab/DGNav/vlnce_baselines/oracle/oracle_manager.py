@@ -2,9 +2,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 import math
 import os
+import time
 import torch
 import numpy as np
 
+from .buffered_writer import BufferedLineWriter
 from .cache import OracleSpatialCache
 from .providers import SimulatorPeekOracleProvider
 from .types import OracleFeatureResult, OracleQuerySpec
@@ -41,6 +43,7 @@ class OracleExperimentManager:
             INSTRUCTION_SENSOR_UUID=config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
             task_type=config.MODEL.task_type,
             instr_max_len=config.IL.max_text_len,
+            oracle_config=self.config_oracle,
         )
 
         self.cache = None
@@ -58,8 +61,23 @@ class OracleExperimentManager:
         self._slot_to_active_env: Dict[int, int] = {}
         self._slot_last_query_stats: Dict[int, Dict[str, Any]] = {}
         self._last_query_stats: Dict[str, Any] = {}
+        self._trace_buffered_writer: Optional[BufferedLineWriter] = None
         if self.trace_cfg.enable and self.trace_cfg.format == "jsonl":
             os.makedirs(self.trace_dir, exist_ok=True)
+
+    def _trace_buffer_enabled(self) -> bool:
+        return bool(getattr(self.trace_cfg, "buffer_enable", True))
+
+    def _get_trace_buffered_writer(self) -> Optional[BufferedLineWriter]:
+        if (not self.trace_cfg.enable) or self.trace_cfg.format != "jsonl":
+            return None
+        if not self._trace_buffer_enabled():
+            return None
+        if self._trace_buffered_writer is None:
+            self._trace_buffered_writer = BufferedLineWriter(
+                flush_records=getattr(self.trace_cfg, "buffer_flush_records", 200)
+            )
+        return self._trace_buffered_writer
 
     def _sanitize_trace_token(self, value: str) -> str:     #清理用于文件名或者路径的字符串的辅助函数
         return (
@@ -97,8 +115,22 @@ class OracleExperimentManager:
     def _write_trace_record(self, slot_id: int, record: Dict[str, Any]) -> None:  #写日志到文件的辅助函数，record要写入的一条 trace 记录
         if slot_id not in self._slot_trace_paths:
             return
-        with open(self._slot_trace_paths[slot_id], "a", encoding="utf-8") as f:
+        path = self._slot_trace_paths[slot_id]
+        writer = self._get_trace_buffered_writer()
+        if writer is not None:
+            writer.append_json(path, record)
+            return
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def flush_trace_buffers(self) -> None:
+        if self._trace_buffered_writer is not None:
+            self._trace_buffered_writer.flush_all()
+
+    def get_trace_buffer_metrics(self) -> Dict[str, Any]:
+        if self._trace_buffered_writer is None:
+            return {}
+        return self._trace_buffered_writer.get_metrics()
 
     def _trace_query_event(     #完成一条信息的组装和写入
         self,
@@ -125,11 +157,11 @@ class OracleExperimentManager:
         used_pos,
         used_heading_rad,
         embed_norm: Optional[float],
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         if not self._should_trace_step(stepk):
-            return
+            return None
         if (not ok) and (not self.trace_cfg.include_failures):
-            return
+            return None
 
         record = {
             "run_id": self.run_id,
@@ -163,6 +195,7 @@ class OracleExperimentManager:
             record["embed_norm"] = embed_norm
 
         self._write_trace_record(slot_id, record)
+        return record
 
     def _is_navigable(self, env_index: int, pos) -> bool:
         #给定一个点，检查这个位置是否可导航
@@ -506,8 +539,14 @@ class OracleExperimentManager:
             "intra_episode_cache_hit_cnt": 0,
             "cross_episode_cache_hit_cnt": 0,
             "latency_ms_sum": 0.0,
+            "provider_miss_cnt": 0,
+            "provider_latency_ms_sum": 0.0,
+            "batched_provider_call_cnt": 0,
+            "provider_batch_size_sum": 0,
             "skipped_cnt": 0,
             "avg_latency_ms": 0.0,
+            "provider_avg_latency_ms": 0.0,
+            "provider_avg_batch_size": 0.0,
             "intra_episode_cache_hit_pct": 0.0,
             "cross_episode_cache_hit_pct": 0.0,
         }
@@ -516,6 +555,15 @@ class OracleExperimentManager:
     def _finalize_query_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
         if stats["query_cnt"] > 0:
             stats["avg_latency_ms"] = stats["latency_ms_sum"] / stats["query_cnt"]
+        if stats["provider_miss_cnt"] > 0:
+            stats["provider_avg_latency_ms"] = (
+                stats["provider_latency_ms_sum"] / stats["provider_miss_cnt"]
+            )
+        if stats["batched_provider_call_cnt"] > 0:
+            stats["provider_avg_batch_size"] = (
+                stats["provider_batch_size_sum"]
+                / stats["batched_provider_call_cnt"]
+            )
         if stats["cache_hit_cnt"] > 0:
             stats["intra_episode_cache_hit_pct"] = (
                 stats["intra_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
@@ -524,6 +572,55 @@ class OracleExperimentManager:
                 stats["cross_episode_cache_hit_cnt"] / stats["cache_hit_cnt"]
             )
         return stats
+
+    @staticmethod
+    def _merge_query_stats(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+        for key in ("requested_ids", "returned_ids", "failed_ids"):
+            dst[key].extend(src.get(key, []))
+        for key in (
+            "query_cnt",
+            "success_cnt",
+            "fail_cnt",
+            "provider_fail_cnt",
+            "resolve_fail_cnt",
+            "cache_hit_cnt",
+            "intra_episode_cache_hit_cnt",
+            "cross_episode_cache_hit_cnt",
+            "latency_ms_sum",
+            "provider_miss_cnt",
+            "provider_latency_ms_sum",
+            "batched_provider_call_cnt",
+            "provider_batch_size_sum",
+            "skipped_cnt",
+        ):
+            dst[key] += src.get(key, 0)
+
+    def _query_specs_serial(
+        self,
+        specs: List[OracleQuerySpec],
+    ) -> List[OracleFeatureResult]:
+        results: List[OracleFeatureResult] = []
+        for spec in specs:
+            try:
+                results.append(self.provider.query(spec))
+            except Exception:
+                results.append(
+                    OracleFeatureResult(
+                        ghost_vp_id=spec.ghost_vp_id,
+                        ok=False,
+                        reason="provider_query_failed",
+                        embed=None,
+                        embed_dtype=None,
+                        embed_norm=None,
+                        used_pos=None,
+                        used_heading_rad=None,
+                        cache_hit=False,
+                        cache_key=None,
+                        latency_ms=0.0,
+                        meta=None,
+                    )
+                )
+        return results
 
     def query_ghosts(
         self,
@@ -538,199 +635,366 @@ class OracleExperimentManager:
         candidate_ghost_ids: List[str],
         current_step: Optional[int] = None,
     ) -> Dict[str, OracleFeatureResult]:
-        allow_mode = (
-            (mode == "eval" and getattr(self.config_oracle, "enable_in_eval", True))
-            or (mode == "train" and getattr(self.config_oracle, "enable_in_train", False))
+        responses = self.query_ghosts_batch(
+            mode=mode,
+            requests=[
+                {
+                    "env_idx": int(active_env_index),
+                    "slot_id": int(slot_id),
+                    "original_env_index": int(original_env_index),
+                    "stepk": int(stepk),
+                    "current_step": current_step,
+                    "gmap": gmap,
+                    "current_episode": current_episode,
+                    "candidate_ghost_ids": list(candidate_ghost_ids),
+                }
+            ],
         )
-        if (not self.config_oracle.enable) or (not allow_mode):
+        if len(responses) == 0:
             empty_stats = self._init_query_stats(candidate_ghost_ids)
             self._slot_last_query_stats[int(slot_id)] = dict(empty_stats)
             self._last_query_stats = dict(empty_stats)
             return {}
+        self._slot_last_query_stats[int(slot_id)] = dict(self._last_query_stats)
+        return dict(responses[0]["results"])
 
-        step_id = stepk if current_step is None else current_step
-        ep = current_episode
-        results: Dict[str, OracleFeatureResult] = {}
-        episode_instance_seq = self._assert_slot_binding(
-            slot_id=slot_id,
-            active_env_index=active_env_index,
-            current_episode=current_episode,
+    def query_ghosts_batch(
+        self,
+        *,
+        mode: str,
+        requests: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        allow_mode = (
+            (mode == "eval" and getattr(self.config_oracle, "enable_in_eval", True))
+            or (mode == "train" and getattr(self.config_oracle, "enable_in_train", False))
         )
-        stats = self._init_query_stats(candidate_ghost_ids)
+        responses: List[Dict[str, Any]] = []
+        aggregate_stats = self._init_query_stats()
+        global_batched_provider_call_cnt = 0
+        global_provider_batch_size_sum = 0
+        global_provider_latency_ms_sum = 0.0
 
-        for ghost_vp_id in candidate_ghost_ids:
-            if ghost_vp_id not in gmap.ghost_mean_pos:
-                stats["failed_ids"].append(ghost_vp_id)
-                continue
-            if (not gmap.has_real_pos) or (ghost_vp_id not in gmap.ghost_real_pos):
-                stats["failed_ids"].append(ghost_vp_id)
-                continue
+        if (not self.config_oracle.enable) or (not allow_mode):
+            for request in requests:
+                stats = self._init_query_stats(
+                    request.get("candidate_ghost_ids", [])
+                )
+                finalized = self._finalize_query_stats(stats)
+                slot_id = int(request["slot_id"])
+                self._slot_last_query_stats[slot_id] = dict(finalized)
+                self._merge_query_stats(aggregate_stats, finalized)
+                responses.append(
+                    {
+                        "env_idx": int(request["env_idx"]),
+                        "slot_id": slot_id,
+                        "results": {},
+                        "stats": finalized,
+                        "trace_items": [],
+                        "provider_batch_participated": False,
+                        "provider_batch_request_size": 0,
+                    }
+                )
+            self._last_query_stats = self._finalize_query_stats(aggregate_stats)
+            return responses
 
-            real_pos_list = gmap.ghost_real_pos[ghost_vp_id]
-            if len(real_pos_list) == 0:
-                stats["failed_ids"].append(ghost_vp_id)
-                continue
+        pending_items: List[Dict[str, Any]] = []
+        response_pending_counts = [0] * len(requests)
 
-            real_pos_mean = tuple(np.mean(real_pos_list, axis=0).tolist())
-            target, resolve_reason = self._resolve_query_target(
-                active_env_index,
-                gmap,
-                ghost_vp_id,
-                real_pos_mean,
+        for request_idx, request in enumerate(requests):
+            env_idx = int(request["env_idx"])
+            slot_id = int(request["slot_id"])
+            original_env_index = int(request["original_env_index"])
+            stepk = int(request["stepk"])
+            current_step = request.get("current_step")
+            step_id = stepk if current_step is None else int(current_step)
+            gmap = request["gmap"]
+            current_episode = request["current_episode"]
+            candidate_ghost_ids = list(request.get("candidate_ghost_ids", []))
+            ep = current_episode
+            episode_instance_seq = self._assert_slot_binding(
+                slot_id=slot_id,
+                active_env_index=env_idx,
+                current_episode=current_episode,
             )
-            if target is None:
-                stats["fail_cnt"] += 1
-                stats["resolve_fail_cnt"] += 1
-                stats["failed_ids"].append(ghost_vp_id)
-                self._trace_query_event(
-                    active_env_index=active_env_index,
-                    slot_id=slot_id,
-                    episode_instance_seq=episode_instance_seq,
+            stats = self._init_query_stats(candidate_ghost_ids)
+            trace_items: List[Dict[str, Any]] = []
+            results: Dict[str, OracleFeatureResult] = {}
+
+            responses.append(
+                {
+                    "env_idx": env_idx,
+                    "slot_id": slot_id,
+                    "results": results,
+                    "stats": stats,
+                    "trace_items": trace_items,
+                    "provider_batch_participated": False,
+                    "provider_batch_request_size": 0,
+                }
+            )
+
+            for ghost_vp_id in candidate_ghost_ids:
+                if ghost_vp_id not in gmap.ghost_mean_pos:
+                    stats["fail_cnt"] += 1
+                    stats["resolve_fail_cnt"] += 1
+                    stats["failed_ids"].append(ghost_vp_id)
+                    trace_record = self._trace_query_event(
+                        active_env_index=env_idx,
+                        slot_id=slot_id,
+                        episode_instance_seq=episode_instance_seq,
+                        scene_id=ep.scene_id,
+                        episode_id=ep.episode_id,
+                        stepk=step_id,
+                        original_env_index=original_env_index,
+                        ghost_vp_id=ghost_vp_id,
+                        chosen_front_vp_id=None,
+                        source_member_index=None,
+                        source_member_real_pos=None,
+                        pos_strategy=self.config_oracle.query_pos_strategy,
+                        heading_strategy=self.config_oracle.query_heading_strategy,
+                        pipeline=self.config_oracle.query_pipeline,
+                        query_pos=None,
+                        query_heading_rad=None,
+                        ok=False,
+                        reason="resolve_missing_ghost_mean_pos",
+                        cache_hit=False,
+                        used_pos=None,
+                        used_heading_rad=None,
+                        embed_norm=None,
+                    )
+                    if trace_record is not None:
+                        trace_items.append(trace_record)
+                    continue
+                if (not gmap.has_real_pos) or (ghost_vp_id not in gmap.ghost_real_pos):
+                    stats["fail_cnt"] += 1
+                    stats["resolve_fail_cnt"] += 1
+                    stats["failed_ids"].append(ghost_vp_id)
+                    trace_record = self._trace_query_event(
+                        active_env_index=env_idx,
+                        slot_id=slot_id,
+                        episode_instance_seq=episode_instance_seq,
+                        scene_id=ep.scene_id,
+                        episode_id=ep.episode_id,
+                        stepk=step_id,
+                        original_env_index=original_env_index,
+                        ghost_vp_id=ghost_vp_id,
+                        chosen_front_vp_id=None,
+                        source_member_index=None,
+                        source_member_real_pos=None,
+                        pos_strategy=self.config_oracle.query_pos_strategy,
+                        heading_strategy=self.config_oracle.query_heading_strategy,
+                        pipeline=self.config_oracle.query_pipeline,
+                        query_pos=None,
+                        query_heading_rad=None,
+                        ok=False,
+                        reason="resolve_missing_ghost_real_pos",
+                        cache_hit=False,
+                        used_pos=None,
+                        used_heading_rad=None,
+                        embed_norm=None,
+                    )
+                    if trace_record is not None:
+                        trace_items.append(trace_record)
+                    continue
+
+                real_pos_list = gmap.ghost_real_pos[ghost_vp_id]
+                if len(real_pos_list) == 0:
+                    stats["fail_cnt"] += 1
+                    stats["resolve_fail_cnt"] += 1
+                    stats["failed_ids"].append(ghost_vp_id)
+                    trace_record = self._trace_query_event(
+                        active_env_index=env_idx,
+                        slot_id=slot_id,
+                        episode_instance_seq=episode_instance_seq,
+                        scene_id=ep.scene_id,
+                        episode_id=ep.episode_id,
+                        stepk=step_id,
+                        original_env_index=original_env_index,
+                        ghost_vp_id=ghost_vp_id,
+                        chosen_front_vp_id=None,
+                        source_member_index=None,
+                        source_member_real_pos=None,
+                        pos_strategy=self.config_oracle.query_pos_strategy,
+                        heading_strategy=self.config_oracle.query_heading_strategy,
+                        pipeline=self.config_oracle.query_pipeline,
+                        query_pos=None,
+                        query_heading_rad=None,
+                        ok=False,
+                        reason="resolve_empty_ghost_real_pos",
+                        cache_hit=False,
+                        used_pos=None,
+                        used_heading_rad=None,
+                        embed_norm=None,
+                    )
+                    if trace_record is not None:
+                        trace_items.append(trace_record)
+                    continue
+
+                real_pos_mean = tuple(np.mean(real_pos_list, axis=0).tolist())
+                target, resolve_reason = self._resolve_query_target(
+                    env_idx,
+                    gmap,
+                    ghost_vp_id,
+                    real_pos_mean,
+                )
+                if target is None:
+                    stats["fail_cnt"] += 1
+                    stats["resolve_fail_cnt"] += 1
+                    stats["failed_ids"].append(ghost_vp_id)
+                    trace_record = self._trace_query_event(
+                        active_env_index=env_idx,
+                        slot_id=slot_id,
+                        episode_instance_seq=episode_instance_seq,
+                        scene_id=ep.scene_id,
+                        episode_id=ep.episode_id,
+                        stepk=step_id,
+                        original_env_index=original_env_index,
+                        ghost_vp_id=ghost_vp_id,
+                        chosen_front_vp_id=None,
+                        source_member_index=None,
+                        source_member_real_pos=None,
+                        pos_strategy=self.config_oracle.query_pos_strategy,
+                        heading_strategy=self.config_oracle.query_heading_strategy,
+                        pipeline=self.config_oracle.query_pipeline,
+                        query_pos=None,
+                        query_heading_rad=None,
+                        ok=False,
+                        reason=resolve_reason,
+                        cache_hit=False,
+                        used_pos=None,
+                        used_heading_rad=None,
+                        embed_norm=None,
+                    )
+                    if trace_record is not None:
+                        trace_items.append(trace_record)
+                    continue
+
+                query_pos = target["query_pos"]
+                query_pos_strategy = target["query_pos_strategy"]
+                source_member_index = target["source_member_index"]
+                source_member_real_pos = target["source_member_real_pos"]
+                chosen_front_vp_id = target["source_front_vp_id"]
+
+                if not self._should_query_ghost(
+                    gmap=gmap,
+                    ghost_vp_id=ghost_vp_id,
+                    real_pos_count=len(real_pos_list),
+                    real_pos_mean=real_pos_mean,
+                    source_member_index=source_member_index,
+                    source_front_vp_id=chosen_front_vp_id,
+                ):
+                    stats["skipped_cnt"] += 1
+                    continue
+
+                front_vp_ids = list(gmap.ghost_fronts[ghost_vp_id])
+                front_pos = gmap.node_pos[chosen_front_vp_id]
+                query_heading_strategy = str(
+                    getattr(
+                        self.config_oracle,
+                        "query_heading_strategy",
+                        "face_frontier",
+                    )
+                ).lower()
+                query_pipeline = str(
+                    getattr(
+                        self.config_oracle,
+                        "query_pipeline",
+                        "future_node_avg_pano",
+                    )
+                ).lower()
+                query_heading_rad = self._resolve_query_heading(
+                    query_pos=query_pos,
+                    front_pos=front_pos,
+                )
+
+                spec = OracleQuerySpec(
+                    run_id=self.run_id,
+                    split=self.split,
                     scene_id=ep.scene_id,
                     episode_id=ep.episode_id,
-                    stepk=step_id,
+                    active_env_index=env_idx,
                     original_env_index=original_env_index,
+                    slot_id=slot_id,
+                    episode_instance_seq=episode_instance_seq,
+                    stepk=step_id,
                     ghost_vp_id=ghost_vp_id,
-                    chosen_front_vp_id=None,
-                    source_member_index=None,
-                    source_member_real_pos=None,
-                    pos_strategy=self.config_oracle.query_pos_strategy,
-                    heading_strategy=self.config_oracle.query_heading_strategy,
-                    pipeline=self.config_oracle.query_pipeline,
-                    query_pos=None,
-                    query_heading_rad=None,
-                    ok=False,
-                    reason=resolve_reason,
-                    cache_hit=False,
-                    used_pos=None,
-                    used_heading_rad=None,
-                    embed_norm=None,
-                )
-                continue
-
-            query_pos = target["query_pos"]
-            query_pos_strategy = target["query_pos_strategy"]
-            source_member_index = target["source_member_index"]
-            source_member_real_pos = target["source_member_real_pos"]
-            chosen_front_vp_id = target["source_front_vp_id"]
-
-            if not self._should_query_ghost(
-                gmap=gmap,
-                ghost_vp_id=ghost_vp_id,
-                real_pos_count=len(real_pos_list),
-                real_pos_mean=real_pos_mean,
-                source_member_index=source_member_index,
-                source_front_vp_id=chosen_front_vp_id,
-            ):
-                stats["skipped_cnt"] += 1
-                continue
-
-            front_vp_ids = list(gmap.ghost_fronts[ghost_vp_id])
-            front_pos = gmap.node_pos[chosen_front_vp_id]
-            query_heading_strategy = str(
-                getattr(
-                    self.config_oracle,
-                    "query_heading_strategy",
-                    "face_frontier",
-                )
-            ).lower()
-            query_pipeline = str(
-                getattr(
-                    self.config_oracle,
-                    "query_pipeline",
-                    "future_node_avg_pano",
-                )
-            ).lower()
-            query_heading_rad = self._resolve_query_heading(
-                query_pos=query_pos,
-                front_pos=front_pos,
-            )
-
-            spec = OracleQuerySpec(
-                run_id=self.run_id,
-                split=self.split,
-                scene_id=ep.scene_id,
-                episode_id=ep.episode_id,
-                active_env_index=active_env_index,
-                original_env_index=original_env_index,
-                slot_id=slot_id,
-                episode_instance_seq=episode_instance_seq,
-                stepk=step_id,
-                ghost_vp_id=ghost_vp_id,
-                front_vp_ids=front_vp_ids,
-                chosen_front_vp_id=chosen_front_vp_id,
-                source_member_index=source_member_index,
-                source_member_real_pos=source_member_real_pos,
-                query_pos=query_pos,
-                query_heading_rad=float(query_heading_rad),
-                pos_strategy=query_pos_strategy,
-                heading_strategy=query_heading_strategy,
-                pipeline=query_pipeline,
-                real_pos_count=len(real_pos_list),
-                real_pos_mean=real_pos_mean,
-            )
-
-            cache_entry = None
-            if self.cache is not None:
-                cache_entry = self.cache.lookup(
-                    ep.scene_id,
-                    query_pos,
-                    query_heading_rad,
+                    front_vp_ids=front_vp_ids,
+                    chosen_front_vp_id=chosen_front_vp_id,
+                    source_member_index=source_member_index,
+                    source_member_real_pos=source_member_real_pos,
+                    query_pos=query_pos,
+                    query_heading_rad=float(query_heading_rad),
+                    pos_strategy=query_pos_strategy,
+                    heading_strategy=query_heading_strategy,
+                    pipeline=query_pipeline,
+                    real_pos_count=len(real_pos_list),
+                    real_pos_mean=real_pos_mean,
                 )
 
-            if cache_entry is not None:
-                cached_embed = cache_entry.embed.detach().clone()
-                cache_meta = cache_entry.meta
-                source_episode_id = cache_meta.get("source_episode_id")
-                result = OracleFeatureResult(
-                    ghost_vp_id=ghost_vp_id,
-                    ok=True,
-                    reason=None,
-                    embed=cached_embed,
-                    embed_dtype=self._dtype_to_name(cached_embed.dtype),
-                    embed_norm=float(cached_embed.norm().item()),
-                    used_pos=tuple(cache_meta.get("used_pos", cache_entry.pos)),
-                    used_heading_rad=float(
-                        cache_entry.heading_rad
-                        if cache_meta.get("used_heading_rad") is None
-                        else cache_meta["used_heading_rad"]
-                    ),
-                    cache_hit=True,
-                    cache_key=self._make_cache_key(
+                cache_entry = None
+                if self.cache is not None:
+                    cache_entry = self.cache.lookup(
                         ep.scene_id,
-                        cache_entry.pos,
-                        cache_entry.heading_rad,
-                    ),
-                    latency_ms=0.0,
-                    meta={
-                        "stepk": step_id,
-                        "used_pos": tuple(
-                            cache_meta.get("used_pos", cache_entry.pos)
-                        ),
-                        "used_heading_rad": float(
+                        query_pos,
+                        query_heading_rad,
+                    )
+
+                if cache_entry is not None:
+                    cached_embed = cache_entry.embed.detach().clone()
+                    cache_meta = cache_entry.meta
+                    source_episode_id = cache_meta.get("source_episode_id")
+                    result = OracleFeatureResult(
+                        ghost_vp_id=ghost_vp_id,
+                        ok=True,
+                        reason=None,
+                        embed=cached_embed,
+                        embed_dtype=self._dtype_to_name(cached_embed.dtype),
+                        embed_norm=float(cached_embed.norm().item()),
+                        used_pos=tuple(cache_meta.get("used_pos", cache_entry.pos)),
+                        used_heading_rad=float(
                             cache_entry.heading_rad
                             if cache_meta.get("used_heading_rad") is None
                             else cache_meta["used_heading_rad"]
                         ),
-                        "real_pos_count": len(real_pos_list),
-                        "real_pos_mean": real_pos_mean,
-                        "query_source_index": source_member_index,
-                        "query_source_real_pos": source_member_real_pos,
-                        "query_source_front_vp_id": chosen_front_vp_id,
-                        "query_pos_strategy": query_pos_strategy,
-                    },
-                )
-                is_intra_episode_cache_hit = (source_episode_id == ep.episode_id)
-            else:
-                is_intra_episode_cache_hit = False
-                try:
-                    result = self.provider.query(spec=spec)
-                except Exception:
-                    stats["fail_cnt"] += 1
-                    stats["provider_fail_cnt"] += 1
-                    stats["failed_ids"].append(ghost_vp_id)
-                    self._trace_query_event(
-                        active_env_index=active_env_index,
+                        cache_hit=True,
+                        cache_key=self._make_cache_key(
+                            ep.scene_id,
+                            cache_entry.pos,
+                            cache_entry.heading_rad,
+                        ),
+                        latency_ms=0.0,
+                        meta={
+                            "stepk": step_id,
+                            "used_pos": tuple(
+                                cache_meta.get("used_pos", cache_entry.pos)
+                            ),
+                            "used_heading_rad": float(
+                                cache_entry.heading_rad
+                                if cache_meta.get("used_heading_rad") is None
+                                else cache_meta["used_heading_rad"]
+                            ),
+                            "real_pos_count": len(real_pos_list),
+                            "real_pos_mean": real_pos_mean,
+                            "query_source_index": source_member_index,
+                            "query_source_real_pos": source_member_real_pos,
+                            "query_source_front_vp_id": chosen_front_vp_id,
+                            "query_pos_strategy": query_pos_strategy,
+                        },
+                    )
+                    is_intra_episode_cache_hit = (source_episode_id == ep.episode_id)
+
+                    stats["query_cnt"] += 1
+                    stats["latency_ms_sum"] += result.latency_ms
+                    stats["cache_hit_cnt"] += 1
+                    if is_intra_episode_cache_hit:
+                        stats["intra_episode_cache_hit_cnt"] += 1
+                    else:
+                        stats["cross_episode_cache_hit_cnt"] += 1
+                    stats["success_cnt"] += 1
+                    stats["returned_ids"].append(ghost_vp_id)
+                    results[ghost_vp_id] = result
+
+                    trace_record = self._trace_query_event(
+                        active_env_index=env_idx,
                         slot_id=slot_id,
                         episode_instance_seq=episode_instance_seq,
                         scene_id=ep.scene_id,
@@ -746,89 +1010,226 @@ class OracleExperimentManager:
                         pipeline=query_pipeline,
                         query_pos=query_pos,
                         query_heading_rad=query_heading_rad,
-                        ok=False,
-                        reason="provider_query_failed",
-                        cache_hit=False,
-                        used_pos=None,
-                        used_heading_rad=None,
-                        embed_norm=None,
+                        ok=True,
+                        reason=None,
+                        cache_hit=True,
+                        used_pos=result.used_pos,
+                        used_heading_rad=result.used_heading_rad,
+                        embed_norm=result.embed_norm,
                     )
+                    if trace_record is not None:
+                        trace_items.append(trace_record)
                     continue
 
-                result.meta = {
-                    "stepk": step_id,
-                    "used_pos": result.used_pos,
-                    "used_heading_rad": result.used_heading_rad,
-                    "real_pos_count": len(real_pos_list),
-                    "real_pos_mean": real_pos_mean,
-                    "query_source_index": source_member_index,
-                    "query_source_real_pos": source_member_real_pos,
-                    "query_source_front_vp_id": chosen_front_vp_id,
-                    "query_pos_strategy": query_pos_strategy,
-                }
-                if self.cache is not None and result.ok and result.embed is not None:
-                    self.cache.insert(
-                        ep.scene_id,
-                        query_pos,
-                        query_heading_rad,
-                        result.embed,
-                        meta={
-                            "used_pos": result.used_pos,
-                            "used_heading_rad": result.used_heading_rad,
-                            "source_episode_id": ep.episode_id,
-                            "query_source_index": source_member_index,
-                            "query_source_real_pos": source_member_real_pos,
-                            "query_source_front_vp_id": chosen_front_vp_id,
-                            "query_pos_strategy": query_pos_strategy,
-                        },
+                response_pending_counts[request_idx] += 1
+                pending_items.append(
+                    {
+                        "request_idx": request_idx,
+                        "spec": spec,
+                        "gmap": gmap,
+                        "episode": ep,
+                        "step_id": step_id,
+                        "query_pos": query_pos,
+                        "query_heading_rad": query_heading_rad,
+                        "query_pos_strategy": query_pos_strategy,
+                        "query_heading_strategy": query_heading_strategy,
+                        "source_member_index": source_member_index,
+                        "source_member_real_pos": source_member_real_pos,
+                        "chosen_front_vp_id": chosen_front_vp_id,
+                        "real_pos_list_len": len(real_pos_list),
+                        "real_pos_mean": real_pos_mean,
+                    }
+                )
+
+        provider_results: List[OracleFeatureResult] = []
+        used_batched_provider = False
+        if len(pending_items) > 0:
+            pending_specs = [item["spec"] for item in pending_items]
+            batch_query_enable = bool(
+                getattr(self.config_oracle, "batch_query_enable", True)
+            )
+            allow_manager_serial_fallback = bool(
+                getattr(
+                    self.config_oracle,
+                    "batch_query_fallback_to_serial",
+                    True,
+                )
+            )
+            provider_t0 = time.perf_counter()
+            if batch_query_enable:
+                try:
+                    provider_results = self.provider.query_many(
+                        specs=pending_specs,
+                        micro_batch_size=int(
+                            getattr(
+                                self.config_oracle,
+                                "batch_query_micro_size",
+                                -1,
+                            )
+                        ),
+                    )
+                    used_batched_provider = True
+                    global_batched_provider_call_cnt = 1
+                    global_provider_batch_size_sum = len(pending_items)
+                except Exception:
+                    used_batched_provider = False
+                    if allow_manager_serial_fallback:
+                        provider_results = self._query_specs_serial(pending_specs)
+                    else:
+                        provider_results = [
+                            OracleFeatureResult(
+                                ghost_vp_id=spec.ghost_vp_id,
+                                ok=False,
+                                reason="provider_query_failed",
+                                embed=None,
+                                embed_dtype=None,
+                                embed_norm=None,
+                                used_pos=None,
+                                used_heading_rad=None,
+                                cache_hit=False,
+                                cache_key=None,
+                                latency_ms=0.0,
+                                meta=None,
+                            )
+                            for spec in pending_specs
+                        ]
+            else:
+                provider_results = self._query_specs_serial(pending_specs)
+            provider_elapsed_ms = (time.perf_counter() - provider_t0) * 1000.0
+            if used_batched_provider:
+                global_provider_latency_ms_sum = provider_elapsed_ms
+
+            if len(provider_results) != len(pending_items):
+                provider_results = provider_results[: len(pending_items)]
+                while len(provider_results) < len(pending_items):
+                    spec = pending_items[len(provider_results)]["spec"]
+                    provider_results.append(
+                        OracleFeatureResult(
+                            ghost_vp_id=spec.ghost_vp_id,
+                            ok=False,
+                            reason="provider_query_failed",
+                            embed=None,
+                            embed_dtype=None,
+                            embed_norm=None,
+                            used_pos=None,
+                            used_heading_rad=None,
+                            cache_hit=False,
+                            cache_key=None,
+                            latency_ms=0.0,
+                            meta=None,
+                        )
                     )
 
-            stats["query_cnt"] += 1
-            stats["latency_ms_sum"] += result.latency_ms
-            stats["cache_hit_cnt"] += int(result.cache_hit)
-            if result.cache_hit:
-                if is_intra_episode_cache_hit:
-                    stats["intra_episode_cache_hit_cnt"] += 1
-                else:
-                    stats["cross_episode_cache_hit_cnt"] += 1
-
-            if result.ok and result.embed is not None:
-                stats["success_cnt"] += 1
-                stats["returned_ids"].append(ghost_vp_id)
-                results[ghost_vp_id] = result
-            else:
-                stats["fail_cnt"] += 1
-                stats["failed_ids"].append(ghost_vp_id)
-
-            self._trace_query_event(
-                active_env_index=active_env_index,
-                slot_id=slot_id,
-                episode_instance_seq=episode_instance_seq,
-                scene_id=ep.scene_id,
-                episode_id=ep.episode_id,
-                stepk=step_id,
-                original_env_index=original_env_index,
-                ghost_vp_id=ghost_vp_id,
-                chosen_front_vp_id=chosen_front_vp_id,
-                source_member_index=source_member_index,
-                source_member_real_pos=source_member_real_pos,
-                pos_strategy=query_pos_strategy,
-                heading_strategy=query_heading_strategy,
-                pipeline=query_pipeline,
-                query_pos=query_pos,
-                query_heading_rad=query_heading_rad,
-                ok=result.ok,
-                reason=result.reason,
-                cache_hit=result.cache_hit,
-                used_pos=result.used_pos,
-                used_heading_rad=result.used_heading_rad,
-                embed_norm=result.embed_norm,
+            provider_latency_share = (
+                provider_elapsed_ms / len(pending_items)
+                if used_batched_provider and len(pending_items) > 0
+                else 0.0
             )
 
-        finalized = self._finalize_query_stats(stats)
-        self._slot_last_query_stats[int(slot_id)] = dict(finalized)
-        self._last_query_stats = dict(finalized)
-        return results
+            for pending_item, result in zip(pending_items, provider_results):
+                response = responses[pending_item["request_idx"]]
+                stats = response["stats"]
+                trace_items = response["trace_items"]
+                results = response["results"]
+                ep = pending_item["episode"]
+                spec = pending_item["spec"]
+
+                if result.meta is None:
+                    result.meta = {}
+                result.meta.update(
+                    {
+                        "stepk": pending_item["step_id"],
+                        "used_pos": result.used_pos,
+                        "used_heading_rad": result.used_heading_rad,
+                        "real_pos_count": pending_item["real_pos_list_len"],
+                        "real_pos_mean": pending_item["real_pos_mean"],
+                        "query_source_index": pending_item["source_member_index"],
+                        "query_source_real_pos": pending_item["source_member_real_pos"],
+                        "query_source_front_vp_id": pending_item["chosen_front_vp_id"],
+                        "query_pos_strategy": pending_item["query_pos_strategy"],
+                    }
+                )
+
+                stats["query_cnt"] += 1
+                stats["provider_miss_cnt"] += 1
+                stats["latency_ms_sum"] += float(result.latency_ms)
+                stats["provider_latency_ms_sum"] += float(
+                    provider_latency_share if used_batched_provider else result.latency_ms
+                )
+
+                if result.ok and result.embed is not None:
+                    stats["success_cnt"] += 1
+                    stats["returned_ids"].append(spec.ghost_vp_id)
+                    results[spec.ghost_vp_id] = result
+                    if self.cache is not None:
+                        self.cache.insert(
+                            ep.scene_id,
+                            pending_item["query_pos"],
+                            pending_item["query_heading_rad"],
+                            result.embed,
+                            meta={
+                                "used_pos": result.used_pos,
+                                "used_heading_rad": result.used_heading_rad,
+                                "source_episode_id": ep.episode_id,
+                                "query_source_index": pending_item["source_member_index"],
+                                "query_source_real_pos": pending_item["source_member_real_pos"],
+                                "query_source_front_vp_id": pending_item["chosen_front_vp_id"],
+                                "query_pos_strategy": pending_item["query_pos_strategy"],
+                            },
+                        )
+                else:
+                    stats["fail_cnt"] += 1
+                    stats["provider_fail_cnt"] += 1
+                    stats["failed_ids"].append(spec.ghost_vp_id)
+
+                trace_record = self._trace_query_event(
+                    active_env_index=spec.active_env_index,
+                    slot_id=spec.slot_id,
+                    episode_instance_seq=spec.episode_instance_seq,
+                    scene_id=spec.scene_id,
+                    episode_id=spec.episode_id,
+                    stepk=spec.stepk,
+                    original_env_index=spec.original_env_index,
+                    ghost_vp_id=spec.ghost_vp_id,
+                    chosen_front_vp_id=pending_item["chosen_front_vp_id"],
+                    source_member_index=pending_item["source_member_index"],
+                    source_member_real_pos=pending_item["source_member_real_pos"],
+                    pos_strategy=pending_item["query_pos_strategy"],
+                    heading_strategy=pending_item["query_heading_strategy"],
+                    pipeline=spec.pipeline,
+                    query_pos=pending_item["query_pos"],
+                    query_heading_rad=pending_item["query_heading_rad"],
+                    ok=result.ok,
+                    reason=result.reason,
+                    cache_hit=False,
+                    used_pos=result.used_pos,
+                    used_heading_rad=result.used_heading_rad,
+                    embed_norm=result.embed_norm,
+                )
+                if trace_record is not None:
+                    trace_items.append(trace_record)
+
+        for request_idx, response in enumerate(responses):
+            if used_batched_provider and response_pending_counts[request_idx] > 0:
+                response["provider_batch_participated"] = True
+                response["provider_batch_request_size"] = int(
+                    response_pending_counts[request_idx]
+                )
+                response["stats"]["batched_provider_call_cnt"] = 1
+                response["stats"]["provider_batch_size_sum"] = int(
+                    response_pending_counts[request_idx]
+                )
+            finalized = self._finalize_query_stats(response["stats"])
+            response["stats"] = finalized
+            self._slot_last_query_stats[int(response["slot_id"])] = dict(finalized)
+            self._merge_query_stats(aggregate_stats, finalized)
+
+        if used_batched_provider:
+            aggregate_stats["batched_provider_call_cnt"] = global_batched_provider_call_cnt
+            aggregate_stats["provider_batch_size_sum"] = global_provider_batch_size_sum
+            aggregate_stats["provider_latency_ms_sum"] = global_provider_latency_ms_sum
+        self._last_query_stats = self._finalize_query_stats(aggregate_stats)
+        return responses
 
     def step_update_oracle(self,
                             mode: str,                      # "train"/"eval"/"infer"
@@ -860,47 +1261,34 @@ class OracleExperimentManager:
 
 
         else:
-            stats = self._init_query_stats()
             if slot_ids is None:
                 raise RuntimeError(
                     "step_update_oracle requires explicit slot_ids under "
                     "stable-slot semantics"
                 )
+            requests = []
             for active_i, (gmap, ep) in enumerate(zip(gmaps, current_episodes)):
-                original_env_index = env_indices[active_i]
-                slot_id = slot_ids[active_i]
-                candidate_ghost_ids = list(gmap.ghost_mean_pos.keys())
-                oracle_results = self.query_ghosts(
-                    mode=mode,
-                    stepk=stepk,
-                    gmap=gmap,
-                    current_episode=ep,
-                    active_env_index=active_i,
-                    original_env_index=original_env_index,
-                    slot_id=slot_id,
-                    candidate_ghost_ids=candidate_ghost_ids,
-                    current_step=stepk,
+                requests.append(
+                    {
+                        "env_idx": int(active_i),
+                        "slot_id": int(slot_ids[active_i]),
+                        "original_env_index": int(env_indices[active_i]),
+                        "stepk": int(stepk),
+                        "current_step": int(stepk),
+                        "gmap": gmap,
+                        "current_episode": ep,
+                        "candidate_ghost_ids": list(gmap.ghost_mean_pos.keys()),
+                    }
                 )
+            responses = self.query_ghosts_batch(mode=mode, requests=requests)
+            for active_i, response in enumerate(responses):
+                gmap = gmaps[active_i]
+                candidate_ghost_ids = requests[active_i]["candidate_ghost_ids"]
+                oracle_results = response["results"]
                 gmap.apply_oracle_embeds(
                     ghost_embeds=oracle_results,
                     allowed_ghost_ids=candidate_ghost_ids,
                     step_id=stepk,
                     strict_scope=False,
                 )
-                env_stats = self.get_last_query_stats()
-                for key in (
-                    "query_cnt",
-                    "success_cnt",
-                    "fail_cnt",
-                    "provider_fail_cnt",
-                    "resolve_fail_cnt",
-                    "cache_hit_cnt",
-                    "intra_episode_cache_hit_cnt",
-                    "cross_episode_cache_hit_cnt",
-                    "latency_ms_sum",
-                    "skipped_cnt",
-                ):
-                    stats[key] += env_stats.get(key, 0)
-
-            self._last_query_stats = self._finalize_query_stats(stats)
             return dict(self._last_query_stats)

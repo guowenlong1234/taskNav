@@ -1,3 +1,5 @@
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
 import numpy as np
 from abc import abstractmethod,ABC
 import torch
@@ -9,7 +11,7 @@ import time
 from vlnce_baselines.common.ops import pad_tensors_wgrad
 from torch.nn.utils.rnn import pad_sequence
 from vlnce_baselines.common.utils import extract_instruction_tokens
-from .types import OracleQuerySpec,OracleFeatureResult,TrajectoryObservationBufferItem
+from .types import OracleQuerySpec,OracleFeatureResult
 class OracleProvider(ABC):
     @abstractmethod
     def query(self,spec:OracleQuerySpec) ->OracleFeatureResult:
@@ -20,6 +22,13 @@ class OracleProvider(ABC):
         '''
 
         raise NotImplementedError
+
+    def query_many(
+        self,
+        specs: List[OracleQuerySpec],
+        micro_batch_size: int = -1,
+    ) -> List[OracleFeatureResult]:
+        return [self.query(spec) for spec in specs]
 
 class SimulatorPeekOracleProvider(OracleProvider):
     def __init__(
@@ -32,6 +41,7 @@ class SimulatorPeekOracleProvider(OracleProvider):
             INSTRUCTION_SENSOR_UUID,
             task_type,
             instr_max_len,
+            oracle_config=None,
                  ):
         self.envs = envs
         self.obs_transforms = obs_transforms
@@ -41,10 +51,54 @@ class SimulatorPeekOracleProvider(OracleProvider):
         self.task_type = task_type  
         self.instr_max_len = instr_max_len  #self.config.IL.max_text_len
         self.waypoint_predictor = waypoint_predictor
+        self.oracle_config = oracle_config
         
         for param in self.waypoint_predictor.parameters():
             param.requires_grad_(False)
         self.waypoint_predictor.to(self.device)
+
+    @staticmethod
+    def _failed_result(
+        spec: OracleQuerySpec,
+        reason: str,
+        latency_ms: float = 0.0,
+    ) -> OracleFeatureResult:
+        return OracleFeatureResult(
+            ghost_vp_id=spec.ghost_vp_id,
+            ok=False,
+            reason=reason,
+            embed=None,
+            embed_dtype=None,
+            embed_norm=None,
+            used_pos=None,
+            used_heading_rad=None,
+            cache_hit=False,
+            cache_key=None,
+            latency_ms=float(latency_ms),
+            meta=None,
+        )
+
+    def _resolve_micro_batch_size(
+        self,
+        valid_obs_cnt: int,
+        micro_batch_size: int,
+    ) -> int:
+        if valid_obs_cnt <= 0:
+            return 1
+
+        max_micro = int(
+            getattr(self.oracle_config, "batch_query_max_micro_size", 32)
+        )
+        max_micro = max(1, max_micro)
+        if int(micro_batch_size) > 0:
+            return max(1, min(int(micro_batch_size), valid_obs_cnt, max_micro))
+
+        adaptive = bool(
+            getattr(self.oracle_config, "batch_query_adaptive", True)
+        )
+        if adaptive:
+            return max(1, min(valid_obs_cnt, max_micro))
+        return max(1, min(valid_obs_cnt, max_micro))
 
     def query(self,spec):
         t0 = time.perf_counter()
@@ -153,6 +207,204 @@ class SimulatorPeekOracleProvider(OracleProvider):
                     self.policy.net.eval()
             self.waypoint_predictor.eval()
 
+    def query_many(
+        self,
+        specs: List[OracleQuerySpec],
+        micro_batch_size: int = -1,
+    ) -> List[OracleFeatureResult]:
+        if len(specs) == 0:
+            return []
+
+        t0 = time.perf_counter()
+        policy_training = self.policy.training
+        net_training = self.policy.net.training if hasattr(self.policy, "net") else None
+        results: List[Optional[OracleFeatureResult]] = [None] * len(specs)
+        batch_result_indices = set()
+
+        try:
+            grouped_specs: Dict[int, List[Any]] = defaultdict(list)
+            for result_idx, spec in enumerate(specs):
+                if spec.pipeline != "future_node_avg_pano":
+                    results[result_idx] = self._failed_result(
+                        spec,
+                        reason=f"unsupported_pipeline:{spec.pipeline}",
+                    )
+                    continue
+                grouped_specs[int(spec.active_env_index)].append((result_idx, spec))
+
+            successful_obs_items = []
+            fallback_to_serial = bool(
+                getattr(
+                    self.oracle_config,
+                    "batch_query_fallback_to_serial",
+                    True,
+                )
+            )
+
+            for env_index, env_specs in grouped_specs.items():
+                queries = []
+                for local_idx, (_, spec) in enumerate(env_specs):
+                    queries.append(
+                        {
+                            "position": list(spec.query_pos),
+                            "heading_rad": float(spec.query_heading_rad),
+                            "query_index": int(local_idx),
+                        }
+                    )
+
+                try:
+                    batch_transport = self.envs.call_at(
+                        env_index,
+                        "get_oracle_pano_obs_at_batch",
+                        {
+                            "queries": queries,
+                            "keep_agent_at_new_pose": False,
+                        },
+                    )
+                    if not isinstance(batch_transport, list):
+                        raise RuntimeError(
+                            "batch oracle transport returned a non-list payload"
+                        )
+                    transport_map = {}
+                    for item in batch_transport:
+                        local_idx = int(item.get("query_index", -1))
+                        if local_idx >= 0:
+                            transport_map[local_idx] = item
+                except Exception:
+                    if fallback_to_serial:
+                        for result_idx, spec in env_specs:
+                            try:
+                                results[result_idx] = self.query(spec)
+                            except Exception:
+                                results[result_idx] = self._failed_result(
+                                    spec,
+                                    reason="provider_query_failed",
+                                )
+                        continue
+
+                    for result_idx, spec in env_specs:
+                        results[result_idx] = self._failed_result(
+                            spec,
+                            reason="batch_transport_failed",
+                        )
+                    continue
+
+                for local_idx, (result_idx, spec) in enumerate(env_specs):
+                    item = transport_map.get(local_idx)
+                    if item is None:
+                        results[result_idx] = self._failed_result(
+                            spec,
+                            reason="batch_transport_missing_item",
+                        )
+                        continue
+                    if not bool(item.get("ok", False)):
+                        results[result_idx] = self._failed_result(
+                            spec,
+                            reason=str(item.get("reason", "batch_transport_failed")),
+                        )
+                        continue
+                    successful_obs_items.append(
+                        {
+                            "result_idx": result_idx,
+                            "spec": spec,
+                            "obs": item["obs"],
+                        }
+                    )
+
+            if len(successful_obs_items) > 0:
+                instr_pad_id = 1 if self.task_type == 'rxr' else 0
+                obs_list = extract_instruction_tokens(
+                    [item["obs"] for item in successful_obs_items],
+                    self.INSTRUCTION_SENSOR_UUID,
+                    max_length=self.instr_max_len,
+                    pad_id=instr_pad_id,
+                )
+                effective_micro_batch_size = self._resolve_micro_batch_size(
+                    len(obs_list),
+                    micro_batch_size,
+                )
+
+                self.waypoint_predictor.eval()
+                self.policy.eval()
+                if hasattr(self.policy, "net"):
+                    self.policy.net.eval()
+
+                for start in range(0, len(obs_list), effective_micro_batch_size):
+                    end = min(start + effective_micro_batch_size, len(obs_list))
+                    chunk_items = successful_obs_items[start:end]
+                    chunk_obs = obs_list[start:end]
+                    try:
+                        batch = batch_obs(chunk_obs, self.device)
+                        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+                        with torch.no_grad():
+                            wp_outputs = self.policy.net(
+                                mode="waypoint",
+                                waypoint_predictor=self.waypoint_predictor,
+                                observations=batch,
+                                in_train=False,
+                            )
+                            vp_inputs = self._vp_feature_variable(wp_outputs)
+                            vp_inputs.update({"mode": "panorama"})
+                            pano_embeds, pano_masks = self.policy.net(**vp_inputs)
+                            avg_pano = torch.sum(
+                                pano_embeds * pano_masks.unsqueeze(2), 1
+                            ) / torch.sum(pano_masks, 1, keepdim=True)
+                    except Exception:
+                        for item in chunk_items:
+                            results[item["result_idx"]] = self._failed_result(
+                                item["spec"],
+                                reason="provider_forward_failed",
+                            )
+                            batch_result_indices.add(int(item["result_idx"]))
+                        continue
+
+                    for local_idx, item in enumerate(chunk_items):
+                        spec = item["spec"]
+                        embed = avg_pano[local_idx].detach().clone()
+                        results[item["result_idx"]] = OracleFeatureResult(
+                            ghost_vp_id=spec.ghost_vp_id,
+                            ok=True,
+                            embed=embed,
+                            reason=None,
+                            embed_dtype={
+                                torch.float16: "fp16",
+                                torch.float32: "fp32",
+                                torch.float64: "fp64",
+                            }.get(embed.dtype, str(embed.dtype)),
+                            embed_norm=float(embed.norm().item()),
+                            used_pos=tuple(spec.query_pos),
+                            used_heading_rad=float(spec.query_heading_rad),
+                            cache_hit=False,
+                            cache_key=None,
+                            latency_ms=0.0,
+                        )
+                        batch_result_indices.add(int(item["result_idx"]))
+
+            for result_idx, spec in enumerate(specs):
+                if results[result_idx] is None:
+                    results[result_idx] = self._failed_result(
+                        spec,
+                        reason="provider_query_failed",
+                    )
+
+            batch_elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if len(batch_result_indices) > 0:
+                per_item_latency_ms = batch_elapsed_ms / len(batch_result_indices)
+                for result_idx in batch_result_indices:
+                    results[result_idx].latency_ms = float(per_item_latency_ms)
+
+            return list(results)
+        finally:
+            if policy_training:
+                self.policy.train()
+            else:
+                self.policy.eval()
+            if hasattr(self.policy, "net") and net_training is not None:
+                if net_training:
+                    self.policy.net.train()
+                else:
+                    self.policy.net.eval()
+            self.waypoint_predictor.eval()
 
     def _vp_feature_variable(self, obs):
         # obs = {

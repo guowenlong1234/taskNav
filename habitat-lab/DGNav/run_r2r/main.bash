@@ -1,107 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
+export PYTHONUNBUFFERED=1
 
-# Avoid CPU thread oversubscription when using many VectorEnv workers.
-# Keep default to 1 for stable throughput, while allowing manual override.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 echo "[main.bash] CPU thread caps: OMP=${OMP_NUM_THREADS}, MKL=${MKL_NUM_THREADS}, OPENBLAS=${OPENBLAS_NUM_THREADS}"
 
-# Force Habitat-Lab/Baselines imports to come from this clean worktree.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dgnav_dir="$(cd "${script_dir}/.." && pwd)"
 preferred_habitat_repo_root="$(cd "${dgnav_dir}/.." && pwd -P)"
-if [ -n "${DGNAV_HABITAT_REPO_ROOT:-}" ]; then
+
+if [[ -n "${DGNAV_HABITAT_REPO_ROOT:-}" ]]; then
       if ! requested_habitat_repo_root="$(cd "${DGNAV_HABITAT_REPO_ROOT}" && pwd -P 2>/dev/null)"; then
             echo "[main.bash] Invalid DGNAV_HABITAT_REPO_ROOT=${DGNAV_HABITAT_REPO_ROOT}" >&2
             exit 1
       fi
-      if [ "${requested_habitat_repo_root}" != "${preferred_habitat_repo_root}" ]; then
+      if [[ "${requested_habitat_repo_root}" != "${preferred_habitat_repo_root}" ]]; then
             echo "[main.bash] Refusing Habitat repo root ${requested_habitat_repo_root}" >&2
             echo "[main.bash] Expected clean worktree root ${preferred_habitat_repo_root}" >&2
             exit 1
       fi
 fi
+
 habitat_repo_root="${preferred_habitat_repo_root}"
-if [ ! -f "${habitat_repo_root}/habitat-baselines/habitat_baselines/common/environments.py" ]; then
+if [[ ! -f "${habitat_repo_root}/habitat-baselines/habitat_baselines/common/environments.py" ]]; then
       echo "[main.bash] Missing required file: ${habitat_repo_root}/habitat-baselines/habitat_baselines/common/environments.py" >&2
       exit 1
 fi
+
 export DGNAV_HABITAT_REPO_ROOT="${habitat_repo_root}"
-export PYTHONPATH="${habitat_repo_root}/habitat-lab:${habitat_repo_root}/habitat-baselines:${PYTHONPATH}"
+export PYTHONPATH="${habitat_repo_root}/habitat-lab:${habitat_repo_root}/habitat-baselines:${PYTHONPATH:-}"
 echo "[main.bash] Using Habitat-Lab/Baselines from ${habitat_repo_root}"
 
-dist_launch_module="torch.distributed.launch"
-if python -c "import importlib.util as u; raise SystemExit(0 if u.find_spec('torch.distributed.run') else 1)"; then
-      dist_launch_module="torch.distributed.run"
+usage() {
+      cat <<'EOF'
+用法:
+  bash habitat-lab/DGNav/run_r2r/main.bash <preset> [CONFIG_OVERRIDE...]
+
+唯一必填参数:
+  <preset> 选择实验配置块。
+
+可用 preset:
+  batch_oracle_eval_stream_cache
+  serial_oracle_eval_stream_cache
+
+默认对齐口径:
+  - ckpt.iter18600
+  - Oracle 打开
+  - soft 注入 alpha=0.25
+  - cache 打开
+  - streaming_refill 打开
+  - NUM_ENVIRONMENTS=4
+  - fixed500 val_unseen
+
+命令行覆盖:
+  直接在 preset 后面追加 run.py 支持的 KEY VALUE 覆盖，例如:
+    bash habitat-lab/DGNav/run_r2r/main.bash batch_oracle_eval_stream_cache \
+      EVAL.EPISODE_COUNT 10 ORACLE.trace.enable False
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+      usage >&2
+      exit 1
+fi
+
+preset="$1"
+shift
+extra_opts=("$@")
+
+conda_env="${CONDA_ENV:-py3-9}"
+dist_launch_module="${DIST_LAUNCH_MODULE:-torch.distributed.run}"
+gpu_numbers="${GPU_NUMBERS:-1}"
+simulator_gpu_ids="${SIMULATOR_GPU_IDS:-[0]}"
+torch_gpu_ids="${TORCH_GPU_IDS:-[0]}"
+torch_gpu_id="${TORCH_GPU_ID:-0}"
+allow_sliding="${ALLOW_SLIDING:-True}"
+results_dir="${RESULTS_DIR:-data/logs/eval_results/}"
+tensorboard_dir="${TENSORBOARD_DIR:-data/logs/tensorboard_dirs/}"
+checkpoint_folder="${CHECKPOINT_FOLDER:-data/logs/checkpoints/}"
+video_dir="${VIDEO_DIR:-data/logs/video/}"
+log_dir="${LOG_DIR:-data/logs/running_log/}"
+
+release_ckpt_iter18600="${dgnav_dir}/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter18600.pth"
+fixed500_file="run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt"
+oracle_stack="run_r2r/r2r_oracle.yaml"
+
+run_type="eval"
+exp_name=""
+exp_config="${oracle_stack}"
+preset_master_port=""
+preset_num_environments="4"
+preset_opts=()
+
+case "${preset}" in
+      A1)
+            exp_name="batch_oracle_eval_stream_cache"
+            preset_master_port="4851"
+            preset_opts=(
+                  "EVAL.CKPT_PATH_DIR" "${release_ckpt_iter18600}"
+                  "EVAL.EPISODE_ID_FILE" "${fixed500_file}"
+                  "EVAL.ENV_REFILL_POLICY" "streaming_refill"
+                  "IL.back_algo" "control"
+                  "ORACLE.enable" "True"
+                  "ORACLE.enable_in_eval" "True"
+                  "ORACLE.apply_mode" "soft"
+                  "ORACLE.soft_alpha" "0.25"
+                  "ORACLE.cache_enable" "True"
+                  "ORACLE.batch_query_enable" "True"
+                  "MODEL.ORACLE_FT.enable" "False"
+            )
+            ;;
+      A2)
+            exp_name="serial_oracle_eval_stream_cache"
+            preset_master_port="4852"
+            preset_opts=(
+                  "EVAL.CKPT_PATH_DIR" "${release_ckpt_iter18600}"
+                  "EVAL.EPISODE_ID_FILE" "${fixed500_file}"
+                  "EVAL.ENV_REFILL_POLICY" "streaming_refill"
+                  "IL.back_algo" "control"
+                  "ORACLE.enable" "True"
+                  "ORACLE.enable_in_eval" "True"
+                  "ORACLE.apply_mode" "soft"
+                  "ORACLE.soft_alpha" "0.25"
+                  "ORACLE.cache_enable" "True"
+                  "ORACLE.batch_query_enable" "False"
+                  "MODEL.ORACLE_FT.enable" "False"
+            )
+            ;;
+      *)
+            echo "[main.bash] Unknown preset: ${preset}" >&2
+            usage >&2
+            exit 1
+            ;;
+esac
+
+master_port="${MASTER_PORT:-${preset_master_port}}"
+num_environments="${NUM_ENVIRONMENTS:-${preset_num_environments}}"
+
+common_opts=(
+      "SIMULATOR_GPU_IDS" "${simulator_gpu_ids}"
+      "TORCH_GPU_IDS" "${torch_gpu_ids}"
+      "TORCH_GPU_ID" "${torch_gpu_id}"
+      "GPU_NUMBERS" "${gpu_numbers}"
+      "NUM_ENVIRONMENTS" "${num_environments}"
+      "RESULTS_DIR" "${results_dir}"
+      "TENSORBOARD_DIR" "${tensorboard_dir}"
+      "CHECKPOINT_FOLDER" "${checkpoint_folder}"
+      "VIDEO_DIR" "${video_dir}"
+      "LOG_DIR" "${log_dir}"
+      "TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING" "${allow_sliding}"
+)
+
+if [[ ! -f "${release_ckpt_iter18600}" ]]; then
+      echo "[main.bash] Missing checkpoint: ${release_ckpt_iter18600}" >&2
+      exit 1
 fi
 
 run_dgnav() {
-      local master_port="$1"
-      shift
-      python -m ${dist_launch_module} --nproc_per_node=1 --master_port "${master_port}" run.py "$@"
+      local -a cmd=(
+            python -m "${dist_launch_module}"
+            --nproc_per_node=1
+            --master_port "${master_port}"
+            run.py
+            --exp_name "${exp_name}"
+            --run-type "${run_type}"
+            --exp-config "${exp_config}"
+      )
+      cmd+=("${common_opts[@]}")
+      cmd+=("${preset_opts[@]}")
+      cmd+=("${extra_opts[@]}")
+
+      echo "[main.bash] preset=${preset}"
+      echo "[main.bash] run_type=${run_type}"
+      echo "[main.bash] exp_name=${exp_name}"
+      echo "[main.bash] exp_config=${exp_config}"
+      echo "[main.bash] master_port=${master_port}"
+      echo "[main.bash] num_environments=${num_environments}"
+
+      if [[ "${CONDA_DEFAULT_ENV:-}" == "${conda_env}" ]]; then
+            echo "[main.bash] Using current conda env: ${CONDA_DEFAULT_ENV}"
+            "${cmd[@]}"
+      else
+            echo "[main.bash] Using conda run -n ${conda_env} --no-capture-output"
+            conda run --no-capture-output -n "${conda_env}" "${cmd[@]}"
+      fi
 }
 
-flag1="--exp_name release_r2r_dino_best_nav
-      --run-type train
-      --exp-config run_r2r/iter_train.yaml
-      SIMULATOR_GPU_IDS [0]
-      TORCH_GPU_IDS [0]
-      GPU_NUMBERS 1
-      NUM_ENVIRONMENTS 6
-      IL.iters 30000
-      IL.lr 1e-5
-      IL.log_every 200
-      IL.ml_weight 1.0
-      IL.sample_ratio 0.75
-      IL.decay_interval 3000
-      IL.load_from_ckpt True
-      IL.is_requeue True
-      IL.waypoint_aug  True
-      IL.back_algo teleport
-      TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
-      MODEL.pretrained_path /home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2_clean/ckpts/model_step_97500.pt
-      "
-
-flag2=" --exp_name release_r2r_dino_best_nav
-      --run-type eval
-      --exp-config run_r2r/iter_train.yaml
-      SIMULATOR_GPU_IDS [0]
-      TORCH_GPU_IDS [0]
-      GPU_NUMBERS 1
-      NUM_ENVIRONMENTS 6
-      TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
-      EVAL.CKPT_PATH_DIR /home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/release_r2r_dino_best_nav
-      IL.is_requeue False
-      IL.back_algo control
-      "
-
-flag3="--exp_name release_r2r
-      --run-type inference
-      --exp-config run_r2r/iter_train.yaml
-      SIMULATOR_GPU_IDS [0]
-      TORCH_GPU_IDS [0]
-      GPU_NUMBERS 1
-      NUM_ENVIRONMENTS 8
-      TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
-      INFERENCE.CKPT_PATH data/logs/checkpoints/DGNav/ckpt.iter15200.pth
-      INFERENCE.PREDICTIONS_FILE preds.json
-      IL.back_algo control
-      "
-
-mode=$1
-case $mode in 
-      train)
-      echo "###### train mode ######"
-      run_dgnav "$2" $flag1
-      ;;
-      eval)
-      echo "###### eval mode ######"
-      run_dgnav "$2" $flag2
-      ;;
-      infer)
-      echo "###### infer mode ######"
-      run_dgnav "$2" $flag3
-      ;;
-esac
+cd "${dgnav_dir}"
+run_dgnav

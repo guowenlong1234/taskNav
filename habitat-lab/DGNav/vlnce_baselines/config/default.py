@@ -11,8 +11,8 @@ from habitat_extensions.config.default import (
 # EXPERIMENT CONFIG
 # -----------------------------------------------------------------------------
 _C = CN()
-_C.BASE_TASK_CONFIG_PATH = "habitat_extensions/config/vlnce_task.yaml"
-_C.TASK_CONFIG = CN()  # task_config will be stored as a config node
+_C.BASE_TASK_CONFIG_PATH = ""
+_C.TASK_CONFIG = get_task_config()  # task_config will be stored as a config node
 _C.TRAINER_NAME = "dagger"
 _C.ENV_NAME = "VLNCEDaggerEnv"
 _C.SIMULATOR_GPU_IDS = [0]
@@ -206,6 +206,11 @@ _C.ORACLE.navigability_y_lock = True
 _C.ORACLE.cache_enable = True
 _C.ORACLE.cache_radius = 0.25
 _C.ORACLE.cache_max_items_per_scene = 4096
+_C.ORACLE.batch_query_enable = True
+_C.ORACLE.batch_query_adaptive = True
+_C.ORACLE.batch_query_micro_size = -1
+_C.ORACLE.batch_query_max_micro_size = 32
+_C.ORACLE.batch_query_fallback_to_serial = True
 _C.ORACLE.max_queries_per_step = -1
 _C.ORACLE.max_queries_per_episode = -1
 _C.ORACLE.use_amp = False
@@ -223,6 +228,10 @@ _C.ORACLE.trace.include_embed_vector = False
 _C.ORACLE.trace.include_embed_norm = True
 _C.ORACLE.trace.include_positions = True
 _C.ORACLE.trace.include_failures = True
+_C.ORACLE.trace.buffer_enable = True
+_C.ORACLE.trace.buffer_flush_records = 200
+_C.ORACLE.trace.flush_on_checkpoint = True
+_C.ORACLE.trace.flush_on_run_end = True
 # -----------------------------------------------------------------------------
 # MODELING CONFIG
 # -----------------------------------------------------------------------------
@@ -662,9 +671,10 @@ def get_config(
             config.merge_from_file(config_path)
             _normalize_oracle_config(config)
             if config.BASE_TASK_CONFIG_PATH != prev_task_config:
-                config.TASK_CONFIG = get_task_config(
-                    config.BASE_TASK_CONFIG_PATH
-                )
+                if config.BASE_TASK_CONFIG_PATH:
+                    config.TASK_CONFIG = get_task_config(
+                        config.BASE_TASK_CONFIG_PATH
+                    )
                 prev_task_config = config.BASE_TASK_CONFIG_PATH
 
     if opts:

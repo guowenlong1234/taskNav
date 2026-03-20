@@ -1,3 +1,0 @@
-ORACLE:
-  target_ghost_scope: top1_shadow
-  shadow_rerun_planner: True

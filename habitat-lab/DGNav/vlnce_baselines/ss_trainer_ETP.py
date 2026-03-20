@@ -36,6 +36,7 @@ from vlnce_baselines.common.env_utils import construct_envs, construct_envs_for_
 from vlnce_baselines.common.utils import extract_instruction_tokens
 from vlnce_baselines.models.graph_utils import GraphMap, MAX_DIST
 from vlnce_baselines.utils import reduce_loss
+from vlnce_baselines.oracle.buffered_writer import BufferedLineWriter
 from vlnce_baselines.oracle.types import OracleFeatureResult,OracleQuerySpec
 from vlnce_baselines.oracle.oracle_manager import OracleExperimentManager
 from .utils import get_camera_orientations12
@@ -139,6 +140,10 @@ class RLTrainer(BaseVLNCETrainer):
         self._oracle_scope_trace_path = None
         self._oracle_scope_summary_path = None
         self._oracle_scope_stats = None
+        self._oracle_buffered_writer = None
+        self._oracle_log_buffer_metrics = {}
+        self._eval_runtime_stats = None
+        self._active_oracle_manager = None
 
     def _init_perf_timing_log(self):
         if self.local_rank != 0:
@@ -213,9 +218,52 @@ class RLTrainer(BaseVLNCETrainer):
             )
         return self._oracle_summary_path
 
+    def _oracle_trace_buffer_enabled(self) -> bool:
+        return bool(getattr(self.config.ORACLE.trace, "buffer_enable", True))
+
+    def _get_oracle_buffered_writer(self):
+        if self.local_rank != 0 or not self._oracle_trace_buffer_enabled():
+            return None
+        if self._oracle_buffered_writer is None:
+            self._oracle_buffered_writer = BufferedLineWriter(
+                flush_records=getattr(
+                    self.config.ORACLE.trace,
+                    "buffer_flush_records",
+                    200,
+                )
+            )
+        return self._oracle_buffered_writer
+
+    @staticmethod
+    def _merge_trace_buffer_metrics(
+        lhs: Optional[Dict[str, Any]],
+        rhs: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        merged = dict(lhs or {})
+        if rhs is None:
+            return merged
+        sum_keys = (
+            "trace_buffer_flush_cnt",
+            "trace_buffer_records_written",
+            "trace_buffer_dropped_cnt",
+            "trace_buffer_flush_wall_time_ms_sum",
+            "trace_buffer_pending_records",
+            "trace_buffer_pending_paths",
+        )
+        max_keys = ("trace_buffer_max_pending_records",)
+        for key in sum_keys:
+            merged[key] = float(merged.get(key, 0.0)) + float(rhs.get(key, 0.0))
+        for key in max_keys:
+            merged[key] = max(float(merged.get(key, 0.0)), float(rhs.get(key, 0.0)))
+        return merged
+
     def _write_oracle_summary_log(self, line: str) -> None:
         path = self._get_oracle_summary_path()
         if path is None:
+            return
+        writer = self._get_oracle_buffered_writer()
+        if writer is not None:
+            writer.append_text(path, line)
             return
         with open(path, "a", encoding="utf-8", buffering=1) as f:
             f.write(line + "\n")
@@ -267,8 +315,28 @@ class RLTrainer(BaseVLNCETrainer):
         path = self._get_oracle_scope_trace_path()
         if path is None:
             return
+        writer = self._get_oracle_buffered_writer()
+        if writer is not None:
+            writer.append_json(path, record)
+            return
         with open(path, "a", encoding="utf-8", buffering=1) as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _flush_oracle_log_buffers(self, oracle_manager=None) -> Dict[str, Any]:
+        if oracle_manager is None:
+            oracle_manager = getattr(self, "_active_oracle_manager", None)
+        metrics: Dict[str, Any] = {}
+        writer = self._oracle_buffered_writer
+        if writer is not None:
+            writer.flush_all()
+            metrics = self._merge_trace_buffer_metrics(metrics, writer.get_metrics())
+        if oracle_manager is not None:
+            oracle_manager.flush_trace_buffers()
+            metrics = self._merge_trace_buffer_metrics(
+                metrics, oracle_manager.get_trace_buffer_metrics()
+            )
+        self._oracle_log_buffer_metrics = dict(metrics)
+        return dict(metrics)
 
     def _get_oracle_scope_summary_path(self):
         if self.local_rank != 0 or not getattr(self.config.ORACLE, "scope_summary_enable", False):
@@ -358,8 +426,14 @@ class RLTrainer(BaseVLNCETrainer):
             "intra_episode_cache_hit_cnt": 0,
             "cross_episode_cache_hit_cnt": 0,
             "latency_ms_sum": 0.0,
+            "provider_miss_cnt": 0,
+            "provider_latency_ms_sum": 0.0,
+            "batched_provider_call_cnt": 0,
+            "provider_batch_size_sum": 0,
             "skipped_cnt": 0,
             "avg_latency_ms": 0.0,
+            "provider_avg_latency_ms": 0.0,
+            "provider_avg_batch_size": 0.0,
             "intra_episode_cache_hit_pct": 0.0,
             "cross_episode_cache_hit_pct": 0.0,
         }
@@ -378,11 +452,23 @@ class RLTrainer(BaseVLNCETrainer):
             "intra_episode_cache_hit_cnt",
             "cross_episode_cache_hit_cnt",
             "latency_ms_sum",
+            "provider_miss_cnt",
+            "provider_latency_ms_sum",
+            "batched_provider_call_cnt",
+            "provider_batch_size_sum",
             "skipped_cnt",
         ):
             dst[key] += src.get(key, 0)
         if dst["query_cnt"] > 0:
             dst["avg_latency_ms"] = dst["latency_ms_sum"] / dst["query_cnt"]
+        if dst["provider_miss_cnt"] > 0:
+            dst["provider_avg_latency_ms"] = (
+                dst["provider_latency_ms_sum"] / dst["provider_miss_cnt"]
+            )
+        if dst["batched_provider_call_cnt"] > 0:
+            dst["provider_avg_batch_size"] = (
+                dst["provider_batch_size_sum"] / dst["batched_provider_call_cnt"]
+            )
         if dst["cache_hit_cnt"] > 0:
             dst["intra_episode_cache_hit_pct"] = (
                 dst["intra_episode_cache_hit_cnt"] / dst["cache_hit_cnt"]
@@ -400,6 +486,7 @@ class RLTrainer(BaseVLNCETrainer):
         txt_masks,
         use_oracle_embeds: bool = True,
         oracle_scope_ids_per_env=None,
+        oracle_result_overrides_per_env=None,
     ) -> Dict[str, Any]:
         nav_inputs = self._nav_gmap_variable(
             cur_vp,
@@ -407,6 +494,7 @@ class RLTrainer(BaseVLNCETrainer):
             cur_ori,
             use_oracle_embeds=use_oracle_embeds,
             oracle_scope_ids_per_env=oracle_scope_ids_per_env,
+            oracle_result_overrides_per_env=oracle_result_overrides_per_env,
         )
         no_vp_left = nav_inputs.pop("no_vp_left")
         nav_inputs.update(
@@ -464,6 +552,131 @@ class RLTrainer(BaseVLNCETrainer):
             ids = ids[:max_scope]
         return ids
 
+    def _prepare_oracle_scope_request(
+        self,
+        *,
+        env_idx,
+        original_env_index,
+        slot_id,
+        gmap,
+        current_episode,
+        current_real_vp,
+        stepk,
+        planner_cache=None,
+    ):
+        scope_ids = self._select_oracle_scope_ids(
+            env_idx=env_idx,
+            gmap=gmap,
+            current_real_vp=current_real_vp,
+            planner_cache=planner_cache,
+        )
+        planner_top1_before = None
+        if planner_cache is not None:
+            planner_top1_before = planner_cache["top1_vps"][env_idx]
+        return {
+            "env_idx": int(env_idx),
+            "slot_id": int(slot_id),
+            "original_env_index": int(original_env_index),
+            "stepk": int(stepk),
+            "current_step": int(gmap.graph_step),
+            "gmap": gmap,
+            "current_episode": current_episode,
+            "current_real_vp": current_real_vp,
+            "candidate_ghost_ids": list(scope_ids),
+            "planner_top1_before": planner_top1_before,
+        }
+
+    def _run_oracle_scope_batch(
+        self,
+        *,
+        oracle_manager,
+        mode,
+        stepks,
+        env_indices,
+        slot_ids,
+        gmaps,
+        current_episodes,
+        current_real_vps,
+        planner_cache=None,
+    ):
+        if oracle_manager is None or len(gmaps) == 0:
+            return [], [], self._init_oracle_query_stats(), []
+
+        requests = []
+        for i, gmap in enumerate(gmaps):
+            requests.append(
+                self._prepare_oracle_scope_request(
+                    env_idx=i,
+                    original_env_index=env_indices[i],
+                    slot_id=slot_ids[i],
+                    gmap=gmap,
+                    current_episode=current_episodes[i],
+                    current_real_vp=current_real_vps[i],
+                    stepk=stepks[i],
+                    planner_cache=planner_cache,
+                )
+            )
+
+        batch_outputs = oracle_manager.query_ghosts_batch(
+            mode=mode,
+            requests=requests,
+        )
+        oracle_stats = oracle_manager.get_last_query_stats()
+        scope_trace_records = []
+        scoped_oracle_ids_per_env = []
+        oracle_result_overrides_per_env = []
+
+        for request, batch_out in zip(requests, batch_outputs):
+            scope_ids = list(request.get("candidate_ghost_ids", []))
+            gmap = request["gmap"]
+            oracle_results = batch_out.get("results", {})
+
+            if getattr(self.config.ORACLE, "persistent_writeback", True):
+                written_ids, skipped_ids = gmap.apply_oracle_embeds(
+                    ghost_embeds=oracle_results,
+                    allowed_ghost_ids=scope_ids,
+                    step_id=gmap.graph_step,
+                    strict_scope=getattr(self.config.ORACLE, "strict_scope", True),
+                )
+            else:
+                written_ids, skipped_ids = [], []
+
+            trace_record = {
+                "episode_id": str(request["current_episode"].episode_id),
+                "episode_instance_seq": oracle_manager.get_slot_episode_instance_seq(
+                    request["slot_id"]
+                ),
+                "active_env_index": int(request["env_idx"]),
+                "original_env_index": int(request["original_env_index"]),
+                "slot_id": int(request["slot_id"]),
+                "step": int(request["stepk"]),
+                "current_real_vp": request["current_real_vp"],
+                "oracle_scope": self._get_oracle_scope_name(),
+                "all_alive_ghost_ids": gmap.get_all_alive_ghost_ids(),
+                "selected_scope_ids": list(scope_ids),
+                "oracle_requested_ids": list(
+                    batch_out.get("stats", {}).get("requested_ids", [])
+                ),
+                "oracle_returned_ids": list(
+                    batch_out.get("stats", {}).get("returned_ids", [])
+                ),
+                "oracle_written_ids": list(written_ids),
+                "oracle_skipped_ids": list(skipped_ids),
+                "planner_top1_before": request.get("planner_top1_before"),
+                "planner_top1_after": None,
+                "target_changed": False,
+            }
+            scope_trace_records.append(trace_record)
+            scoped_oracle_ids_per_env.append(list(scope_ids))
+            oracle_result_overrides_per_env.append(dict(oracle_results))
+
+        return (
+            scoped_oracle_ids_per_env,
+            scope_trace_records,
+            oracle_stats,
+            oracle_result_overrides_per_env,
+        )
+
     def _apply_oracle_scope_for_env(
         self,
         oracle_manager,
@@ -477,61 +690,24 @@ class RLTrainer(BaseVLNCETrainer):
         current_real_vp,
         planner_cache=None,
     ):
-        scope_ids = self._select_oracle_scope_ids(
-            env_idx=env_idx,
-            gmap=gmap,
-            current_real_vp=current_real_vp,
+        (
+            scope_ids_per_env,
+            scope_trace_records,
+            oracle_stats,
+            _oracle_result_overrides_per_env,
+        ) = self._run_oracle_scope_batch(
+            oracle_manager=oracle_manager,
+            mode=mode,
+            stepks=[stepk],
+            env_indices=[original_env_index],
+            slot_ids=[slot_id],
+            gmaps=[gmap],
+            current_episodes=[current_episode],
+            current_real_vps=[current_real_vp],
             planner_cache=planner_cache,
         )
-        oracle_results = oracle_manager.query_ghosts(
-            mode=mode,
-            stepk=stepk,
-            gmap=gmap,
-            current_episode=current_episode,
-            active_env_index=env_idx,
-            original_env_index=original_env_index,
-            slot_id=slot_id,
-            candidate_ghost_ids=scope_ids,
-            current_step=gmap.graph_step,
-        )
-        query_stats = oracle_manager.get_last_query_stats()
-
-        if getattr(self.config.ORACLE, "persistent_writeback", True):
-            written_ids, skipped_ids = gmap.apply_oracle_embeds(
-                ghost_embeds=oracle_results,
-                allowed_ghost_ids=scope_ids,
-                step_id=gmap.graph_step,
-                strict_scope=getattr(self.config.ORACLE, "strict_scope", True),
-            )
-        else:
-            written_ids, skipped_ids = [], []
-
-        planner_top1_before = None
-        if planner_cache is not None:
-            planner_top1_before = planner_cache["top1_vps"][env_idx]
-
-        trace_record = {
-            "episode_id": str(current_episode.episode_id),
-            "episode_instance_seq": oracle_manager.get_slot_episode_instance_seq(
-                slot_id
-            ),
-            "active_env_index": int(env_idx),
-            "original_env_index": int(original_env_index),
-            "slot_id": int(slot_id),
-            "step": int(stepk),
-            "current_real_vp": current_real_vp,
-            "oracle_scope": self._get_oracle_scope_name(),
-            "all_alive_ghost_ids": gmap.get_all_alive_ghost_ids(),
-            "selected_scope_ids": list(scope_ids),
-            "oracle_requested_ids": list(query_stats.get("requested_ids", [])),
-            "oracle_returned_ids": list(query_stats.get("returned_ids", [])),
-            "oracle_written_ids": list(written_ids),
-            "oracle_skipped_ids": list(skipped_ids),
-            "planner_top1_before": planner_top1_before,
-            "planner_top1_after": None,
-            "target_changed": False,
-        }
-        return trace_record, query_stats
+        trace_record = scope_trace_records[0] if len(scope_trace_records) > 0 else {}
+        return trace_record, oracle_stats
 
     def _validate_env_refill_policy(self, policy: str, where: str) -> None:
         allowed = {"legacy_batch", "streaming_refill"}
@@ -630,6 +806,7 @@ class RLTrainer(BaseVLNCETrainer):
         existing_manager: Optional[OracleExperimentManager] = None,
     ):
         if not self._is_oracle_effective_for_mode(mode):
+            self._active_oracle_manager = None
             return None
         oracle_manager = existing_manager
         if oracle_manager is None:
@@ -659,6 +836,7 @@ class RLTrainer(BaseVLNCETrainer):
                 episode_id=ep.episode_id,
                 active_env_index=i,
             )
+        self._active_oracle_manager = oracle_manager
         return oracle_manager
 
     def _build_initial_stream_slot_state(
@@ -927,7 +1105,18 @@ class RLTrainer(BaseVLNCETrainer):
             "num_budget_trims": 0,
             "num_duplicate_pauses": 0,
             "start_time": time.time(),
+            "oracle_stats": self._init_oracle_query_stats(),
         }
+
+    def _accumulate_eval_oracle_stats(self, oracle_stats: Optional[Dict[str, Any]]) -> None:
+        if oracle_stats is None or self._eval_runtime_stats is None:
+            return
+        if "oracle_stats" not in self._eval_runtime_stats:
+            self._eval_runtime_stats["oracle_stats"] = self._init_oracle_query_stats()
+        self._merge_oracle_query_stats(
+            self._eval_runtime_stats["oracle_stats"],
+            oracle_stats,
+        )
 
     def _write_eval_runtime_stats(
         self,
@@ -956,6 +1145,9 @@ class RLTrainer(BaseVLNCETrainer):
             mean_active_envs_ex_tail10 = 0.0
             min_active_envs = 0
             max_active_envs = 0
+
+        oracle_stats = dict(runtime_stats.get("oracle_stats", {}))
+        buffer_metrics = dict(self._oracle_log_buffer_metrics)
 
         payload = {
             "checkpoint_index": int(checkpoint_index),
@@ -987,6 +1179,34 @@ class RLTrainer(BaseVLNCETrainer):
             "num_budget_trims": int(runtime_stats.get("num_budget_trims", 0)),
             "num_duplicate_pauses": int(
                 runtime_stats.get("num_duplicate_pauses", 0)
+            ),
+            "query_cnt": int(oracle_stats.get("query_cnt", 0)),
+            "cache_hit_cnt": int(oracle_stats.get("cache_hit_cnt", 0)),
+            "provider_miss_cnt": int(oracle_stats.get("provider_miss_cnt", 0)),
+            "avg_latency_ms": float(oracle_stats.get("avg_latency_ms", 0.0)),
+            "provider_avg_latency_ms": float(
+                oracle_stats.get("provider_avg_latency_ms", 0.0)
+            ),
+            "batched_provider_call_cnt": int(
+                oracle_stats.get("batched_provider_call_cnt", 0)
+            ),
+            "provider_avg_batch_size": float(
+                oracle_stats.get("provider_avg_batch_size", 0.0)
+            ),
+            "trace_buffer_flush_cnt": int(
+                buffer_metrics.get("trace_buffer_flush_cnt", 0)
+            ),
+            "trace_buffer_records_written": int(
+                buffer_metrics.get("trace_buffer_records_written", 0)
+            ),
+            "trace_buffer_max_pending_records": int(
+                buffer_metrics.get("trace_buffer_max_pending_records", 0)
+            ),
+            "trace_buffer_dropped_cnt": int(
+                buffer_metrics.get("trace_buffer_dropped_cnt", 0)
+            ),
+            "trace_buffer_flush_wall_time_ms_sum": float(
+                buffer_metrics.get("trace_buffer_flush_wall_time_ms_sum", 0.0)
             ),
         }
         os.makedirs(self.config.RESULTS_DIR, exist_ok=True)
@@ -1088,6 +1308,8 @@ class RLTrainer(BaseVLNCETrainer):
                 os.makedirs(self.config.RESULTS_DIR, exist_ok=True)
 
     def save_checkpoint(self, iteration: int):
+        if getattr(self.config.ORACLE.trace, "flush_on_checkpoint", True):
+            self._flush_oracle_log_buffers()
         checkpoint_dict = {
             "state_dict": self.policy.state_dict(),
             "config": self.config,
@@ -1854,6 +2076,7 @@ class RLTrainer(BaseVLNCETrainer):
         cur_ori,
         use_oracle_embeds: bool = True,
         oracle_scope_ids_per_env=None,
+        oracle_result_overrides_per_env=None,
     ):
         #cur_vp前每个环境所在真实节点的 viewpoint id 列表，cur_pos当前每个环境 agent 的真实三维位置列表，cur_ori当前每个环境 agent 的真实朝向列表
         batch_gmap_vp_ids, batch_gmap_step_ids, batch_gmap_lens = [], [], []
@@ -1877,15 +2100,27 @@ class RLTrainer(BaseVLNCETrainer):
             allowed_oracle_ghost_ids = None
             if oracle_scope_ids_per_env is not None:
                 allowed_oracle_ghost_ids = set(oracle_scope_ids_per_env[i])
+            transient_oracle_embeds = None
+            if oracle_result_overrides_per_env is not None:
+                transient_oracle_embeds = oracle_result_overrides_per_env[i]
 
-            gmap_img_fts = [gmap.get_node_embeds(vp) for vp in node_vp_ids]
+            gmap_img_fts = [
+                gmap.get_node_embeds(
+                    vp,
+                    transient_oracle_embeds=transient_oracle_embeds,
+                )
+                for vp in node_vp_ids
+            ]
             gmap_base_img_fts = []
             gmap_oracle_raw_fts = []
             gmap_oracle_masks = []
 
             for vp in node_vp_ids + ghost_vp_ids:
                 #对节点和ghost节点都进行遍历，获取节点的特征值。
-                components = gmap.get_node_embed_components(vp)
+                components = gmap.get_node_embed_components(
+                    vp,
+                    transient_oracle_embeds=transient_oracle_embeds,
+                )
                 base = components["base"]
                 oracle_raw = components["oracle_raw"]
                 has_oracle = components["has_oracle"]
@@ -1903,11 +2138,19 @@ class RLTrainer(BaseVLNCETrainer):
                         vp,
                         use_oracle=True,
                         allowed_oracle_ghost_ids=allowed_oracle_ghost_ids,
+                        transient_oracle_embeds=transient_oracle_embeds,
                     )   #获取orcale
                     oracle_mask = 1.0
                     oracle_raw_tensor = oracle_raw
                 else:#不允许使用orcale的话
-                    effective = base if vp.startswith('g') else gmap.get_node_embeds(vp)
+                    effective = (
+                        base
+                        if vp.startswith('g')
+                        else gmap.get_node_embeds(
+                            vp,
+                            transient_oracle_embeds=transient_oracle_embeds,
+                        )
+                    )
                     oracle_mask = 0.0
                     oracle_raw_tensor = torch.zeros_like(base)  #返回原始节点特征。并且orcale特征全部置0
 
@@ -2020,6 +2263,7 @@ class RLTrainer(BaseVLNCETrainer):
 
     def train(self):
         self._set_config()
+        self._oracle_log_buffer_metrics = {}
         if self.config.MODEL.task_type == 'rxr':
             self.gt_data = {}
             for role in self.config.TASK_CONFIG.DATASET.ROLES:
@@ -2069,6 +2313,9 @@ class RLTrainer(BaseVLNCETrainer):
                         getattr(self.config.MODEL, 'use_node_gating', False)) and cur_iter % 200 == 0:
                         self.save_dynamic_graph_weights(cur_iter)
         finally:
+            if getattr(self.config.ORACLE.trace, "flush_on_run_end", True):
+                self._flush_oracle_log_buffers()
+            self._active_oracle_manager = None
             self._close_perf_timing_log()
         
     def _train_interval(self, interval, ml_weight, sample_ratio):
@@ -2234,6 +2481,8 @@ class RLTrainer(BaseVLNCETrainer):
             eps_to_eval = sum(self.envs.number_of_episodes)
         else:
             eps_to_eval = min(self.config.EVAL.EPISODE_COUNT, sum(self.envs.number_of_episodes))
+        self._oracle_log_buffer_metrics = {}
+        self._eval_runtime_stats = self._new_eval_runtime_stats(eps_to_eval)
         self.stat_eps = {}
         self._reset_oracle_scope_eval_state()
         # Always initialize loc_noise_history to record loc_noise values for each episode
@@ -2252,6 +2501,10 @@ class RLTrainer(BaseVLNCETrainer):
         try:
             if policy == "legacy_batch":
                 while len(self.stat_eps) < eps_to_eval:
+                    if self._eval_runtime_stats is not None:
+                        self._eval_runtime_stats["active_envs_series"].append(
+                            self.envs.num_envs
+                        )
                     self._rollout_legacy('eval')
             elif policy == "streaming_refill":
                 self._rollout_eval_streaming(eps_to_eval)
@@ -2261,10 +2514,26 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 raise ValueError(f"Invalid eval env refill policy: {policy}")
         finally:
+            if getattr(self.config.ORACLE.trace, "flush_on_run_end", True):
+                self._flush_oracle_log_buffers(
+                    getattr(self, "_legacy_eval_oracle_manager", None)
+                )
             self._legacy_eval_oracle_manager = None
+            self._active_oracle_manager = None
             self.envs.close()
             if self.pbar is not None:
                 self.pbar.close()
+
+        self._write_eval_runtime_stats(
+            checkpoint_index=checkpoint_index,
+            split=self.config.TASK_CONFIG.DATASET.SPLIT,
+            policy=policy,
+            oracle_enabled=self._is_oracle_effective_for_mode("eval"),
+            runtime_stats=self._eval_runtime_stats
+            if self._eval_runtime_stats is not None
+            else self._new_eval_runtime_stats(eps_to_eval),
+        )
+        self._eval_runtime_stats = None
 
         if self.world_size > 1:
             distr.barrier()
@@ -2685,13 +2954,12 @@ class RLTrainer(BaseVLNCETrainer):
             )
 
         t_navigation = time.perf_counter()
-        current_eps = self.envs.current_episodes()
         scope_trace_records = []
         oracle_mode_enabled = self._is_oracle_effective_for_mode(mode)
         batch_stepk = max(slot_episode_steps) if len(slot_episode_steps) > 0 else 0
 
         if oracle_mode_enabled:
-            oracle_stats = self._init_oracle_query_stats()
+            current_eps = self.envs.current_episodes()
             if self._get_oracle_scope_name() == "top1_shadow":
                 planner_cache = self._forward_navigation_once(
                     cur_vp,
@@ -2701,28 +2969,22 @@ class RLTrainer(BaseVLNCETrainer):
                     txt_masks,
                     use_oracle_embeds=False,
                 )
-                top1_shadow_scope_ids = []
-                for i, gmap in enumerate(gmaps):
-                    slot_id = int(slot_ids[i])
-                    trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
-                        oracle_manager=oracle_manager,
-                        mode=mode,
-                        stepk=slot_episode_steps[i],
-                        env_idx=i,
-                        original_env_index=slot_id,
-                        slot_id=slot_id,
-                        gmap=gmap,
-                        current_episode=current_eps[i],
-                        current_real_vp=cur_vp[i],
-                        planner_cache=planner_cache,
-                    )
-                    scope_trace_records.append(trace_record)
-                    top1_shadow_scope_ids.append(
-                        list(trace_record.get("selected_scope_ids", []))
-                    )
-                    self._merge_oracle_query_stats(
-                        oracle_stats, env_oracle_stats
-                    )
+                (
+                    top1_shadow_scope_ids,
+                    scope_trace_records,
+                    oracle_stats,
+                    oracle_result_overrides_per_env,
+                ) = self._run_oracle_scope_batch(
+                    oracle_manager=oracle_manager,
+                    mode=mode,
+                    stepks=slot_episode_steps,
+                    env_indices=slot_ids,
+                    slot_ids=slot_ids,
+                    gmaps=gmaps,
+                    current_episodes=current_eps,
+                    current_real_vps=cur_vp,
+                    planner_cache=planner_cache,
+                )
                 if self.config.ORACLE.shadow_rerun_planner:
                     nav_bundle = self._forward_navigation_once(
                         cur_vp,
@@ -2732,32 +2994,27 @@ class RLTrainer(BaseVLNCETrainer):
                         txt_masks,
                         use_oracle_embeds=True,
                         oracle_scope_ids_per_env=top1_shadow_scope_ids,
+                        oracle_result_overrides_per_env=oracle_result_overrides_per_env,
                     )
                 else:
                     nav_bundle = planner_cache
             else:
-                scoped_oracle_ids_per_env = []
-                for i, gmap in enumerate(gmaps):
-                    slot_id = int(slot_ids[i])
-                    trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
-                        oracle_manager=oracle_manager,
-                        mode=mode,
-                        stepk=slot_episode_steps[i],
-                        env_idx=i,
-                        original_env_index=slot_id,
-                        slot_id=slot_id,
-                        gmap=gmap,
-                        current_episode=current_eps[i],
-                        current_real_vp=cur_vp[i],
-                        planner_cache=None,
-                    )
-                    scope_trace_records.append(trace_record)
-                    scoped_oracle_ids_per_env.append(
-                        list(trace_record.get("selected_scope_ids", []))
-                    )
-                    self._merge_oracle_query_stats(
-                        oracle_stats, env_oracle_stats
-                    )
+                (
+                    scoped_oracle_ids_per_env,
+                    scope_trace_records,
+                    oracle_stats,
+                    oracle_result_overrides_per_env,
+                ) = self._run_oracle_scope_batch(
+                    oracle_manager=oracle_manager,
+                    mode=mode,
+                    stepks=slot_episode_steps,
+                    env_indices=slot_ids,
+                    slot_ids=slot_ids,
+                    gmaps=gmaps,
+                    current_episodes=current_eps,
+                    current_real_vps=cur_vp,
+                    planner_cache=None,
+                )
                 nav_bundle = self._forward_navigation_once(
                     cur_vp,
                     cur_pos,
@@ -2766,6 +3023,7 @@ class RLTrainer(BaseVLNCETrainer):
                     txt_masks,
                     use_oracle_embeds=True,
                     oracle_scope_ids_per_env=scoped_oracle_ids_per_env,
+                    oracle_result_overrides_per_env=oracle_result_overrides_per_env,
                 )
 
             if self.local_rank < 1:
@@ -2791,11 +3049,18 @@ class RLTrainer(BaseVLNCETrainer):
                     f"({float(oracle_stats.get('intra_episode_cache_hit_pct', 0.0)):.2%}) "
                     f"cross_ep_hit={cross_hit_cnt} "
                     f"({float(oracle_stats.get('cross_episode_cache_hit_pct', 0.0)):.2%}) "
+                    f"provider_miss={int(oracle_stats.get('provider_miss_cnt', 0))} "
                     f"resolve_fail={int(oracle_stats.get('resolve_fail_cnt', 0))} "
                     f"provider_fail={int(oracle_stats.get('provider_fail_cnt', 0))} "
-                    f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f}"
+                    f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f} "
+                    f"provider_avg_latency_ms={float(oracle_stats.get('provider_avg_latency_ms', 0.0)):.2f} "
+                    f"batched_provider_call_cnt={int(oracle_stats.get('batched_provider_call_cnt', 0))} "
+                    f"provider_avg_batch_size={float(oracle_stats.get('provider_avg_batch_size', 0.0)):.2f}"
                 )
                 self._write_oracle_summary_log(oracle_summary_line)
+
+            if mode == "eval":
+                self._accumulate_eval_oracle_stats(oracle_stats)
 
             if mode == "train":
                 self.logs["oracle/query_cnt"].append(
@@ -3004,7 +3269,11 @@ class RLTrainer(BaseVLNCETrainer):
         }
 
     def _rollout_eval_streaming(self, eps_to_eval: int) -> None:
-        runtime_stats = self._new_eval_runtime_stats(eps_to_eval)
+        runtime_stats = self._eval_runtime_stats
+        if runtime_stats is None:
+            runtime_stats = self._new_eval_runtime_stats(eps_to_eval)
+            self._eval_runtime_stats = runtime_stats
+        oracle_manager = None
         self.envs.resume_all()
         observations = list(self.envs.reset())
         current_eps = self.envs.current_episodes()
@@ -3044,100 +3313,130 @@ class RLTrainer(BaseVLNCETrainer):
                 observations,
             )
 
-        (
-            observations,
-            gmaps,
-            prev_vp,
-            slot_ids,
-            slot_txt_masks,
-            slot_txt_embeds,
-            slot_episode_steps,
-            oracle_manager,
-        ) = self._build_initial_stream_slot_state(observations, mode="eval")
-        active_episode_ids = self._get_active_episode_ids()
-        self.gmaps = gmaps
-
-        while len(observations) > 0 and len(self.stat_eps) < eps_to_eval:
-            runtime_stats["active_envs_series"].append(len(observations))
-            step_out = self._rollout_step_core(
-                mode="eval",
-                observations=observations,
-                gmaps=gmaps,
-                prev_vp=prev_vp,
-                slot_ids=slot_ids,
-                slot_txt_masks=slot_txt_masks,
-                slot_txt_embeds=slot_txt_embeds,
-                slot_episode_steps=slot_episode_steps,
-                oracle_manager=oracle_manager,
-            )
-            observations = step_out["observations"]
-            infos = step_out["infos"]
-            dones = step_out["dones"]
-            gmaps = step_out["gmaps"]
-            prev_vp = step_out["prev_vp"]
-            for i in range(len(observations)):
-                slot_episode_steps[i] += 1
+        try:
+            (
+                observations,
+                gmaps,
+                prev_vp,
+                slot_ids,
+                slot_txt_masks,
+                slot_txt_embeds,
+                slot_episode_steps,
+                oracle_manager,
+            ) = self._build_initial_stream_slot_state(observations, mode="eval")
+            active_episode_ids = self._get_active_episode_ids()
             self.gmaps = gmaps
 
-            done_envs = [i for i, done in enumerate(dones) if done]
-            done_envs.sort()
-            envs_to_pause = []
-            for i in done_envs:
-                completed_ep_id = self._record_eval_done_episode(
-                    i, observations, infos, gmaps
-                )
-                active_episode_ids.discard(completed_ep_id)
-
-            remaining_budget = eps_to_eval - len(self.stat_eps)
-            surviving_active = max(len(observations) - len(done_envs), 0)
-            refill_quota = max(0, remaining_budget - surviving_active)
-            refill_quota = min(refill_quota, len(done_envs))
-            refill_used = 0
-
-            for i in done_envs:
-                if refill_used >= refill_quota:
-                    envs_to_pause.append(i)
-                    continue
-
-                runtime_stats["num_reset_at_calls"] += 1
-                new_ep_id = self._reset_eval_stream_slot(
-                    i,
-                    observations,
-                    gmaps,
-                    prev_vp,
-                    slot_ids,
-                    slot_txt_masks,
-                    slot_txt_embeds,
-                    slot_episode_steps,
-                    active_episode_ids=active_episode_ids,
+            while len(observations) > 0 and len(self.stat_eps) < eps_to_eval:
+                runtime_stats["active_envs_series"].append(len(observations))
+                step_out = self._rollout_step_core(
+                    mode="eval",
+                    observations=observations,
+                    gmaps=gmaps,
+                    prev_vp=prev_vp,
+                    slot_ids=slot_ids,
+                    slot_txt_masks=slot_txt_masks,
+                    slot_txt_embeds=slot_txt_embeds,
+                    slot_episode_steps=slot_episode_steps,
                     oracle_manager=oracle_manager,
                 )
-                if new_ep_id is None:
-                    envs_to_pause.append(i)
-                    runtime_stats["num_duplicate_pauses"] += 1
-                else:
-                    active_episode_ids.add(new_ep_id)
-                    runtime_stats["num_refills"] += 1
-                    refill_used += 1
+                observations = step_out["observations"]
+                infos = step_out["infos"]
+                dones = step_out["dones"]
+                gmaps = step_out["gmaps"]
+                prev_vp = step_out["prev_vp"]
+                for i in range(len(observations)):
+                    slot_episode_steps[i] += 1
+                self.gmaps = gmaps
 
-            remaining_budget = eps_to_eval - len(self.stat_eps)
-            if remaining_budget < (len(observations) - len(set(envs_to_pause))):
-                trim = self._tail_indices_to_trim(
-                    len(observations),
-                    remaining_budget,
-                    exclude=envs_to_pause,
-                )
-                envs_to_pause.extend(trim)
-                runtime_stats["num_budget_trims"] += len(trim)
+                done_envs = [i for i, done in enumerate(dones) if done]
+                done_envs.sort()
+                envs_to_pause = []
+                for i in done_envs:
+                    completed_ep_id = self._record_eval_done_episode(
+                        i, observations, infos, gmaps
+                    )
+                    active_episode_ids.discard(completed_ep_id)
 
-            if len(envs_to_pause) > 0:
+                remaining_budget = eps_to_eval - len(self.stat_eps)
+                surviving_active = max(len(observations) - len(done_envs), 0)
+                refill_quota = max(0, remaining_budget - surviving_active)
+                refill_quota = min(refill_quota, len(done_envs))
+                refill_used = 0
+
+                for i in done_envs:
+                    if refill_used >= refill_quota:
+                        envs_to_pause.append(i)
+                        continue
+
+                    runtime_stats["num_reset_at_calls"] += 1
+                    new_ep_id = self._reset_eval_stream_slot(
+                        i,
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        slot_ids,
+                        slot_txt_masks,
+                        slot_txt_embeds,
+                        slot_episode_steps,
+                        active_episode_ids=active_episode_ids,
+                        oracle_manager=oracle_manager,
+                    )
+                    if new_ep_id is None:
+                        envs_to_pause.append(i)
+                        runtime_stats["num_duplicate_pauses"] += 1
+                    else:
+                        active_episode_ids.add(new_ep_id)
+                        runtime_stats["num_refills"] += 1
+                        refill_used += 1
+
+                remaining_budget = eps_to_eval - len(self.stat_eps)
+                if remaining_budget < (len(observations) - len(set(envs_to_pause))):
+                    trim = self._tail_indices_to_trim(
+                        len(observations),
+                        remaining_budget,
+                        exclude=envs_to_pause,
+                    )
+                    envs_to_pause.extend(trim)
+                    runtime_stats["num_budget_trims"] += len(trim)
+
+                if len(envs_to_pause) > 0:
+                    (
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        extra_state,
+                    ) = self._pause_stream_slots(
+                        envs_to_pause,
+                        self.envs,
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        extra_state={
+                            "slot_ids": slot_ids,
+                            "slot_txt_masks": slot_txt_masks,
+                            "slot_txt_embeds": slot_txt_embeds,
+                            "slot_episode_steps": slot_episode_steps,
+                        },
+                        oracle_manager=oracle_manager,
+                    )
+                    slot_ids = extra_state["slot_ids"]
+                    slot_txt_masks = extra_state["slot_txt_masks"]
+                    slot_txt_embeds = extra_state["slot_txt_embeds"]
+                    slot_episode_steps = extra_state["slot_episode_steps"]
+                    self.gmaps = gmaps
+                    if oracle_manager is not None:
+                        oracle_manager.rebind_after_pause(slot_ids)
+                    active_episode_ids = self._get_active_episode_ids()
+
+            if len(observations) > 0 and len(self.stat_eps) >= eps_to_eval:
                 (
                     observations,
                     gmaps,
                     prev_vp,
                     extra_state,
                 ) = self._pause_stream_slots(
-                    envs_to_pause,
+                    list(range(len(observations))),
                     self.envs,
                     observations,
                     gmaps,
@@ -3158,241 +3457,222 @@ class RLTrainer(BaseVLNCETrainer):
                 if oracle_manager is not None:
                     oracle_manager.rebind_after_pause(slot_ids)
                 active_episode_ids = self._get_active_episode_ids()
-
-        if len(observations) > 0 and len(self.stat_eps) >= eps_to_eval:
-            (
-                observations,
-                gmaps,
-                prev_vp,
-                extra_state,
-            ) = self._pause_stream_slots(
-                list(range(len(observations))),
-                self.envs,
-                observations,
-                gmaps,
-                prev_vp,
-                extra_state={
-                    "slot_ids": slot_ids,
-                    "slot_txt_masks": slot_txt_masks,
-                    "slot_txt_embeds": slot_txt_embeds,
-                    "slot_episode_steps": slot_episode_steps,
-                },
-                oracle_manager=oracle_manager,
-            )
-            slot_ids = extra_state["slot_ids"]
-            slot_txt_masks = extra_state["slot_txt_masks"]
-            slot_txt_embeds = extra_state["slot_txt_embeds"]
-            slot_episode_steps = extra_state["slot_episode_steps"]
-            self.gmaps = gmaps
-            if oracle_manager is not None:
-                oracle_manager.rebind_after_pause(slot_ids)
-            active_episode_ids = self._get_active_episode_ids()
-
-        split = self.config.TASK_CONFIG.DATASET.SPLIT
-        self._write_eval_runtime_stats(
-            checkpoint_index=getattr(self, "_stream_eval_checkpoint_index", 0),
-            split=split,
-            policy="streaming_refill",
-            oracle_enabled=self._is_oracle_effective_for_mode("eval"),
-            runtime_stats=runtime_stats,
-        )
+        finally:
+            if getattr(self.config.ORACLE.trace, "flush_on_run_end", True):
+                self._flush_oracle_log_buffers(oracle_manager)
 
     def _rollout_train_streaming(
         self, ml_weight: float, sample_ratio: float
     ) -> torch.Tensor:
+        oracle_manager = None
         self.envs.resume_all()
         observations = list(self.envs.reset())
-        (
-            observations,
-            gmaps,
-            prev_vp,
-            slot_ids,
-            slot_txt_masks,
-            slot_txt_embeds,
-            slot_episode_steps,
-            oracle_manager,
-        ) = self._build_initial_stream_slot_state(observations, mode="train")
-        self.gmaps = gmaps
-
-        initial_active_envs = len(observations)
-        action_budget = self._compute_train_action_budget(initial_active_envs)
-        total_actions = 0
-        loss_sum = torch.zeros((), device=self.device)
-
-        timing_enabled = self.local_rank == 0 and self._perf_timing_fh is not None
-        if timing_enabled:
-            rollout_t0 = time.perf_counter()
-            timing_acc = {
-                "waypoint": 0.0,
-                "env_call_at": 0.0,
-                "navigation": 0.0,
-                "env_step": 0.0,
-            }
-            step_counter = 0
-            env_instance_sum = 0
-            env_call_at_requests = 0
-
-        while len(observations) > 0 and total_actions < action_budget:
-            self._update_train_progress(active_envs=len(observations))
-            remaining_actions = action_budget - total_actions
-            if remaining_actions < len(observations):
-                trim = self._tail_indices_to_trim(
-                    len(observations), remaining_actions
-                )
-                (
-                    observations,
-                    gmaps,
-                    prev_vp,
-                    extra_state,
-                ) = self._pause_stream_slots(
-                    trim,
-                    self.envs,
-                    observations,
-                    gmaps,
-                    prev_vp,
-                    extra_state={
-                        "slot_ids": slot_ids,
-                        "slot_txt_masks": slot_txt_masks,
-                        "slot_txt_embeds": slot_txt_embeds,
-                        "slot_episode_steps": slot_episode_steps,
-                    },
-                    oracle_manager=oracle_manager,
-                )
-                slot_ids = extra_state["slot_ids"]
-                slot_txt_masks = extra_state["slot_txt_masks"]
-                slot_txt_embeds = extra_state["slot_txt_embeds"]
-                slot_episode_steps = extra_state["slot_episode_steps"]
-                self.gmaps = gmaps
-                if oracle_manager is not None:
-                    oracle_manager.rebind_after_pause(slot_ids)
-                if len(observations) == 0:
-                    break
-
-            if timing_enabled:
-                step_counter += 1
-                env_instance_sum += len(observations)
-
-            step_out = self._rollout_step_core(
-                mode="train",
-                observations=observations,
-                gmaps=gmaps,
-                prev_vp=prev_vp,
-                slot_ids=slot_ids,
-                slot_txt_masks=slot_txt_masks,
-                slot_txt_embeds=slot_txt_embeds,
-                slot_episode_steps=slot_episode_steps,
-                oracle_manager=oracle_manager,
-                sample_ratio=sample_ratio,
-            )
-            observations = step_out["observations"]
-            dones = step_out["dones"]
-            gmaps = step_out["gmaps"]
-            prev_vp = step_out["prev_vp"]
-            loss_sum = loss_sum + step_out["loss_contribution"]
-            total_actions += step_out["actions_issued"]
+        try:
+            (
+                observations,
+                gmaps,
+                prev_vp,
+                slot_ids,
+                slot_txt_masks,
+                slot_txt_embeds,
+                slot_episode_steps,
+                oracle_manager,
+            ) = self._build_initial_stream_slot_state(observations, mode="train")
             self.gmaps = gmaps
 
+            initial_active_envs = len(observations)
+            action_budget = self._compute_train_action_budget(initial_active_envs)
+            total_actions = 0
+            loss_sum = torch.zeros((), device=self.device)
+
+            timing_enabled = self.local_rank == 0 and self._perf_timing_fh is not None
             if timing_enabled:
-                timing = step_out["timing"]
-                timing_acc["waypoint"] += timing["waypoint"]
-                timing_acc["env_call_at"] += timing["env_call_at"]
-                timing_acc["navigation"] += timing["navigation"]
-                timing_acc["env_step"] += timing["env_step"]
-                env_call_at_requests += timing["env_call_at_requests"]
-
-            envs_to_pause = []
-            refill_candidates = []
-            for i in range(len(observations)):
-                slot_episode_steps[i] += 1
-                if dones[i] and slot_episode_steps[i] < self.max_len:
-                    refill_candidates.append(i)
-                elif slot_episode_steps[i] >= self.max_len:
-                    envs_to_pause.append(i)
-
-            remaining_actions = max(action_budget - total_actions, 0)
-            surviving_active_after_step = max(
-                len(observations)
-                - len(refill_candidates)
-                - len(envs_to_pause),
-                0,
-            )
-            refill_quota = max(
-                0, remaining_actions - surviving_active_after_step
-            )
-            refill_quota = min(refill_quota, len(refill_candidates))
-
-            for refill_idx, i in enumerate(refill_candidates):
-                if refill_idx >= refill_quota:
-                    envs_to_pause.append(i)
-                    continue
-                self._reset_train_stream_slot(
-                    i,
-                    observations,
-                    gmaps,
-                    prev_vp,
-                    slot_ids,
-                    slot_episode_steps,
-                    slot_txt_masks,
-                    slot_txt_embeds,
-                    oracle_manager=oracle_manager,
-                )
-
-            if len(envs_to_pause) > 0:
-                (
-                    observations,
-                    gmaps,
-                    prev_vp,
-                    extra_state,
-                ) = self._pause_stream_slots(
-                    envs_to_pause,
-                    self.envs,
-                    observations,
-                    gmaps,
-                    prev_vp,
-                    extra_state={
-                        "slot_ids": slot_ids,
-                        "slot_txt_masks": slot_txt_masks,
-                        "slot_txt_embeds": slot_txt_embeds,
-                        "slot_episode_steps": slot_episode_steps,
-                    },
-                    oracle_manager=oracle_manager,
-                )
-                slot_ids = extra_state["slot_ids"]
-                slot_txt_masks = extra_state["slot_txt_masks"]
-                slot_txt_embeds = extra_state["slot_txt_embeds"]
-                slot_episode_steps = extra_state["slot_episode_steps"]
-                self.gmaps = gmaps
-                if oracle_manager is not None:
-                    oracle_manager.rebind_after_pause(slot_ids)
-
-        if timing_enabled:
-            self._train_rollout_counter += 1
-            rollout_total = time.perf_counter() - rollout_t0
-            self._write_perf_timing_log(
-                {
-                    "rollout_id": self._train_rollout_counter,
-                    "steps": step_counter,
-                    "env_instances_avg": env_instance_sum / max(step_counter, 1),
-                    "total_actions": total_actions,
-                    "waypoint": timing_acc["waypoint"],
-                    "env_call_at": timing_acc["env_call_at"],
-                    "navigation": timing_acc["navigation"],
-                    "env_step": timing_acc["env_step"],
-                    "rollout_total": rollout_total,
-                    "env_call_at_requests": env_call_at_requests,
+                rollout_t0 = time.perf_counter()
+                timing_acc = {
+                    "waypoint": 0.0,
+                    "env_call_at": 0.0,
+                    "navigation": 0.0,
+                    "env_step": 0.0,
                 }
-            )
+                step_counter = 0
+                env_instance_sum = 0
+                env_call_at_requests = 0
 
-        assert total_actions > 0
-        loss = ml_weight * loss_sum / total_actions
-        self.loss = loss
-        self.logs["IL_loss"].append(loss.item())
-        return loss
+            while len(observations) > 0 and total_actions < action_budget:
+                self._update_train_progress(active_envs=len(observations))
+                remaining_actions = action_budget - total_actions
+                if remaining_actions < len(observations):
+                    trim = self._tail_indices_to_trim(
+                        len(observations), remaining_actions
+                    )
+                    (
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        extra_state,
+                    ) = self._pause_stream_slots(
+                        trim,
+                        self.envs,
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        extra_state={
+                            "slot_ids": slot_ids,
+                            "slot_txt_masks": slot_txt_masks,
+                            "slot_txt_embeds": slot_txt_embeds,
+                            "slot_episode_steps": slot_episode_steps,
+                        },
+                        oracle_manager=oracle_manager,
+                    )
+                    slot_ids = extra_state["slot_ids"]
+                    slot_txt_masks = extra_state["slot_txt_masks"]
+                    slot_txt_embeds = extra_state["slot_txt_embeds"]
+                    slot_episode_steps = extra_state["slot_episode_steps"]
+                    self.gmaps = gmaps
+                    if oracle_manager is not None:
+                        oracle_manager.rebind_after_pause(slot_ids)
+                    if len(observations) == 0:
+                        break
+
+                if timing_enabled:
+                    step_counter += 1
+                    env_instance_sum += len(observations)
+
+                step_out = self._rollout_step_core(
+                    mode="train",
+                    observations=observations,
+                    gmaps=gmaps,
+                    prev_vp=prev_vp,
+                    slot_ids=slot_ids,
+                    slot_txt_masks=slot_txt_masks,
+                    slot_txt_embeds=slot_txt_embeds,
+                    slot_episode_steps=slot_episode_steps,
+                    oracle_manager=oracle_manager,
+                    sample_ratio=sample_ratio,
+                )
+                observations = step_out["observations"]
+                dones = step_out["dones"]
+                gmaps = step_out["gmaps"]
+                prev_vp = step_out["prev_vp"]
+                loss_sum = loss_sum + step_out["loss_contribution"]
+                total_actions += step_out["actions_issued"]
+                self.gmaps = gmaps
+
+                if timing_enabled:
+                    timing = step_out["timing"]
+                    timing_acc["waypoint"] += timing["waypoint"]
+                    timing_acc["env_call_at"] += timing["env_call_at"]
+                    timing_acc["navigation"] += timing["navigation"]
+                    timing_acc["env_step"] += timing["env_step"]
+                    env_call_at_requests += timing["env_call_at_requests"]
+
+                envs_to_pause = []
+                refill_candidates = []
+                for i in range(len(observations)):
+                    slot_episode_steps[i] += 1
+                    if dones[i] and slot_episode_steps[i] < self.max_len:
+                        refill_candidates.append(i)
+                    elif slot_episode_steps[i] >= self.max_len:
+                        envs_to_pause.append(i)
+
+                remaining_actions = max(action_budget - total_actions, 0)
+                surviving_active_after_step = max(
+                    len(observations)
+                    - len(refill_candidates)
+                    - len(envs_to_pause),
+                    0,
+                )
+                refill_quota = max(
+                    0, remaining_actions - surviving_active_after_step
+                )
+                refill_quota = min(refill_quota, len(refill_candidates))
+
+                for refill_idx, i in enumerate(refill_candidates):
+                    if refill_idx >= refill_quota:
+                        envs_to_pause.append(i)
+                        continue
+                    self._reset_train_stream_slot(
+                        i,
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        slot_ids,
+                        slot_episode_steps,
+                        slot_txt_masks,
+                        slot_txt_embeds,
+                        oracle_manager=oracle_manager,
+                    )
+
+                if len(envs_to_pause) > 0:
+                    (
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        extra_state,
+                    ) = self._pause_stream_slots(
+                        envs_to_pause,
+                        self.envs,
+                        observations,
+                        gmaps,
+                        prev_vp,
+                        extra_state={
+                            "slot_ids": slot_ids,
+                            "slot_txt_masks": slot_txt_masks,
+                            "slot_txt_embeds": slot_txt_embeds,
+                            "slot_episode_steps": slot_episode_steps,
+                        },
+                        oracle_manager=oracle_manager,
+                    )
+                    slot_ids = extra_state["slot_ids"]
+                    slot_txt_masks = extra_state["slot_txt_masks"]
+                    slot_txt_embeds = extra_state["slot_txt_embeds"]
+                    slot_episode_steps = extra_state["slot_episode_steps"]
+                    self.gmaps = gmaps
+                    if oracle_manager is not None:
+                        oracle_manager.rebind_after_pause(slot_ids)
+
+            if timing_enabled:
+                self._train_rollout_counter += 1
+                rollout_total = time.perf_counter() - rollout_t0
+                self._write_perf_timing_log(
+                    {
+                        "rollout_id": self._train_rollout_counter,
+                        "steps": step_counter,
+                        "env_instances_avg": env_instance_sum / max(step_counter, 1),
+                        "total_actions": total_actions,
+                        "waypoint": timing_acc["waypoint"],
+                        "env_call_at": timing_acc["env_call_at"],
+                        "navigation": timing_acc["navigation"],
+                        "env_step": timing_acc["env_step"],
+                        "rollout_total": rollout_total,
+                        "env_call_at_requests": env_call_at_requests,
+                    }
+                )
+
+            assert total_actions > 0
+            loss = ml_weight * loss_sum / total_actions
+            self.loss = loss
+            self.logs["IL_loss"].append(loss.item())
+            return loss
+        finally:
+            if getattr(self.config.ORACLE.trace, "flush_on_run_end", True):
+                self._flush_oracle_log_buffers(oracle_manager)
 
     def rollout(self, mode, ml_weight=None, sample_ratio=None):
         return self._rollout_legacy(mode, ml_weight, sample_ratio)
 
     def _rollout_legacy(self, mode, ml_weight=None, sample_ratio=None):
+        self._active_oracle_manager = None
+        try:
+            return self._rollout_legacy_impl(mode, ml_weight, sample_ratio)
+        finally:
+            if getattr(self.config.ORACLE.trace, "flush_on_run_end", True):
+                self._flush_oracle_log_buffers(
+                    getattr(self, "_active_oracle_manager", None)
+                )
+            self._active_oracle_manager = None
+
+    def _rollout_legacy_impl(self, mode, ml_weight=None, sample_ratio=None):
         #真正的训练循环与环境交互
 
         if mode == 'train':
@@ -3524,6 +3804,10 @@ class RLTrainer(BaseVLNCETrainer):
         for stepk in range(self.max_len):
             if mode == 'train':
                 self._update_train_progress(active_envs=self.envs.num_envs)
+            if mode == 'eval' and self._eval_runtime_stats is not None:
+                self._eval_runtime_stats["active_envs_series"].append(
+                    self.envs.num_envs
+                )
             total_actions += self.envs.num_envs
             #性能分析使用
             if timing_enabled:
@@ -3794,11 +4078,10 @@ class RLTrainer(BaseVLNCETrainer):
             if timing_enabled:
                 t_navigation = time.perf_counter()
 
-            current_eps = self.envs.current_episodes()
             scope_trace_records = []
             oracle_mode_enabled = self._is_oracle_effective_for_mode(mode)
             if oracle_mode_enabled:
-                oracle_stats = self._init_oracle_query_stats()
+                current_eps = self.envs.current_episodes()
                 if self._get_oracle_scope_name() == "top1_shadow":
                     planner_cache = self._forward_navigation_once(
                         cur_vp,
@@ -3808,26 +4091,22 @@ class RLTrainer(BaseVLNCETrainer):
                         txt_masks,
                         use_oracle_embeds=False,
                     )
-                    top1_shadow_scope_ids = []
-                    for i, gmap in enumerate(self.gmaps):
-                        slot_id = not_done_index[i]
-                        trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
-                            oracle_manager=oracle_manager,
-                            mode=mode,
-                            stepk=stepk,
-                            env_idx=i,
-                            original_env_index=not_done_index[i],
-                            slot_id=slot_id,
-                            gmap=gmap,
-                            current_episode=current_eps[i],
-                            current_real_vp=cur_vp[i],
-                            planner_cache=planner_cache,
-                        )
-                        scope_trace_records.append(trace_record)
-                        top1_shadow_scope_ids.append(
-                            list(trace_record.get("selected_scope_ids", []))
-                        )
-                        self._merge_oracle_query_stats(oracle_stats, env_oracle_stats)
+                    (
+                        top1_shadow_scope_ids,
+                        scope_trace_records,
+                        oracle_stats,
+                        oracle_result_overrides_per_env,
+                    ) = self._run_oracle_scope_batch(
+                        oracle_manager=oracle_manager,
+                        mode=mode,
+                        stepks=[stepk] * len(self.gmaps),
+                        env_indices=not_done_index,
+                        slot_ids=not_done_index,
+                        gmaps=self.gmaps,
+                        current_episodes=current_eps,
+                        current_real_vps=cur_vp,
+                        planner_cache=planner_cache,
+                    )
                     if self.config.ORACLE.shadow_rerun_planner:
                         nav_bundle = self._forward_navigation_once(
                             cur_vp,
@@ -3837,30 +4116,27 @@ class RLTrainer(BaseVLNCETrainer):
                             txt_masks,
                             use_oracle_embeds=True,
                             oracle_scope_ids_per_env=top1_shadow_scope_ids,
+                            oracle_result_overrides_per_env=oracle_result_overrides_per_env,
                         )
                     else:
                         nav_bundle = planner_cache
                 else:
-                    scoped_oracle_ids_per_env = []
-                    for i, gmap in enumerate(self.gmaps):
-                        slot_id = not_done_index[i]
-                        trace_record, env_oracle_stats = self._apply_oracle_scope_for_env(
-                            oracle_manager=oracle_manager,
-                            mode=mode,
-                            stepk=stepk,
-                            env_idx=i,
-                            original_env_index=not_done_index[i],
-                            slot_id=slot_id,
-                            gmap=gmap,
-                            current_episode=current_eps[i],
-                            current_real_vp=cur_vp[i],
-                            planner_cache=None,
-                        )
-                        scope_trace_records.append(trace_record)
-                        scoped_oracle_ids_per_env.append(
-                            list(trace_record.get("selected_scope_ids", []))
-                        )
-                        self._merge_oracle_query_stats(oracle_stats, env_oracle_stats)
+                    (
+                        scoped_oracle_ids_per_env,
+                        scope_trace_records,
+                        oracle_stats,
+                        oracle_result_overrides_per_env,
+                    ) = self._run_oracle_scope_batch(
+                        oracle_manager=oracle_manager,
+                        mode=mode,
+                        stepks=[stepk] * len(self.gmaps),
+                        env_indices=not_done_index,
+                        slot_ids=not_done_index,
+                        gmaps=self.gmaps,
+                        current_episodes=current_eps,
+                        current_real_vps=cur_vp,
+                        planner_cache=None,
+                    )
                     nav_bundle = self._forward_navigation_once(
                         cur_vp,
                         cur_pos,
@@ -3869,6 +4145,7 @@ class RLTrainer(BaseVLNCETrainer):
                         txt_masks,
                         use_oracle_embeds=True,
                         oracle_scope_ids_per_env=scoped_oracle_ids_per_env,
+                        oracle_result_overrides_per_env=oracle_result_overrides_per_env,
                     )
 
                 if self.local_rank < 1:
@@ -3886,11 +4163,18 @@ class RLTrainer(BaseVLNCETrainer):
                         f"cache_hit={cache_hit_cnt} ({cache_hit_pct:.2%}) "
                         f"intra_ep_hit={intra_hit_cnt} ({float(oracle_stats.get('intra_episode_cache_hit_pct', 0.0)):.2%}) "
                         f"cross_ep_hit={cross_hit_cnt} ({float(oracle_stats.get('cross_episode_cache_hit_pct', 0.0)):.2%}) "
+                        f"provider_miss={int(oracle_stats.get('provider_miss_cnt', 0))} "
                         f"resolve_fail={int(oracle_stats.get('resolve_fail_cnt', 0))} "
                         f"provider_fail={int(oracle_stats.get('provider_fail_cnt', 0))} "
-                        f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f}"
+                        f"avg_latency_ms={float(oracle_stats.get('avg_latency_ms', 0.0)):.2f} "
+                        f"provider_avg_latency_ms={float(oracle_stats.get('provider_avg_latency_ms', 0.0)):.2f} "
+                        f"batched_provider_call_cnt={int(oracle_stats.get('batched_provider_call_cnt', 0))} "
+                        f"provider_avg_batch_size={float(oracle_stats.get('provider_avg_batch_size', 0.0)):.2f}"
                     )
                     self._write_oracle_summary_log(oracle_summary_line)
+
+                if mode == 'eval':
+                    self._accumulate_eval_oracle_stats(oracle_stats)
 
                 if mode == 'train':
                     self.logs['oracle/query_cnt'].append(float(oracle_stats.get("query_cnt", 0)))
@@ -4159,6 +4443,10 @@ class RLTrainer(BaseVLNCETrainer):
             loss = ml_weight * loss / total_actions
             self.loss += loss
             self.logs['IL_loss'].append(loss.item())
+            if oracle_manager is not None:
+                oracle_manager.flush_trace_buffers()
             return loss
 
+        if oracle_manager is not None:
+            oracle_manager.flush_trace_buffers()
         return None

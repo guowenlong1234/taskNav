@@ -1,6 +1,0 @@
-IL:
-  TRAIN_ENV_REFILL_POLICY: streaming_refill
-
-ORACLE:
-  enable: True
-  enable_in_train: True

@@ -1,4 +1,5 @@
 from typing import Any, Dict, Optional, Tuple, List, Union
+import copy
 import math
 import random
 import habitat
@@ -162,6 +163,129 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         finally:
             if not keep_agent_at_new_pose:  #回退到初始位置
                 sim.set_agent_state(init_state.position, init_state.rotation)
+
+    @staticmethod
+    def _safe_state_copy(value):
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            try:
+                return copy.copy(value)
+            except Exception:
+                return value
+
+    def _snapshot_task_measure_states(self) -> Dict[str, Dict[str, Any]]:
+        task = getattr(self._env, "task", None)
+        measurements = getattr(task, "measurements", None)
+        measure_map = getattr(measurements, "measures", None)
+        if measure_map is None:
+            return {}
+
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for name, measure in measure_map.items():
+            state: Dict[str, Any] = {}
+            for key, value in measure.__dict__.items():
+                if key in {"_sim", "_config"}:
+                    continue
+                state[key] = self._safe_state_copy(value)
+            snapshot[str(name)] = state
+        return snapshot
+
+    def _restore_task_measure_states(
+        self,
+        snapshot: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if len(snapshot) == 0:
+            return
+
+        task = getattr(self._env, "task", None)
+        measurements = getattr(task, "measurements", None)
+        measure_map = getattr(measurements, "measures", None)
+        if measure_map is None:
+            return
+
+        for name, state in snapshot.items():
+            measure = measure_map.get(name)
+            if measure is None:
+                continue
+            current_keys = [
+                key
+                for key in list(measure.__dict__.keys())
+                if key not in {"_sim", "_config"}
+            ]
+            for key in current_keys:
+                if key not in state:
+                    measure.__dict__.pop(key, None)
+            for key, value in state.items():
+                measure.__dict__[key] = value
+
+    def get_oracle_pano_obs_at_batch(
+        self,
+        queries: List[Dict[str, Any]],
+        keep_agent_at_new_pose: bool = False,
+    ) -> List[Dict[str, Any]]:
+        sim = self._env.sim
+        init_state = sim.get_agent_state()
+        init_episode_over = bool(self._env.episode_over)
+        init_elapsed_steps = getattr(self._env, "_elapsed_steps", None)
+        task = getattr(self._env, "task", None)
+        init_is_stop_called = bool(getattr(task, "is_stop_called", False))
+        init_is_episode_active = getattr(task, "_is_episode_active", None)
+        measure_state_snapshot = self._snapshot_task_measure_states()
+        results: List[Dict[str, Any]] = []
+
+        try:
+            for query_index, query in enumerate(list(queries)):
+                result_query_index = int(query.get("query_index", query_index))
+                position = list(query.get("position", []))
+                heading_rad = float(query.get("heading_rad", 0.0))
+                elevation_rad = float(query.get("elevation_rad", 0.0))
+                try:
+                    obs = self.get_oracle_pano_obs_at(
+                        position=position,
+                        heading_rad=heading_rad,
+                        elevation_rad=elevation_rad,
+                        keep_agent_at_new_pose=keep_agent_at_new_pose,
+                        strict=False,
+                    )
+                    ok = isinstance(obs, dict) and len(obs) > 0
+                    results.append(
+                        {
+                            "ok": ok,
+                            "obs": obs if ok else None,
+                            "reason": None if ok else "peek_failed",
+                            "query_index": result_query_index,
+                            "position": position,
+                            "heading_rad": heading_rad,
+                        }
+                    )
+                except Exception as e:
+                    results.append(
+                        {
+                            "ok": False,
+                            "obs": None,
+                            "reason": str(e),
+                            "query_index": result_query_index,
+                            "position": position,
+                            "heading_rad": heading_rad,
+                        }
+                    )
+        finally:
+            # Batch peek is defined as a no-side-effect RPC; always restore the
+            # entry pose unless the caller explicitly asks to keep the final pose.
+            if not keep_agent_at_new_pose:
+                sim.set_agent_state(init_state.position, init_state.rotation)
+            if hasattr(self._env, "_elapsed_steps") and init_elapsed_steps is not None:
+                self._env._elapsed_steps = init_elapsed_steps
+            if hasattr(self._env, "_episode_over"):
+                self._env._episode_over = init_episode_over
+            if task is not None and hasattr(task, "is_stop_called"):
+                task.is_stop_called = init_is_stop_called
+            if task is not None and hasattr(task, "_is_episode_active"):
+                task._is_episode_active = init_is_episode_active
+            self._restore_task_measure_states(measure_state_snapshot)
+
+        return results
 
     def get_cand_real_pos(self, forward, angle):
         '''get cand real_pos by executing action'''

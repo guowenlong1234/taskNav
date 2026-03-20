@@ -1,7 +1,9 @@
 ORACLE:
   enable: False
+  enable_in_train: False
   enable_in_eval: False
+  cache_enable: False
 
 MODEL:
   ORACLE_FT:
-    enable: True
+    enable: False
