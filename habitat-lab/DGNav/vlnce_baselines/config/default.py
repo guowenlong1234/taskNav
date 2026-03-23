@@ -65,6 +65,20 @@ _C.INFERENCE.NONLEARNING.AGENT = "RandomAgent"
 _C.INFERENCE.FORMAT = "rxr"  # either 'rxr' or 'r2r'
 _C.INFERENCE.EPISODE_COUNT = -1
 # -----------------------------------------------------------------------------
+# COLLECT CONFIG
+# -----------------------------------------------------------------------------
+_C.COLLECT = CN()
+_C.COLLECT.enable = False
+_C.COLLECT.output_dir = "data/logs/ghost_wm_collect/"
+_C.COLLECT.flush_every_n_samples = 50
+_C.COLLECT.collect_visual_debug = False
+_C.COLLECT.save_debug_meta = True
+_C.COLLECT.max_episodes = -1
+_C.COLLECT.max_samples = -1
+_C.COLLECT.collect_target_supervision = True
+_C.COLLECT.feature_dtype = "float16"
+_C.COLLECT.debug_dir = "data/logs/ghost_wm_collect/debug/"
+# -----------------------------------------------------------------------------
 # IMITATION LEARNING CONFIG
 # -----------------------------------------------------------------------------
 _C.IL = CN()

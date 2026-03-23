@@ -49,6 +49,7 @@ usage() {
   A2  serial Oracle eval, streaming_refill + cache
   A3  batch Oracle eval, streaming_refill + cache + batch_query, full val_unseen
   T1  Oracle train, streaming_refill + cache + batch_query + Oracle-FT
+  collect  Ghost-WM 数据采集模式
 
 默认对齐口径:
   - A1/A2:
@@ -125,6 +126,7 @@ oracle_train_resume_ckpt="${dgnav_dir}/data/logs/checkpoints/oracle_train_stream
 fixed500_file="run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt"
 fixed500_file_path="${dgnav_dir}/${fixed500_file}"
 oracle_stack="run_r2r/r2r_oracle.yaml"
+collect_stack="run_r2r/collect.yaml"
 
 run_type="eval"
 exp_name=""
@@ -192,7 +194,7 @@ case "${preset}" in
             ;;
       T1)
             run_type="train"
-            exp_name="oracle_all_pool"
+            exp_name="oracle_all_pool2"
             preset_master_port="4861"
             preset_num_environments="6"
             preset_opts=(
@@ -202,8 +204,8 @@ case "${preset}" in
                   "IL.sample_ratio" "0.75"
                   "IL.decay_interval" "3000"
                   "IL.waypoint_aug" "True"
-                  "IL.load_from_ckpt" "True"
-                  "IL.is_requeue" "True"
+                  "IL.load_from_ckpt" "False"
+                  "IL.is_requeue" "False"
                   "IL.ckpt_to_load" "/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_all_pool"
                   "IL.TRAIN_ENV_REFILL_POLICY" "streaming_refill"
                   "IL.TRAIN_STATIC_SCENE_POOLS_ENABLE" "True"
@@ -227,6 +229,22 @@ case "${preset}" in
                   "MODEL.ORACLE_FT.train_scope" "baseline_plus_oracle_adapter"
             )
             required_paths+=("${best_nav_pretrain_base}" "${oracle_train_resume_ckpt}")
+            ;;
+      collect)
+            run_type="collect"
+            exp_name="ghost_wm_collect"
+            exp_config="${collect_stack}"
+            preset_master_port="4871"
+            preset_num_environments="4"
+            preset_opts=(
+                  "COLLECT.enable" "True"
+                  "COLLECT.output_dir" "data/logs/ghost_wm_collect/"
+                  "COLLECT.flush_every_n_samples" "50"
+                  "COLLECT.collect_visual_debug" "False"
+                  "COLLECT.save_debug_meta" "True"
+                  "COLLECT.collect_target_supervision" "True"
+                  "COLLECT.feature_dtype" "float16"
+            )
             ;;
       *)
             echo "[main.bash] Unknown preset: ${preset}" >&2

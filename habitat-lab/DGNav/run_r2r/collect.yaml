@@ -1,0 +1,216 @@
+TRAINER_NAME: SS-ETP
+TENSORBOARD_DIR: data/logs/tensorboard_dirs/
+CHECKPOINT_FOLDER: data/logs/checkpoints/
+EVAL_CKPT_PATH_DIR: data/logs/checkpoints/
+RESULTS_DIR: data/logs/eval_results/
+VIDEO_DIR: data/logs/video/
+VIDEO_OPTION: []
+
+TASK_CONFIG:
+  ENVIRONMENT:
+    MAX_EPISODE_STEPS: 5000
+  SIMULATOR:
+    ACTION_SPACE_CONFIG: v0
+    AGENT_0:
+      SENSORS: [RGB_SENSOR, DEPTH_SENSOR]
+    FORWARD_STEP_SIZE: 0.25
+    TURN_ANGLE: 15
+    HABITAT_SIM_V0:
+      GPU_DEVICE_ID: 0
+      ALLOW_SLIDING: True
+    RGB_SENSOR:
+      WIDTH: 224
+      HEIGHT: 224
+      HFOV: 90
+      TYPE: HabitatSimRGBSensor
+    DEPTH_SENSOR:
+      WIDTH: 256
+      HEIGHT: 256
+      HFOV: 90
+      TYPE: HabitatSimDepthSensor
+    TYPE: Sim-v1
+  TASK:
+    TYPE: VLN-v0
+    POSSIBLE_ACTIONS: [STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT, HIGHTOLOW]
+    SUCCESS_DISTANCE: 3.0
+    SENSORS:
+      - INSTRUCTION_SENSOR
+    INSTRUCTION_SENSOR_UUID: instruction
+    MEASUREMENTS: []
+    SUCCESS:
+      SUCCESS_DISTANCE: 3.0
+    SPL:
+      SUCCESS_DISTANCE: 3.0
+    NDTW:
+      SUCCESS_DISTANCE: 3.0
+      GT_PATH: data/datasets/R2R_VLNCE_v1-2_preprocessed/{split}/{split}_gt.json.gz
+    SDTW:
+      SUCCESS_DISTANCE: 3.0
+      GT_PATH: data/datasets/R2R_VLNCE_v1-2_preprocessed/{split}/{split}_gt.json.gz
+    ORACLE_SUCCESS:
+      SUCCESS_DISTANCE: 3.0
+  DATASET:
+    TYPE: VLN-CE-v1
+    SPLIT: train
+    DATA_PATH: data/datasets/R2R_VLNCE_v1-2_preprocessed_BERTidx/{split}/{split}_bertidx.json.gz
+    SCENES_DIR: data/scene_datasets/
+
+INFERENCE:
+  SPLIT: test
+  USE_CKPT_CONFIG: False
+  SAMPLE: False
+  CKPT_PATH: ""
+  PREDICTIONS_FILE: ""
+  FORMAT: r2r
+  EPISODE_COUNT: -1
+
+EVAL:
+  USE_CKPT_CONFIG: False
+  SPLIT: val_unseen
+  EPISODE_COUNT: -1
+  CKPT_PATH_DIR: ""
+  fast_eval: False
+  ENV_REFILL_POLICY: legacy_batch
+  EPISODE_ID_FILE: ""
+
+COLLECT:
+  enable: True
+  output_dir: data/logs/ghost_wm_collect/
+  flush_every_n_samples: 50
+  collect_visual_debug: False
+  save_debug_meta: True
+  max_episodes: -1
+  max_samples: -1
+  collect_target_supervision: True
+  feature_dtype: float16
+  debug_dir: data/logs/ghost_wm_collect/debug/
+
+IL:
+  iters: 20000
+  log_every: 200
+  lr: 1e-5
+  batch_size: 1
+  ml_weight: 1.0
+  expert_policy: spl
+  sample_ratio: 0.75
+  decay_interval: 3000
+  load_from_ckpt: False
+  ckpt_to_load: data/logs/checkpoints/ckpt.iter12000.pth
+  is_requeue: False
+  max_traj_len: 15
+  max_text_len: 80
+  TRAIN_ENV_REFILL_POLICY: legacy_batch
+  loc_noise: 0.50
+  use_dynamic_loc_noise: False
+  dynamic_loc_noise_min: 0.25
+  dynamic_loc_noise_max: 0.50
+  dynamic_loc_noise_alpha: 0.86
+  dynamic_loc_noise_beta: 0.23
+  dynamic_loc_noise_mapping: linear
+  dynamic_loc_noise_sigmoid_k: 12.0
+  dynamic_loc_noise_exponential_k: 4.0
+  use_random_loc_noise: False
+  random_loc_noise_min: 0.25
+  random_loc_noise_max: 0.50
+  waypoint_aug: False
+  ghost_aug: 0.0
+  back_algo: teleport
+  tryout: True
+
+MODEL:
+  task_type: r2r
+  policy_name: PolicyViewSelectionETP
+  rgb_feature_extractor: dino
+  dino: EffoNav
+  NUM_ANGLES: 12
+  pretrained_path: pretrained/ETP/mlm.sap_r2r/ckpts/model_step_82500.pt
+  fix_lang_embedding: False
+  fix_pano_embedding: False
+  use_depth_embedding: True
+  use_sprels: True
+  merge_ghost: True
+  consume_ghost: True
+  use_dynamic_graph: True
+  dynamic_graph_lr: 1e-4
+  use_esem: True
+  use_einst: True
+  use_geo_dropout: False
+  geo_dropout_prob: 0.3
+  use_node_gating: False
+  node_gating_lr: 1e-4
+  spatial_output: False
+  RGB_ENCODER:
+    output_size: 512
+  DEPTH_ENCODER:
+    output_size: 256
+  VISUAL_DIM:
+    vis_hidden: 768
+    directional: 128
+  INSTRUCTION_ENCODER:
+    bidirectional: True
+  ORACLE_FT:
+    enable: False
+    hidden_dim: 768
+    num_layers: 3
+    dropout: 0.1
+    activation: gelu
+    use_layer_norm: True
+    identity_init: True
+    gain_init: 1.0
+    fusion_alpha: 0.25
+    use_config_soft_alpha: True
+    train_scope: oracle_only
+    unfreeze_global_encoder: True
+    unfreeze_input_proj: False
+    oracle_mlp_lr: 5e-5
+    graph_lr: 5e-6
+    input_proj_lr: 1e-5
+    weight_decay: 0.01
+    log_feature_stats: True
+    eval_with_oracle_off: True
+
+ORACLE:
+  enable: True
+  mode: O1
+  provider: SimulatorPeekOracleProvider
+  force_have_real_pos: True
+  query_pipeline: future_node_avg_pano
+  query_pos_strategy: ghost_real_pos_mean
+  query_pos_fallback: nearest_real_pos
+  query_heading_strategy: face_frontier
+  target_ghost_scope: all
+  enable_in_train: True
+  enable_in_eval: True
+  apply_mode: soft
+  soft_alpha: 0.25
+  refresh_policy: on_change
+  strict_scope: True
+  shadow_rerun_planner: True
+  max_scope_ghosts: -1
+  scope_trace_enable: False
+  scope_summary_enable: False
+  scope_trace_dir: data/logs/oracle_scope_traces/
+  scope_summary_dir: data/logs/oracle_scope_summaries/
+  requery_min_pos_delta: 0.10
+  navigability_check: True
+  navigability_search_radius: 1.0
+  navigability_num_samples: 16
+  navigability_y_lock: True
+  cache_enable: True
+  cache_radius: 0.25
+  cache_max_items_per_scene: 4096
+  max_queries_per_step: -1
+  max_queries_per_episode: -1
+  use_amp: False
+  embed_dtype: fp32
+  persistent_writeback: True
+  trace:
+    enable: False
+    dir: data/logs/oracle_traces/
+    format: jsonl
+    log_every_n_steps: 1
+    counterfactual_trace: False
+    include_embed_vector: False
+    include_embed_norm: True
+    include_positions: True
+    include_failures: True

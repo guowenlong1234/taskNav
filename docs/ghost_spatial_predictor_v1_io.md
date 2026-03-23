@@ -37,6 +37,7 @@ sample = {
     # 从节点 2 移动到节点 1 过程中的历史
     "hist_visual":        Tensor[K, P, D_v],
     "hist_motion":        Tensor[K, D_m],
+    "hist_action":        Tensor[K] | Tensor[K, A] | list,
 
     # 当前真实节点 1 的全景
     "curr_pano":          Tensor[V, P, D_v],
@@ -51,13 +52,17 @@ sample = {
 
     # 元数据，不送入模型
     "episode_id":         str | int,
+    "scan_id":            str | int,
     "ghost_vp_id":        str,
-    "node_id_src":        int,
-    "node_id_cur":        int,
-    "node_id_tgt":        int,
-    "abs_pose_hist":      Tensor[K, 3],
-    "abs_pose_cur":       Tensor[3],
-    "abs_pose_tgt":       Tensor[3],
+    "node_id_src":        str | int,
+    "node_id_cur":        str | int,
+    "node_id_tgt":        str | int | None,
+    "hist_abs_pose":      Tensor[K, 3],
+    "curr_abs_pose":      Tensor[3],
+    "tgt_abs_pose":       Tensor[3],
+    "obs_count":          int,
+    "unique_front_count": int,
+    "waypoint_score_raw": float,
 }
 ```
 
@@ -65,6 +70,327 @@ V1 中的数据样本单位固定定义为：
 
 - 每个 ghost 对应一个样本
 - 如果同一个当前节点 `1` 后面存在多个 ghost，则使用同一个 `hist_visual / hist_motion / curr_pano` 上下文，沿样本维分别展开多个 `ghost_query / ghost_meta / target_ghost_pano`
+
+### V1 数据采集字段总表
+
+为了避免采集字段分散在文档不同位置，V1 统一把离线数据采集相关的字段归纳成下面 4 个结构。
+
+#### 1. 稠密执行轨迹 `trace_step`
+
+这是 `2 -> 1` 执行过程中的原始采集单元。
+
+```python
+trace_step = {
+    "step_id": int,
+    "action": int | str | Tensor,
+    "position": Tensor[3],
+    "heading": float,
+    "dino_patch": Tensor[196, 384],
+    "collided": bool,
+}
+```
+
+字段说明：
+
+- `action`：低层原始动作，主要用于调试、回放和误差分析
+- `position`、`heading`：后续用于构造 `hist_motion`
+- `dino_patch`：当前单视角图像编码后的 patch 特征
+- `collided`：用于过滤低信息量和异常重复帧
+
+V1 在这一层默认：
+
+- 不保存原始 RGB / depth 图像
+- 采样时直接编码后落盘
+- `action` 和位姿信息同时保留
+
+这里需要进一步区分“episode 内临时缓存”和“最终落盘格式”。
+
+V1 最终采用的默认策略是：
+
+- 在 episode 执行过程中，允许临时缓存每个低层 step 对应的原始 front 图像
+- 到达当前节点 `1` 后，再把路上的 `n` 张 front 图像与当前节点的 `12` 张 pano 图像拼成一个 batch
+- 如果当前节点下有 `G` 个待监督 ghost，则再额外加入这些 ghost 的 `12 * G` 张 target pano 图像
+- 对这 `n + 12 + 12 * G` 张图像统一送入 DINO backbone 做一次批量编码
+- 将编码后的 patch 特征回填到 `trace_step` 和 `curr_pano`
+- 最终真正写入离线数据集时，只保存编码后的特征，不保存原始 RGB / depth
+
+这样设计的目的有两个：
+
+- 保留整段 `2 -> 1` 执行过程中的全部中间观测，方便后续修改 `K` 或历史采样规则时无需重新采集 episode
+- 尽量将 DINO 编码改成到达节点后的批量处理，以减少频繁环境交互下逐帧编码带来的额外开销
+
+并且由于这些 target pano 的采集不参与当前 step 的 planner 决策，因此：
+
+- V1 允许在 episode 执行结束当前高层 step 后，再异步或半异步地组装样本
+- 也就是说，target supervision 的采集与编码不需要卡在实时决策链路中
+
+因此，V1 推荐的数据采集流水线是：
+
+1. 低层执行时临时缓存原始 front 图像与位姿、动作
+2. 到达节点后统一批量编码
+3. 最终只把编码后的特征和必要元数据落盘
+
+### 可视化调试开关
+
+V1 额外建议提供一个数据采集级别的可视化调试开关，例如：
+
+```python
+collect_visual_debug = True | False
+```
+
+默认情况下：
+
+- 该开关关闭
+- 只保存最终训练所需的特征与元数据
+
+当该开关打开时，数据采集阶段应额外保存以下调试信息：
+
+1. 关键采样点对应的原始图像  
+   包括：
+   - 历史采样到的 `K` 个关键 front 图像
+   - 当前节点 `curr_pano` 的 `12` 张 pano 图像
+   - 目标监督 `target_ghost_pano` 的 `12` 张 pano 图像
+
+2. 对应 step 的地图俯视图 / top-down map  
+   并在图上显式标记：
+   - 当前真实节点位置
+   - 历史关键采样点位置
+   - 目标 `ghost_mean_pos`
+   - 各关键点的朝向箭头
+   - `ghost_query` 对应的 canonical front 方向
+
+3. 关键字段的配套调试元数据  
+   例如：
+   - `episode_id`
+   - `ghost_vp_id`
+   - `step_id`
+   - `hist_abs_pose`
+   - `curr_abs_pose`
+   - `tgt_abs_pose`
+
+这个开关的目的不是参与训练，而是：
+
+- 用于人工检查样本采样是否发生错位
+- 用于定位 silent bug
+- 用于核对 `hist_visual / curr_pano / target_ghost_pano` 三者在空间上的对应关系
+
+因此，V1 在这里的原则固定为：
+
+- 默认训练数据集不保存这些额外图片
+- 但必须保留一个可选调试开关
+- 一旦打开，就额外保存原始图片与地图标注结果，专门用于样本质检
+
+### `update_graph` 中的 `cand2ghost` 记录
+
+V1 明确建议在 `graph_utils.update_graph(...)` 中补充一份当前 step 的 candidate-to-target 映射记录，记为 `cand2ghost` 或 `cand_match_records`。
+
+这样做的原因是：
+
+- `identify_node(...)` 里生成的 `cand_vp` 只是当前 step 的临时 candidate id，例如 `\"3_0\"`、`\"3_1\"`
+- 它不是稳定的 ghost id，也不是最终图里的节点 id
+- 真正决定“这个 candidate 最后对应哪个 ghost / node”的逻辑只存在于 `update_graph(...)` 内部
+- 如果不在这里显式保留映射，后续样本组装阶段很难稳定地把当前 step 的 `waypoint_score`、`ghost_query`、`cand_real_pos` 绑定到最终的 ghost 身份上
+
+特别要注意：
+
+- 现有的 `last_added_ghost_ids / step_added_ghost_ids` 只覆盖“新建 ghost”
+- 它们不能覆盖“当前 candidate merge 到已有 ghost”这种情况
+- 因此它们不足以支持稳定的样本生成
+
+V1 推荐的 `cand_match_record` 至少包含：
+
+```python
+{
+    "cand_index": int,
+    "cand_vp": str,
+    "front_vp": str,
+    "target_kind": "node" | "ghost",
+    "target_id": str,
+    "is_new_ghost": bool,
+}
+```
+
+工程上推荐两种方式同时保留：
+
+- `update_graph(...)` 直接返回当前 step 的 `cand_match_records`
+- 同时把它缓存到 `gmap.last_cand_match_records` 和 `gmap.step_cand_match_records[step_id]`
+
+这样既方便 trainer 当场生成样本，也方便后续异步样本组装流水线复用。
+
+### 样本生成时机与多路径重复观测规则
+
+V1 中，一条样本的基本单位固定为：
+
+- 一次当前路径下的 ghost 观测事件
+
+而不是：
+
+- 一个 ghost 在多条路径信息融合后的最终状态
+
+因此，V1 对样本生成时机的规则固定为：
+
+1. 先在 `update_graph(...)` 之前缓存当前路径下的局部观测信息  
+   这里包括：
+   - `hist_visual`
+   - `hist_motion`
+   - `hist_action`
+   - `curr_pano`
+   - 当前 step 的 candidate-level `ghost_query`
+   - 当前 step 的 `waypoint_score`
+
+2. 再执行 `update_graph(...)`  
+   这一步只负责：
+   - 决定 candidate 最后对应哪个 ghost / node
+   - 更新图结构
+   - 产出 `cand2ghost`
+
+3. 最后根据 `cand2ghost` 完成样本落盘  
+   其中：
+   - 当前路径下的观测特征保持不变
+   - 不用“合并后的视觉特征”回写旧样本
+   - 旧样本一旦生成，不再被后续其它路径的融合结果覆盖
+
+因此，如果某个 ghost 在之后的另一条路径上又被观测到，并发生了合并：
+
+- 这一次新的观测事件可以再生成一条新的样本
+- 但不因为“ghost 被合并了”而额外生成一个纯融合态样本
+- 每条样本只对应其各自路径下、各自时刻的局部观测上下文
+
+这对应 V1 的单路径预测设定：
+
+- 样本中的视觉上下文不跨路径融合
+- 多路径协同预测留到后续版本再做
+
+#### 2. 当前节点下的 ghost 条件记录 `ghost_record`
+
+这是当前真实节点 `1` 下，对每个 ghost 候选保存的条件信息。
+
+```python
+ghost_record = {
+    "ghost_vp_id": str,
+    "ghost_query": Tensor[5],
+    "ghost_meta": Tensor[2],
+    "obs_count": int,
+    "unique_front_count": int,
+    "waypoint_score_raw": float,
+    "ghost_mean_pos": Tensor[3],
+}
+```
+
+字段说明：
+
+- `ghost_query = [r, sin(bearing), cos(bearing), sin(delta_heading), cos(delta_heading)]`
+- `ghost_meta = [ghost_prior, waypoint_score]`
+- `ghost_mean_pos`：默认作为目标监督位置
+
+#### 3. 目标监督记录 `target_record`
+
+这是为某个 ghost 构造监督信号时所采集的目标信息。
+
+```python
+target_record = {
+    "target_position": Tensor[3],
+    "target_heading_front": float,
+    "target_ghost_pano": Tensor[12, 196, 384],
+    "target_conf_mask": Tensor[1],
+}
+```
+
+字段说明：
+
+- `target_position`：默认直接取 `ghost_mean_pos`
+- `target_heading_front`：默认定义为 `heading_cur + bearing`
+- `target_ghost_pano`：在目标位置处，以 canonical front 为 `view_0` 采集并编码后的完整 `12` 视角 pano 特征
+- `target_conf_mask`：若目标监督无法成功构造，则置 `0`
+
+#### 4. 最终训练样本 `sample`
+
+这是最终真正写入离线数据集并送入模型训练的样本。
+
+```python
+sample = {
+    "hist_visual":        Tensor[3, 196, 384],
+    "hist_motion":        Tensor[3, 5],
+    "hist_action":        Tensor[3] | Tensor[3, A] | list,
+
+    "curr_pano":          Tensor[12, 196, 384],
+
+    "ghost_query":        Tensor[5],
+    "ghost_meta":         Tensor[2],
+
+    "target_ghost_pano":  Tensor[12, 196, 384],
+    "target_conf_mask":   Tensor[1],
+
+    "episode_id":         str | int,
+    "scan_id":            str | int,
+    "ghost_vp_id":        str,
+    "node_id_src":        str | int,
+    "node_id_cur":        str | int,
+    "node_id_tgt":        str | int | None,
+
+    "hist_abs_pose":      Tensor[3, 3],
+    "curr_abs_pose":      Tensor[3],
+    "tgt_abs_pose":       Tensor[3],
+
+    "obs_count":          int,
+    "unique_front_count": int,
+    "waypoint_score_raw": float,
+}
+```
+
+V1 中，真正喂模型的主要字段是：
+
+- `hist_visual`
+- `hist_motion`
+- `curr_pano`
+- `ghost_query`
+- `ghost_meta`
+
+监督字段是：
+
+- `target_ghost_pano`
+- `target_conf_mask`
+
+其余字段主要用于：
+
+- 复原图结构统计
+- debug
+- 数据质量检查
+- 后续重算或做消融实验
+
+### `target_ghost_pano` 的监督朝向定义
+
+V1 中，目标监督默认使用**完整的 12 视角全景监督**，而不是只监督单个 front 视角。
+
+但是，这个 12 视角全景必须使用一个固定的 canonical front 来定义 `view_0`。V1 将这个 canonical front 固定为：
+
+- 从当前真实节点 `1` 出发
+- 沿 `ghost_query` 所定义的 `1 -> ghost` 查询方向直行
+- 中间不引入额外转弯朝向
+
+也就是说：
+
+- `target_ghost_pano` 的 `view_0`，固定对齐到 `ghost_query` 的前向方向
+- `view_1 ... view_11` 再按逆时针 `30°` 依次展开
+
+如果用角度表达，可以写成：
+
+```python
+heading_tgt_canonical = heading_cur + bearing
+```
+
+再将该角度规范到统一范围内。
+
+在 Habitat 环境中，第一版可以按这个 canonical heading，在目标位姿处调用 `_env.sim.get_observations_at(...)` 一类接口采集目标监督图像，再编码成 `12 x 196 x 384` 的 DINO patch 特征。
+
+因此，V1 的目标监督不是：
+
+- 跟随真实执行过程中的最终朝向
+- 也不是任意选择一个目标节点默认朝向
+
+而是：
+
+- 始终与当前样本的 `ghost_query` 方向严格对齐
 
 符号说明：
 
@@ -792,12 +1118,218 @@ forward(x, mode, output_kind=\"default\")
 - V1 预测目标 ghost 节点完整的 12 视角 patch 级 latent panorama。
 - 预测目标始终位于 DINO 特征空间中。
 
-### 2. Ghost 置信度
+第一版默认在输出端加入一个逐 patch 的线性映射头：
+
+```python
+patch_head: Linear(394, 384)
+```
+
+因此：
+
+- 主干 predictor 内部 token hidden dim 仍然是 `394`
+- 最终监督时，先通过 `patch_head` 将每个预测 token 映射回视觉空间 `384`
+- 再与目标 ghost 的 DINO patch 特征进行比较
+
+### 2. Ghost 全局特征
+
+`pred_ghost_global: Tensor[D_v]`
+
+V1 默认不使用额外的 `CLS token` 来产生全局特征，而是直接从 patch 级预测结果中做固定 pooling。
+
+推荐流程为：
+
+```python
+pred_patch:   [B, 12, 196, 384]
+pred_view:    [B, 12, 384]   # 对 patch 维做 mean pooling
+pred_global:  [B, 384]       # 对 view 维做 mean pooling
+```
+
+也就是说：
+
+- 每个视角内部先对 `196` 个 patch 做 mean pooling
+- 再对 `12` 个视角做 mean pooling
+- 第一版这里默认不再引入额外可学习的 global aggregator
+- 下游 planner 使用的是这个 node-level 全局特征
+
+### 3. Ghost 置信度
 
 `pred_ghost_conf: Tensor[1]`
 
 - V1 使用一个标量表示整个 ghost 节点的预测置信度。
 - 后续如果有需要，可以再扩展到 per-view 或 per-patch 级别的置信度。
+
+第一版默认使用一个独立的小置信度头：
+
+```python
+confidence_head: MLP(384 -> 128 -> 1)
+```
+
+其输入默认定义为：
+
+```python
+conf_input = stopgrad(pred_ghost_global)
+```
+
+也就是说：
+
+- 第一版默认只使用 `pred_ghost_global` 作为置信度预测输入
+- 并且在进入 `confidence_head` 前先做 `detach`
+- 因此 `L_conf` 默认只训练置信度分支，而不反向影响主干特征预测器
+
+## V1 监督信号与损失
+
+V1 默认使用三类监督信号：
+
+1. patch-level 特征监督
+2. global-level 特征监督
+3. confidence 监督
+
+### 1. `L_patch`
+
+主监督信号固定为 patch-level latent feature loss。
+
+定义：
+
+```python
+gt_patch:   [B, 12, 196, 384]
+pred_patch: [B, 12, 196, 384]
+```
+
+推荐形式：
+
+```python
+L_patch = L_cos_patch + lambda_mse * L_mse_patch
+```
+
+其中：
+
+- `L_cos_patch`：逐 patch 的 cosine loss
+- `L_mse_patch`：逐 patch 的 MSE loss
+- 第一版以 `L_cos_patch` 为主，`L_mse_patch` 只作为小权重辅助项
+
+对于 `12` 视角监督，V1 默认使用**完整全景监督 + 前向视角加权**。
+
+具体原则为：
+
+- 所有 `12` 个视角都参与监督
+- 但与 `view_0` 越接近的视角权重越高
+- 越远离 `view_0` 的视角权重越低
+
+其中：
+
+- `view_0` 就是 `ghost_query` 对齐后的 canonical front
+- 加权只作用在 patch-level 监督上
+- 第一版不因此改变 `pred_ghost_global` 的 mean pooling 定义
+
+推荐的 view 权重可以写成基于环形视角距离的衰减函数：
+
+```python
+d(v) = min(v, 12 - v)
+w(v) = exp(-alpha * d(v))
+```
+
+其中：
+
+- `v in {0, 1, ..., 11}`
+- `d(v)` 表示该视角与 `view_0` 的环形距离
+- `alpha > 0` 控制权重衰减速度
+
+然后将 view 权重广播到该视角内全部 patch 上，构造加权 patch 损失。
+
+因此，V1 的 patch 主损失更准确地写成：
+
+```python
+L_patch = L_patch_weighted_cos + lambda_mse * L_patch_weighted_mse
+```
+
+梯度流向：
+
+- `L_patch` 是主损失
+- 默认回传到整个预测路径
+- 包括 `patch_head`、`ViTPredictor`、`TransitionEncoder`、`ViewAngleEncoder`、`pred_base` 以及各类 embedding
+- 不回传到冻结的 DINO encoder
+
+### 2. `L_global`
+
+辅助监督信号固定为 global feature loss。
+
+先从 patch 级目标和预测中分别构造：
+
+```python
+gt_view:      [B, 12, 384]
+gt_global:    [B, 384]
+pred_view:    [B, 12, 384]
+pred_global:  [B, 384]
+```
+
+其中：
+
+- `gt_view / pred_view`：对 patch 维做 mean pooling
+- `gt_global / pred_global`：对 view 维做 mean pooling
+
+推荐形式：
+
+```python
+L_global = cosine(pred_global, gt_global)
+```
+
+梯度流向固定为：
+
+- `L_global` 默认回传到主干预测路径
+- 它不是只训练 `394 -> 384` 的输出头
+- 它用于给整个主干增加全局一致性的辅助约束
+- 但第一版必须保持小权重，避免压过 `L_patch`
+
+### 3. `L_conf`
+
+V1 中，置信度监督默认不直接反向塑造主干，而是用于单独训练 `confidence_head`。
+
+先定义置信度目标：
+
+```python
+q_target = exp(-tau * stopgrad(L_patch_sample + 0.5 * L_global_sample))
+```
+
+其中：
+
+- `L_patch_sample`：单个样本级别的 patch 误差
+- `L_global_sample`：单个样本级别的 global 误差
+- 都先做 `detach`
+
+然后定义：
+
+```python
+pred_conf = confidence_head(stopgrad(pred_global))
+L_conf = MSE(pred_conf, q_target)
+```
+
+因此，第一版中：
+
+- `L_conf` 默认只训练 `confidence_head`
+- `L_conf` 不回传到 `ViTPredictor` 主干
+- 置信度表示的是“当前这次 ghost 特征预测质量有多高”
+- 它不是 ghost 是否存在，也不是 waypoint score 的替代品
+
+### 总损失
+
+第一版推荐总损失为：
+
+```python
+L_total = L_patch + lambda_global * L_global + lambda_conf * L_conf
+```
+
+推荐起始权重：
+
+```python
+lambda_global = 0.25
+lambda_conf = 0.1
+```
+
+也就是说：
+
+- `L_patch` 是主监督
+- `L_global` 是小权重辅助监督
+- `L_conf` 是更小权重的校准监督
 
 ## Token 化方案
 
@@ -996,6 +1528,68 @@ pred_content[v, p] = pred_base + pred_view_angle_emb[v]
 ```
 
 这个固定顺序本身会被 `seq_pos` 感知，但 V1 不只依赖固定顺序，还会额外加入显式的 `time_emb`。
+
+## 默认预测器结构
+
+V1 默认直接参考 DINO-WM 的 `ViTPredictor` 结构，先不在主干 Transformer 架构上做改动。
+
+默认配置固定为：
+
+```python
+predictor = ViTPredictor(
+    depth=6,
+    heads=16,
+    mlp_dim=2048,
+    dropout=0.1,
+    emb_dropout=0.0,
+)
+```
+
+这意味着：
+
+- 第一版默认使用 `6` 层 Transformer block
+- 每层使用 `16` 个 attention head
+- 前馈层隐藏维度固定为 `2048`
+- 输入 token 在进入 predictor 前先展平成一维序列
+- predictor 侧的位置编码继续沿用 DINO-WM 的 learned absolute positional embedding
+
+因此，V1 默认主干可以概括为：
+
+- 冻结的 DINOv2 patch encoder 负责提供 patch-level 视觉特征
+- `TransitionEncoder` 与 `ghost_meta` MLP 负责条件编码
+- 条件与 patch token 在输入侧完成拼接/加法融合
+- 主预测器默认使用 `6` 层 `ViTPredictor`
+
+第一版在这一层先不默认引入：
+
+- 更深的 predictor
+- cross-attention decoder
+- 稀疏 attention
+- 额外的 token 压缩层
+
+这些结构改动可以留到后续显存优化或性能消融阶段再讨论。
+
+### V1 训练实现建议
+
+考虑到当前 V1 输入序列较长，第一版训练实现默认建议开启 AMP。
+
+推荐原则是：
+
+- 默认使用 AMP 混合精度训练
+- 第一版优先保证单卡可跑通
+- 具体 batch size 在实际训练时再根据显存占用做试验性确定
+
+这里之所以默认建议 AMP，是因为：
+
+- 当前 token 序列长度较长
+- 默认 predictor 仍然是全 self-attention 的 `ViTPredictor`
+- 在单张 RTX A6000 上，混合精度会显著降低训练显存压力
+
+因此，V1 在训练实现层面的默认建议固定为：
+
+- `predictor` 主干保持不变
+- 默认开启 AMP
+- batch size 不在文档中预先写死，由实际实验决定
 
 ## Embedding 结构
 
@@ -1336,6 +1930,13 @@ V * P
 - `pred tokens` 默认显式加入 view angle embedding
 - `pred tokens` 与 `curr_pano` 默认共用同一个 `ViewAngleEncoder`
 - 第一版不默认为每个 view 或每个 patch 位置学习完全独立的 prediction query 参数
+- 输出端默认增加 `patch_head: 394 -> 384`，将预测 token 映射回视觉空间
+- `pred_ghost_global` 默认由 `pred_patch` 经过 patch mean pooling 和 view mean pooling得到
+- 第一版不默认引入额外的 `CLS token` 或可学习 global aggregator
+- `confidence_head` 默认采用 `MLP(384 -> 128 -> 1)`
+- `confidence_head` 的输入默认使用 `stopgrad(pred_ghost_global)`
+- `target_ghost_pano` 默认使用完整 `12` 视角监督，且 `view_0` 对齐 `ghost_query` 的 canonical front
+- `L_patch` 默认采用完整全景监督，但对 `view_0` 附近的视角给予更高权重
 - 条件输入统一通过一个按 `mode` 分派的 `ConditionEncoder` 类管理
 - `ConditionEncoder` 共用类定义；其中转移条件分支共享参数，`ghost_meta` 分支不共享参数
 - `time_emb` 采用 `nn.Embedding(6, D)`，并通过加法注入到 token 上
@@ -1352,6 +1953,26 @@ V * P
 - V1 不再额外引入独立的离散 `view_emb` 表，视角信息统一通过连续 angle encoding 提供
 - 数据样本单位固定为“每个 ghost 一个样本”
 - `pred_base` 第一版实现为全局共享的 `nn.Parameter`，并在 `forward` 时按 batch 与 `12 x 196` 位置广播展开
+- 默认主干预测器直接采用 DINO-WM 风格的 `ViTPredictor(depth=6, heads=16, mlp_dim=2048)`
+- 第一版训练实现默认建议开启 AMP，batch size 在实际实验时再按显存占用确定
+- `L_patch` 是主监督，并默认回传到整个预测主干
+- `L_global` 是小权重辅助监督，默认也回传到主干
+- `L_conf` 默认只训练 `confidence_head`，不反向影响主干 predictor
+- 数据采集阶段默认只保存编码后的特征，不保存原始 RGB / depth 图像
+- 历史 trace 中默认同时保存 `action`、`position`、`heading` 和 `dino_patch`
+- 目标监督位置默认直接使用合并后的 `ghost_mean_pos`
+- 目标监督位置的可采样性处理默认沿用现有 oracle 查询位置策略与 fallback 规则
+- episode 执行过程中允许临时缓存原始 front 图像；到达节点后统一批量编码；最终落盘时只保存特征
+- 到达节点后默认将路上 `n` 张 front 图像、当前节点 `12` 张 pano 图像、以及目标 ghost 的 `12 * G` 张 target pano 图像统一批量编码
+- `graph_utils.update_graph(...)` 默认应提供当前 step 的 `cand2ghost` 映射记录，用于稳定组装样本
+- 样本按“观测事件”生成，不按“多路径合并后的 ghost 融合状态”生成
+- 如果同一 ghost 在后续另一条路径上再次被观测，可以生成新的样本，但旧样本不被合并后的特征覆盖
+- 数据采集默认提供一个可选的可视化调试开关；打开后额外保存关键原始图片、地图俯视图及关键采样点/方向标注
+- 数据生成默认遵循调用链：`wrap_act -> trace buffer -> node arrival -> batch encode -> update_graph -> cand2ghost -> sample dump`
+- 数据采集默认作为独立 `run_type` 接入，并配套单独 YAML 配置
+- 样本默认按 shard 形式写入 `.pt` 文件，并使用 `manifest.json` 记录数据集元信息
+- 默认采用内存缓冲后批量写盘，起始建议 `flush_every_n_samples = 50`
+- 大体积 patch 特征默认以 `float16` 存储
 
 ## `2 -> 1` 移动历史的定义与采样策略
 
@@ -1471,6 +2092,8 @@ hist_visual[2] = 最晚的历史帧
 
 ### 稠密执行轨迹缓存定义
 
+这一节与上面的“V1 数据采集字段总表”对应，重点补充 `trace_step` 在历史采样中的使用方式。
+
 为了同时支持两套采样方案，离线数据采集阶段不应一开始就只保存最终的 3 帧历史，而应该先缓存一条“稠密执行轨迹”，再从这条轨迹上二次采样。
 
 推荐在每次 `2 -> 1` 的执行过程中，构造如下中间缓存：
@@ -1482,9 +2105,7 @@ trace = [
         "action": int | str,
         "position": Tensor[3],
         "heading": float,
-        "rgb": Tensor[3, H, W] | None,
-        "depth": Tensor[1, H, W] | None,
-        "dino_patch": Tensor[P, D_v] | None,
+        "dino_patch": Tensor[P, D_v],
         "collided": bool,
     },
     ...
@@ -1494,8 +2115,48 @@ trace = [
 建议说明如下：
 
 - `trace` 中每个元素表示一次低层执行后的 agent 状态
-- 如果采集时不想重复存原始图像，也可以只存 DINO patch 特征
+- V1 最终落盘格式默认不保存原始 RGB / depth 图像，只保存编码后的 DINO patch 特征
+- `action` 和位姿信息需要同时保留
+- `action` 主要用于调试、回放和误差分析；真正进入模型的运动条件仍由位姿差构造
 - `collided` 需要保留，因为它有助于后续分析哪些中间帧是低信息量、哪些是控制异常造成的重复帧
+
+因此，V1 在采样实现层面的默认原则是：
+
+- episode 内允许临时缓存原始 front 图像
+- 到达节点后统一批量编码
+- 最终落盘时只保存编码后的特征
+- 历史 trace 中同时保存 `action`、`position`、`heading` 和 `dino_patch`
+
+### 目标监督位置与可采样性规则
+
+这一节与上面的 `target_record` 定义对应，重点补充目标监督位置的具体采样规则。
+
+V1 中，目标 ghost 的监督位置默认直接使用图中合并后的：
+
+```python
+ghost_mean_pos
+```
+
+也就是说：
+
+- `target_position` 默认取自当前 ghost 的 `ghost_mean_pos`
+- 目标监督的 12 视角 pano 也默认在该位置上采集
+
+对于该位置是否可直接用于环境观测采样，V1 不重新发明一套新规则，而是默认沿用当前工程中现有的 oracle 查询位置处理逻辑。
+
+当前工程里已经有：
+
+- `get_oracle_pano_obs_at(...)`
+- `get_oracle_pano_obs_at_batch(...)`
+- `oracle_manager` 中围绕 `ghost_mean_pos` 的查询位置策略与 fallback 逻辑
+
+因此，V1 数据采集阶段对目标监督位置的默认处理规则固定为：
+
+- 优先使用当前 ghost 的 `ghost_mean_pos`
+- 若该位置不能直接用于环境观测采样，则沿用现有 oracle 的位置合法化 / fallback 规则
+- 若最终仍无法成功采样完整监督，则将该样本标记为无效，并设置 `target_conf_mask = 0`
+
+这意味着，V1 中的目标监督位置策略与现有工程保持一致，不额外引入新的 target position 修正规则。
 
 在构造最终样本时，可以先从 `trace` 生成一条过滤后的候选轨迹 `trace_valid`：
 
@@ -1509,6 +2170,336 @@ trace_valid = filter(trace)
 - 去掉重复碰撞带来的几乎静止帧
 
 后面的 `fixed-step` 和 `distance-based` 都在 `trace_valid` 上执行。
+
+### 从 episode 生成 sample 的完整调用链
+
+结合当前工程代码结构，V1 推荐把样本生成链条拆成四层：
+
+1. 环境层：缓存低层执行 trace  
+2. trainer 层：整理当前 step 的 candidate 与上下文  
+3. 图更新层：解析 candidate 最终身份  
+4. sample 组装层：按 ghost 样本落盘
+
+#### 1. 环境层：低层执行 trace 缓存
+
+V1 推荐把 `trace_step` 的缓存挂在环境层的低层动作执行路径上，优先挂在：
+
+- `wrap_act(...)`
+- `single_step_control(...)`
+- `step(...)`
+
+对应代码位置可参考：
+
+- [environments.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/common/environments.py)
+
+其中：
+
+- `wrap_act(...)` 是每个低层动作真正落到环境里的统一入口
+- `single_step_control(...)` 负责从当前 front 节点向 ghost 方向执行若干次前进/试探动作
+- `step(...)` 的 `act == 4` 分支负责一次完整的“回到 front 节点 -> 前进到 ghost”高层执行
+
+因此，V1 默认要求：
+
+- 在低层执行过程中，持续向 `trace` 追加 `trace_step`
+- `trace_step` 中至少保留 `action / position / heading / collided`
+- front 图像可先临时缓存，等到达节点后再统一批量编码
+
+#### 2. trainer 层：整理当前 step 的上下文与 candidate
+
+在 trainer 层，当前 step 会先完成 waypoint 预测与 panorama 编码，再构造当前 step 的候选 waypoint。
+
+对应代码位置可参考：
+
+- [ss_trainer_ETP.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/ss_trainer_ETP.py)
+
+当前链路中，trainer 已经会得到：
+
+- `cand_angles`
+- `cand_distances`
+- `cand_real_pos`
+- `cur_pos`
+- `cur_ori`
+- `avg_pano_embeds`
+- `pano_embeds`
+
+随后通过：
+
+- `gmaps[i].identify_node(...)`
+
+构造：
+
+- `cur_vp`
+- `cand_vp`
+- `cand_pos`
+
+这里要特别强调：
+
+- `cand_vp` 只是当前 step 的临时 candidate id，例如 `\"3_0\"`
+- 它不是稳定的 ghost id
+- 它也不是最终图里的真实节点 id
+
+因此，trainer 层在 V1 中的职责是：
+
+- 先缓存当前路径下的局部观测信息
+- 再把这些 candidate 交给图更新层解析最终身份
+
+#### 3. 图更新层：`update_graph(...)` 负责最终身份解析
+
+V1 中，candidate 最终到底对应：
+
+- 已有真实节点
+- 新建 ghost
+- 合并到已有 ghost
+
+这件事只在：
+
+- `graph_utils.update_graph(...)`
+
+里被真正决定。
+
+对应代码位置可参考：
+
+- [graph_utils.py](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/vlnce_baselines/models/graph_utils.py)
+
+当前逻辑会：
+
+- 新建 / 更新 `ghost_mean_pos`
+- 新建 / 更新 `ghost_embeds`
+- 新建 / 更新 `ghost_fronts`
+- 可选记录 `ghost_real_pos`
+
+但为了支持稳定的数据采集，V1 明确要求：
+
+- `update_graph(...)` 必须额外提供当前 step 的 `cand2ghost` / `cand_match_records`
+
+该记录用于把：
+
+- 当前 step 的 candidate-level 几何与分数  
+和
+- 图更新后的最终 ghost 身份
+
+稳定地绑定起来。
+
+#### 4. sample 组装层：按 ghost 逐条落盘
+
+在 `update_graph(...)` 之后，V1 再根据 `cand2ghost` 逐条生成样本。
+
+推荐规则是：
+
+- 只对 `target_kind == "ghost"` 的 candidate 生成样本
+- 每个 ghost 观测事件生成一条样本
+- 如果同一 ghost 之后在另一条路径上再次被观测，可再生成一条新的样本
+- 不因为后续跨路径 merge 而回写旧样本
+
+V1 推荐的样本组装顺序为：
+
+1. 从当前 step 的 `trace` 中筛出 `trace_valid`
+2. 根据历史采样规则得到 `hist_visual / hist_motion / hist_action`
+3. 从当前节点得到 `curr_pano`
+4. 从 candidate-level 信息构造 `ghost_query`
+5. 从图统计构造 `ghost_meta`
+6. 从 `ghost_mean_pos` 和 canonical heading 构造 `target_ghost_pano`
+7. 写出最终 `sample`
+
+#### 5. 批量编码与异步组装
+
+V1 默认允许在当前高层 step 结束后，再统一做一次图像编码与样本组装。
+
+具体做法是：
+
+- 收集路上 `n` 张 front 图像
+- 收集当前节点 `12` 张 pano 图像
+- 若当前节点下有 `G` 个 ghost，则再收集目标监督的 `12 * G` 张 target pano 图像
+- 将这些图像统一组成一个 batch
+- 一次性送入 DINO backbone 编码
+
+因此，当前 step 的总编码批大小可以写成：
+
+```python
+n + 12 + 12 * G
+```
+
+由于 target pano 的采集不影响当前 step 的 planner 决策，因此：
+
+- 这部分可以后置
+- 也可以在后续版本中改造成异步 sample assembly 流水线
+
+#### 6. V1 推荐的整体职责划分
+
+最终，V1 推荐的职责划分为：
+
+- 环境层：负责低层 trace 缓存与原始观测获取
+- trainer 层：负责当前 step 上下文整理与批量编码调度
+- graph 层：负责 candidate 最终身份解析与 `cand2ghost` 生成
+- sample assembler：负责按 ghost 逐条生成并落盘训练样本
+
+这也是 V1 推荐的完整调用链：
+
+```python
+wrap_act
+-> trace buffer
+-> node arrival
+-> batch encode
+-> update_graph
+-> cand2ghost
+-> sample dump
+```
+
+### 数据采集运行入口与存储格式
+
+结合当前工程结构，V1 推荐把离线数据采集作为一个独立运行模式接入，而不是混入现有的 `train / eval / infer` 流程。
+
+#### 1. `run_type` 扩展
+
+V1 推荐在：
+
+- [main.bash](/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/run_r2r/main.bash)
+
+中新增一个专门的数据采集运行类型，例如：
+
+```python
+run_type = collect_ghost_wm_data
+```
+
+该模式的职责固定为：
+
+- 运行 episode
+- 收集 `trace`
+- 生成 ghost 样本
+- 按 shard 形式落盘
+
+而不是：
+
+- 执行导航训练
+- 执行普通评测
+
+#### 2. 独立 YAML 配置
+
+V1 推荐新增一份专门的数据采集配置文件，用于控制样本采集而不是控制导航训练。
+
+推荐内容至少包括：
+
+```python
+collect.enable: true
+collect.output_dir: ...
+collect.flush_every_n_samples: 50
+collect.collect_visual_debug: false
+collect.save_debug_meta: true
+collect.max_episodes: ...
+collect.max_samples: ...
+collect.collect_target_supervision: true
+```
+
+建议这份 YAML 与当前 run 配置体系并列维护，避免污染现有训练配置。
+
+#### 3. 内存缓冲与批量写盘
+
+V1 推荐采用：
+
+- 先在内存中缓冲一批样本
+- 再统一写盘
+
+默认建议：
+
+```python
+flush_every_n_samples = 50
+```
+
+这样做的原因是：
+
+- 当前样本中包含大量 patch 特征张量
+- 频繁小文件写入会带来明显 IO 开销
+- 用户当前机器内存资源较充足，适合用内存缓冲换取更少的磁盘写入次数
+
+如果后续实验表明内存仍然充足，可再调大到：
+
+- `100`
+- `200`
+
+但第一版默认建议从 `50` 开始。
+
+#### 4. 存储格式
+
+考虑到最终数据规模可能达到几十 GB，V1 不推荐：
+
+- 单个超大 `.pkl`
+- 单个超大 `.pt`
+
+V1 推荐采用：
+
+- **分 shard 的 `.pt` 文件**
+
+目录结构建议为：
+
+```text
+output_dir/
+  manifest.json
+  shard_000000.pt
+  shard_000001.pt
+  shard_000002.pt
+  ...
+```
+
+其中：
+
+- 每个 `shard_xxxxxx.pt` 存一批样本
+- `manifest.json` 记录：
+  - 总样本数
+  - shard 数量
+  - 字段 schema
+  - 采集配置快照
+  - 数据版本号
+
+推荐的 shard 内容可以写成：
+
+```python
+{
+    "samples": List[Dict],
+    "count": int,
+    "shard_id": int,
+}
+```
+
+#### 5. 数值类型建议
+
+为了降低磁盘体积，V1 推荐：
+
+- 大体积 patch 特征默认存 `float16`
+- pose / query / meta 这类几何与标量字段可存 `float32`
+- id / mask / step 等保持整数或布尔类型
+
+这条建议尤其适用于：
+
+- `hist_visual`
+- `curr_pano`
+- `target_ghost_pano`
+
+因为这些字段是整个样本中占空间最大的部分。
+
+#### 6. 调试数据目录
+
+如果打开：
+
+```python
+collect_visual_debug = true
+```
+
+则推荐在输出目录下额外建立：
+
+```text
+output_dir/debug/
+```
+
+专门保存：
+
+- 原始调试图像
+- top-down 地图可视化
+- 关键采样点标记结果
+
+这样可以保证：
+
+- 训练样本 shard 只保存必要字段
+- 调试资源与正式训练数据分离管理
 
 ### 方案 A：`fixed-step` 稀疏采样（补充方案）
 

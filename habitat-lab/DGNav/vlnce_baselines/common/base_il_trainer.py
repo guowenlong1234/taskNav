@@ -98,6 +98,11 @@ class BaseVLNCETrainer(BaseILTrainer):
         self.start_epoch = 0
         self.step_id = 0
 
+    def collect(self):
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.collect() is not implemented yet."
+        )
+
     def _initialize_policy(
         self,
         config: Config,
