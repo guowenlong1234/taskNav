@@ -1,17 +1,30 @@
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import logging
 import numpy as np
 from abc import abstractmethod,ABC
+import sys
 import torch
+from habitat import logger
 from habitat_baselines.utils.common import batch_obs
 from habitat_baselines.common.obs_transformers import (
     apply_obs_transforms_batch,
 )
 import time
+from vlnce_baselines.common.logging_utils import emit_file_only
 from vlnce_baselines.common.ops import pad_tensors_wgrad
 from torch.nn.utils.rnn import pad_sequence
 from vlnce_baselines.common.utils import extract_instruction_tokens
 from .types import OracleQuerySpec,OracleFeatureResult
+
+ORACLE_STAGE_TIMING_KEYS = (
+    "env_peek_ms",
+    "tokenize_ms",
+    "batch_obs_ms",
+    "waypoint_ms",
+    "panorama_ms",
+)
+
 class OracleProvider(ABC):
     @abstractmethod
     def query(self,spec:OracleQuerySpec) ->OracleFeatureResult:
@@ -31,6 +44,8 @@ class OracleProvider(ABC):
         return [self.query(spec) for spec in specs]
 
 class SimulatorPeekOracleProvider(OracleProvider):
+    _ORACLE_DIAG_SLOW_BATCH_MS = 250.0
+
     def __init__(
             self,
             envs,
@@ -58,10 +73,41 @@ class SimulatorPeekOracleProvider(OracleProvider):
         self.waypoint_predictor.to(self.device)
 
     @staticmethod
+    def _empty_stage_timing_meta() -> Dict[str, float]:
+        return {
+            key: 0.0
+            for key in ORACLE_STAGE_TIMING_KEYS
+        }
+
+    @classmethod
+    def _clone_stage_timing_meta(
+        cls,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        merged = cls._empty_stage_timing_meta()
+        if meta is None:
+            return merged
+        for key in ORACLE_STAGE_TIMING_KEYS:
+            merged[key] = float(meta.get(key, 0.0))
+        return merged
+
+    @classmethod
+    def _add_stage_timing(
+        cls,
+        meta: Dict[str, float],
+        key: str,
+        elapsed_ms: float,
+    ) -> None:
+        if key not in ORACLE_STAGE_TIMING_KEYS:
+            raise KeyError(f"Unsupported oracle timing key: {key}")
+        meta[key] += float(elapsed_ms)
+
+    @staticmethod
     def _failed_result(
         spec: OracleQuerySpec,
         reason: str,
         latency_ms: float = 0.0,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> OracleFeatureResult:
         return OracleFeatureResult(
             ghost_vp_id=spec.ghost_vp_id,
@@ -75,7 +121,7 @@ class SimulatorPeekOracleProvider(OracleProvider):
             cache_hit=False,
             cache_key=None,
             latency_ms=float(latency_ms),
-            meta=None,
+            meta=meta,
         )
 
     def _resolve_micro_batch_size(
@@ -100,8 +146,192 @@ class SimulatorPeekOracleProvider(OracleProvider):
             return max(1, min(valid_obs_cnt, max_micro))
         return max(1, min(valid_obs_cnt, max_micro))
 
+    @staticmethod
+    def _format_env_query_counts(grouped_specs: Dict[int, List[Any]]) -> str:
+        if len(grouped_specs) == 0:
+            return "none"
+        return ",".join(
+            f"{env_index}:{len(env_specs)}"
+            for env_index, env_specs in sorted(grouped_specs.items())
+        )
+
+    @staticmethod
+    def _summarize_transport_items(
+        batch_transport,
+        expected_queries: int,
+    ) -> Dict[str, Any]:
+        summary = {
+            "is_list": isinstance(batch_transport, list),
+            "returned": 0,
+            "ok": 0,
+            "fail": 0,
+            "missing": max(int(expected_queries), 0),
+            "reasons": [],
+        }
+        if not isinstance(batch_transport, list):
+            return summary
+
+        seen_indices = set()
+        reasons = []
+        for item in batch_transport:
+            if not isinstance(item, dict):
+                summary["fail"] += 1
+                reasons.append("non_dict_item")
+                continue
+            summary["returned"] += 1
+            query_index = int(item.get("query_index", -1))
+            if query_index >= 0:
+                seen_indices.add(query_index)
+            if bool(item.get("ok", False)):
+                summary["ok"] += 1
+            else:
+                summary["fail"] += 1
+                reasons.append(str(item.get("reason", "unknown")))
+
+        summary["missing"] = max(int(expected_queries) - len(seen_indices), 0)
+        unique_reasons = []
+        seen_reasons = set()
+        for reason in reasons:
+            if reason in seen_reasons:
+                continue
+            seen_reasons.add(reason)
+            unique_reasons.append(reason)
+            if len(unique_reasons) >= 3:
+                break
+        summary["reasons"] = unique_reasons
+        return summary
+
+    @staticmethod
+    def _diag_emit(
+        level: int,
+        message: str,
+        exc_info=None,
+    ) -> None:
+        emit_file_only(logger, level, message, exc_info=exc_info)
+
+    @staticmethod
+    def _split_batch_transport_payload(
+        batch_transport: Any,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if isinstance(batch_transport, dict):
+            items = batch_transport.get("items", [])
+            diag = batch_transport.get("diag")
+            if isinstance(items, list):
+                return items, diag if isinstance(diag, dict) else None
+            return [], diag if isinstance(diag, dict) else None
+        if isinstance(batch_transport, list):
+            return batch_transport, None
+        return [], None
+
+    @classmethod
+    def _log_env_batch_diag(
+        cls,
+        *,
+        env_index: int,
+        diag: Optional[Dict[str, Any]],
+    ) -> None:
+        if not isinstance(diag, dict) or not bool(diag.get("should_log", False)):
+            return
+
+        log_mode = str(diag.get("log_mode", "baseline"))
+        level = logging.INFO if log_mode == "baseline" else logging.WARNING
+        cls._diag_emit(
+            level,
+            "[OracleEnvDiag][BatchPeek] "
+            f"env={int(env_index)} "
+            f"log_mode={log_mode} "
+            f"counter={int(diag.get('counter', 0))} "
+            f"scene={diag.get('scene_id')} "
+            f"episode={diag.get('episode_id')} "
+            f"queries={int(diag.get('queries', 0))} "
+            f"batch_total_ms={float(diag.get('batch_total_ms', 0.0)):.2f} "
+            f"snapshot_state_ms={float(diag.get('snapshot_state_ms', 0.0)):.2f} "
+            f"restore_state_ms={float(diag.get('restore_state_ms', 0.0)):.2f} "
+            f"avg_get_observation_ms={float(diag.get('avg_get_observation_ms', 0.0)):.2f} "
+            f"max_get_observation_ms={float(diag.get('max_get_observation_ms', 0.0)):.2f} "
+            f"avg_set_agent_state_ms={float(diag.get('avg_set_agent_state_ms', 0.0)):.2f} "
+            f"max_set_agent_state_ms={float(diag.get('max_set_agent_state_ms', 0.0)):.2f} "
+            f"failed_queries={int(diag.get('failed_queries', 0))}"
+        )
+        if log_mode not in {"slow", "failed"}:
+            return
+        for record in diag.get("query_records", []):
+            cls._diag_emit(
+                logging.WARNING,
+                "[OracleEnvDiag][BatchPeek][Query] "
+                f"env={int(env_index)} "
+                f"log_mode={log_mode} "
+                f"counter={int(diag.get('counter', 0))} "
+                f"scene={diag.get('scene_id')} "
+                f"episode={diag.get('episode_id')} "
+                f"query_index={int(record.get('query_index', -1))} "
+                f"ok={bool(record.get('ok', False))} "
+                f"reason={record.get('reason')} "
+                f"per_query_get_observation_ms={float(record.get('per_query_get_observation_ms', 0.0)):.2f} "
+                f"per_query_set_agent_state_ms={float(record.get('per_query_set_agent_state_ms', 0.0)):.2f}"
+            )
+
+    @classmethod
+    def _log_parallel_batch_summary(
+        cls,
+        *,
+        grouped_specs: Dict[int, List[Any]],
+        active_env_count: int,
+        total_pending_queries: int,
+        elapsed_ms: float,
+    ) -> None:
+        level = (
+            logging.WARNING
+            if float(elapsed_ms) >= cls._ORACLE_DIAG_SLOW_BATCH_MS
+            else logging.INFO
+        )
+        cls._diag_emit(
+            level,
+            "[OracleDiag][BatchRPC] "
+            f"active_envs={len(grouped_specs)}/{active_env_count} "
+            f"total_pending_queries={total_pending_queries} "
+            f"elapsed_ms={float(elapsed_ms):.2f} "
+            f"query_counts={cls._format_env_query_counts(grouped_specs)}"
+        )
+
+    @classmethod
+    def _log_batch_env_detail(
+        cls,
+        *,
+        prefix: str,
+        env_index: int,
+        query_count: int,
+        transport_summary: Dict[str, Any],
+        elapsed_ms: Optional[float] = None,
+        force_log: bool = False,
+    ) -> None:
+        should_log = force_log or (
+            (not transport_summary.get("is_list", False))
+            or int(transport_summary.get("fail", 0)) > 0
+            or int(transport_summary.get("missing", 0)) > 0
+        )
+        if not should_log:
+            return
+        elapsed_token = (
+            ""
+            if elapsed_ms is None
+            else f" elapsed_ms={float(elapsed_ms):.2f}"
+        )
+        cls._diag_emit(
+            logging.WARNING,
+            f"[OracleDiag]{prefix} "
+            f"env={int(env_index)} queries={int(query_count)}"
+            f"{elapsed_token} "
+            f"returned={int(transport_summary.get('returned', 0))} "
+            f"ok={int(transport_summary.get('ok', 0))} "
+            f"fail={int(transport_summary.get('fail', 0))} "
+            f"missing={int(transport_summary.get('missing', 0))} "
+            f"reasons={transport_summary.get('reasons', [])}"
+        )
+
     def query(self,spec):
         t0 = time.perf_counter()
+        stage_timing_meta = self._empty_stage_timing_meta()
         policy_training = self.policy.training
         net_training = self.policy.net.training if hasattr(self.policy, "net") else None
         try:
@@ -113,6 +343,7 @@ class SimulatorPeekOracleProvider(OracleProvider):
             query_pos = spec.query_pos
             query_heading_rad = spec.query_heading_rad
 
+            t_stage = time.perf_counter()
             obs = self.envs.call_at(
                 env_index,
                 "get_oracle_pano_obs_at",
@@ -122,6 +353,11 @@ class SimulatorPeekOracleProvider(OracleProvider):
                     "strict": True,
                 },
             )
+            self._add_stage_timing(
+                stage_timing_meta,
+                "env_peek_ms",
+                (time.perf_counter() - t_stage) * 1000.0,
+            )
             #把观测中的指令字段进行处理，过长的截断，不足的补足pad，是指令长度与维度统一。
                     #设置最长步长
             # instr_max_len = self.config.IL.max_text_len # r2r 80, rxr 200
@@ -129,17 +365,30 @@ class SimulatorPeekOracleProvider(OracleProvider):
             # #设置不同的pad_id
             instr_pad_id = 1 if self.task_type == 'rxr' else 0
 
+            t_stage = time.perf_counter()
             obs = extract_instruction_tokens([obs], self.INSTRUCTION_SENSOR_UUID,
                                                     max_length=self.instr_max_len, pad_id=instr_pad_id)[0]
+            self._add_stage_timing(
+                stage_timing_meta,
+                "tokenize_ms",
+                (time.perf_counter() - t_stage) * 1000.0,
+            )
             
+            t_stage = time.perf_counter()
             batch = batch_obs([obs], self.device)
             batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+            self._add_stage_timing(
+                stage_timing_meta,
+                "batch_obs_ms",
+                (time.perf_counter() - t_stage) * 1000.0,
+            )
 
             self.waypoint_predictor.eval()
             self.policy.eval()
             if hasattr(self.policy, "net"):
                 self.policy.net.eval()
             with torch.no_grad():
+                t_stage = time.perf_counter()
                 wp_outputs = self.policy.net(
                         mode = "waypoint",
                         waypoint_predictor = self.waypoint_predictor,
@@ -147,7 +396,13 @@ class SimulatorPeekOracleProvider(OracleProvider):
                         #config.IL.waypoint_aug是否进行采样增强，训练的时候按照概率再nms周围选出一定的点
                         in_train = False,
                     )
+                self._add_stage_timing(
+                    stage_timing_meta,
+                    "waypoint_ms",
+                    (time.perf_counter() - t_stage) * 1000.0,
+                )
                 
+                t_stage = time.perf_counter()
                 vp_inputs = self._vp_feature_variable(wp_outputs)
                 #将这里面的都pad到相同长度，组织成batch，转换成tensor
                 #             return {
@@ -165,6 +420,11 @@ class SimulatorPeekOracleProvider(OracleProvider):
                 #把一整圈全景视角 token，压缩成“当前节点的单个全景摘要表示”。[B, L, H] -> [B, H],将12个视角特征进行融合
                 avg_pano = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
                             torch.sum(pano_masks, 1, keepdim=True)
+                self._add_stage_timing(
+                    stage_timing_meta,
+                    "panorama_ms",
+                    (time.perf_counter() - t_stage) * 1000.0,
+                )
 
                 embed = avg_pano[0].detach().clone()
 
@@ -184,7 +444,8 @@ class SimulatorPeekOracleProvider(OracleProvider):
                 used_heading_rad = float(spec.query_heading_rad),
                 cache_hit = False,
                 cache_key = None,
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (time.perf_counter() - t0) * 1000.0,
+                meta=stage_timing_meta,
             )
         except Exception as e:
             raise RuntimeError(
@@ -220,6 +481,10 @@ class SimulatorPeekOracleProvider(OracleProvider):
         net_training = self.policy.net.training if hasattr(self.policy, "net") else None
         results: List[Optional[OracleFeatureResult]] = [None] * len(specs)
         batch_result_indices = set()
+        result_timing_metas = [
+            self._empty_stage_timing_meta()
+            for _ in specs
+        ]
 
         try:
             grouped_specs: Dict[int, List[Any]] = defaultdict(list)
@@ -241,84 +506,298 @@ class SimulatorPeekOracleProvider(OracleProvider):
                 )
             )
 
-            for env_index, env_specs in grouped_specs.items():
-                queries = []
-                for local_idx, (_, spec) in enumerate(env_specs):
-                    queries.append(
-                        {
-                            "position": list(spec.query_pos),
-                            "heading_rad": float(spec.query_heading_rad),
-                            "query_index": int(local_idx),
-                        }
-                    )
-
-                try:
-                    batch_transport = self.envs.call_at(
-                        env_index,
-                        "get_oracle_pano_obs_at_batch",
-                        {
-                            "queries": queries,
-                            "keep_agent_at_new_pose": False,
-                        },
-                    )
-                    if not isinstance(batch_transport, list):
-                        raise RuntimeError(
-                            "batch oracle transport returned a non-list payload"
+            def _run_serial_transport_fallback() -> None:
+                self._diag_emit(
+                    logging.WARNING,
+                    "[OracleDiag][SerialBatchRPC] "
+                    f"entering_serial_fallback active_envs={len(grouped_specs)} "
+                    f"query_counts={self._format_env_query_counts(grouped_specs)}"
+                )
+                for env_index, env_specs in grouped_specs.items():
+                    queries = []
+                    for local_idx, (_, spec) in enumerate(env_specs):
+                        queries.append(
+                            {
+                                "position": list(spec.query_pos),
+                                "heading_rad": float(spec.query_heading_rad),
+                                "query_index": int(local_idx),
+                            }
                         )
-                    transport_map = {}
-                    for item in batch_transport:
-                        local_idx = int(item.get("query_index", -1))
-                        if local_idx >= 0:
-                            transport_map[local_idx] = item
-                except Exception:
-                    if fallback_to_serial:
+
+                    try:
+                        env_peek_t0 = time.perf_counter()
+                        batch_transport = self.envs.call_at(
+                            env_index,
+                            "get_oracle_pano_obs_at_batch",
+                            {
+                                "queries": queries,
+                                "keep_agent_at_new_pose": False,
+                            },
+                        )
+                        env_peek_elapsed_ms = (
+                            time.perf_counter() - env_peek_t0
+                        ) * 1000.0
+                        transport_items, env_diag = self._split_batch_transport_payload(
+                            batch_transport
+                        )
+                        self._log_env_batch_diag(
+                            env_index=env_index,
+                            diag=env_diag,
+                        )
+                        env_peek_share_ms = (
+                            env_peek_elapsed_ms / len(env_specs)
+                            if len(env_specs) > 0
+                            else 0.0
+                        )
+                        transport_summary = self._summarize_transport_items(
+                            transport_items,
+                            len(env_specs),
+                        )
+                        self._log_batch_env_detail(
+                            prefix="[SerialBatchRPC][Env]",
+                            env_index=env_index,
+                            query_count=len(env_specs),
+                            transport_summary=transport_summary,
+                            elapsed_ms=env_peek_elapsed_ms,
+                            force_log=True,
+                        )
+                        for result_idx, _ in env_specs:
+                            self._add_stage_timing(
+                                result_timing_metas[result_idx],
+                                "env_peek_ms",
+                                env_peek_share_ms,
+                            )
+                        if not isinstance(batch_transport, (list, dict)):
+                            raise RuntimeError(
+                                "batch oracle transport returned an invalid payload"
+                            )
+                        transport_map = {}
+                        for item in transport_items:
+                            local_idx = int(item.get("query_index", -1))
+                            if local_idx >= 0:
+                                transport_map[local_idx] = item
+                    except Exception:
+                        self._diag_emit(
+                            logging.ERROR,
+                            "[OracleDiag][SerialBatchRPC][EnvFallback] "
+                            f"env={env_index} queries={len(env_specs)} "
+                            "call_at batch transport failed; falling back to "
+                            "per-query provider.query()",
+                            exc_info=sys.exc_info(),
+                        )
+                        if fallback_to_serial:
+                            for result_idx, spec in env_specs:
+                                try:
+                                    result = self.query(spec)
+                                    result.meta = self._clone_stage_timing_meta(
+                                        result.meta
+                                    )
+                                    self._add_stage_timing(
+                                        result.meta,
+                                        "env_peek_ms",
+                                        result_timing_metas[result_idx]["env_peek_ms"],
+                                    )
+                                    results[result_idx] = result
+                                except Exception:
+                                    results[result_idx] = self._failed_result(
+                                        spec,
+                                        reason="provider_query_failed",
+                                        meta=self._clone_stage_timing_meta(
+                                            result_timing_metas[result_idx]
+                                        ),
+                                    )
+                            continue
+
                         for result_idx, spec in env_specs:
-                            try:
-                                results[result_idx] = self.query(spec)
-                            except Exception:
+                            results[result_idx] = self._failed_result(
+                                spec,
+                                reason="batch_transport_failed",
+                                meta=self._clone_stage_timing_meta(
+                                    result_timing_metas[result_idx]
+                                ),
+                            )
+                        continue
+
+                    for local_idx, (result_idx, spec) in enumerate(env_specs):
+                        item = transport_map.get(local_idx)
+                        if item is None:
+                            results[result_idx] = self._failed_result(
+                                spec,
+                                reason="batch_transport_missing_item",
+                                meta=self._clone_stage_timing_meta(
+                                    result_timing_metas[result_idx]
+                                ),
+                            )
+                            continue
+                        if not bool(item.get("ok", False)):
+                            results[result_idx] = self._failed_result(
+                                spec,
+                                reason=str(item.get("reason", "batch_transport_failed")),
+                                meta=self._clone_stage_timing_meta(
+                                    result_timing_metas[result_idx]
+                                ),
+                            )
+                            continue
+                        successful_obs_items.append(
+                            {
+                                "result_idx": result_idx,
+                                "spec": spec,
+                                "obs": item["obs"],
+                            }
+                        )
+
+            if len(grouped_specs) > 0:
+                try:
+                    active_env_count = int(self.envs.num_envs)
+                    total_pending_queries = sum(
+                        len(env_specs)
+                        for env_specs in grouped_specs.values()
+                    )
+                    function_names = [
+                        "get_oracle_pano_obs_at_batch"
+                    ] * active_env_count
+                    function_args_list = []
+                    for env_index in range(active_env_count):
+                        env_specs = grouped_specs.get(env_index, [])
+                        queries = []
+                        for local_idx, (_, spec) in enumerate(env_specs):
+                            queries.append(
+                                {
+                                    "position": list(spec.query_pos),
+                                    "heading_rad": float(spec.query_heading_rad),
+                                    "query_index": int(local_idx),
+                                }
+                            )
+                        function_args_list.append(
+                            {
+                                "queries": queries,
+                                "keep_agent_at_new_pose": False,
+                            }
+                        )
+
+                    env_peek_t0 = time.perf_counter()
+                    batch_transports = self.envs.call(
+                        function_names,
+                        function_args_list,
+                    )
+                    env_peek_elapsed_ms = (
+                        time.perf_counter() - env_peek_t0
+                    ) * 1000.0
+                    self._log_parallel_batch_summary(
+                        grouped_specs=grouped_specs,
+                        active_env_count=active_env_count,
+                        total_pending_queries=total_pending_queries,
+                        elapsed_ms=env_peek_elapsed_ms,
+                    )
+                    if total_pending_queries > 0:
+                        env_peek_share_ms = (
+                            env_peek_elapsed_ms / total_pending_queries
+                        )
+                        for env_specs in grouped_specs.values():
+                            for result_idx, _ in env_specs:
+                                self._add_stage_timing(
+                                    result_timing_metas[result_idx],
+                                    "env_peek_ms",
+                                    env_peek_share_ms,
+                                )
+
+                    for env_index, env_specs in grouped_specs.items():
+                        batch_transport = batch_transports[env_index]
+                        transport_items, env_diag = self._split_batch_transport_payload(
+                            batch_transport
+                        )
+                        self._log_env_batch_diag(
+                            env_index=env_index,
+                            diag=env_diag,
+                        )
+                        transport_summary = self._summarize_transport_items(
+                            transport_items,
+                            len(env_specs),
+                        )
+                        self._log_batch_env_detail(
+                            prefix="[BatchRPC][Env]",
+                            env_index=env_index,
+                            query_count=len(env_specs),
+                            transport_summary=transport_summary,
+                            force_log=(
+                                float(env_peek_elapsed_ms)
+                                >= self._ORACLE_DIAG_SLOW_BATCH_MS
+                            ),
+                        )
+                        if not isinstance(batch_transport, (list, dict)):
+                            for result_idx, spec in env_specs:
                                 results[result_idx] = self._failed_result(
                                     spec,
-                                    reason="provider_query_failed",
+                                    reason="batch_transport_failed",
+                                    meta=self._clone_stage_timing_meta(
+                                        result_timing_metas[result_idx]
+                                    ),
                                 )
-                        continue
+                            continue
 
-                    for result_idx, spec in env_specs:
-                        results[result_idx] = self._failed_result(
-                            spec,
-                            reason="batch_transport_failed",
-                        )
-                    continue
+                        transport_map = {}
+                        for item in transport_items:
+                            local_idx = int(item.get("query_index", -1))
+                            if local_idx >= 0:
+                                transport_map[local_idx] = item
 
-                for local_idx, (result_idx, spec) in enumerate(env_specs):
-                    item = transport_map.get(local_idx)
-                    if item is None:
-                        results[result_idx] = self._failed_result(
-                            spec,
-                            reason="batch_transport_missing_item",
-                        )
-                        continue
-                    if not bool(item.get("ok", False)):
-                        results[result_idx] = self._failed_result(
-                            spec,
-                            reason=str(item.get("reason", "batch_transport_failed")),
-                        )
-                        continue
-                    successful_obs_items.append(
-                        {
-                            "result_idx": result_idx,
-                            "spec": spec,
-                            "obs": item["obs"],
-                        }
+                        for local_idx, (result_idx, spec) in enumerate(env_specs):
+                            item = transport_map.get(local_idx)
+                            if item is None:
+                                results[result_idx] = self._failed_result(
+                                    spec,
+                                    reason="batch_transport_missing_item",
+                                    meta=self._clone_stage_timing_meta(
+                                        result_timing_metas[result_idx]
+                                    ),
+                                )
+                                continue
+                            if not bool(item.get("ok", False)):
+                                results[result_idx] = self._failed_result(
+                                    spec,
+                                    reason=str(
+                                        item.get("reason", "batch_transport_failed")
+                                    ),
+                                    meta=self._clone_stage_timing_meta(
+                                        result_timing_metas[result_idx]
+                                    ),
+                                )
+                                continue
+                            successful_obs_items.append(
+                                {
+                                    "result_idx": result_idx,
+                                    "spec": spec,
+                                    "obs": item["obs"],
+                                }
+                            )
+                except Exception:
+                    self._diag_emit(
+                        logging.ERROR,
+                        "[OracleDiag][BatchRPC][Fallback] "
+                        f"envs.call failed; active_envs={len(grouped_specs)}/{int(self.envs.num_envs)} "
+                        f"total_pending_queries={sum(len(env_specs) for env_specs in grouped_specs.values())} "
+                        f"query_counts={self._format_env_query_counts(grouped_specs)}",
+                        exc_info=sys.exc_info(),
                     )
+                    _run_serial_transport_fallback()
 
             if len(successful_obs_items) > 0:
                 instr_pad_id = 1 if self.task_type == 'rxr' else 0
+                tokenize_t0 = time.perf_counter()
                 obs_list = extract_instruction_tokens(
                     [item["obs"] for item in successful_obs_items],
                     self.INSTRUCTION_SENSOR_UUID,
                     max_length=self.instr_max_len,
                     pad_id=instr_pad_id,
                 )
+                tokenize_elapsed_ms = (time.perf_counter() - tokenize_t0) * 1000.0
+                tokenize_share_ms = tokenize_elapsed_ms / len(successful_obs_items)
+                for item in successful_obs_items:
+                    self._add_stage_timing(
+                        result_timing_metas[item["result_idx"]],
+                        "tokenize_ms",
+                        tokenize_share_ms,
+                    )
                 effective_micro_batch_size = self._resolve_micro_batch_size(
                     len(obs_list),
                     micro_batch_size,
@@ -333,9 +812,48 @@ class SimulatorPeekOracleProvider(OracleProvider):
                     end = min(start + effective_micro_batch_size, len(obs_list))
                     chunk_items = successful_obs_items[start:end]
                     chunk_obs = obs_list[start:end]
+
+                    batch_obs_t0 = time.perf_counter()
                     try:
                         batch = batch_obs(chunk_obs, self.device)
                         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+                    except Exception:
+                        batch_obs_elapsed_ms = (
+                            time.perf_counter() - batch_obs_t0
+                        ) * 1000.0
+                        batch_obs_share_ms = (
+                            batch_obs_elapsed_ms / len(chunk_items)
+                            if len(chunk_items) > 0
+                            else 0.0
+                        )
+                        for item in chunk_items:
+                            self._add_stage_timing(
+                                result_timing_metas[item["result_idx"]],
+                                "batch_obs_ms",
+                                batch_obs_share_ms,
+                            )
+                            results[item["result_idx"]] = self._failed_result(
+                                item["spec"],
+                                reason="provider_forward_failed",
+                                meta=self._clone_stage_timing_meta(
+                                    result_timing_metas[item["result_idx"]]
+                                ),
+                            )
+                            batch_result_indices.add(int(item["result_idx"]))
+                        continue
+                    batch_obs_elapsed_ms = (
+                        time.perf_counter() - batch_obs_t0
+                    ) * 1000.0
+                    batch_obs_share_ms = batch_obs_elapsed_ms / len(chunk_items)
+                    for item in chunk_items:
+                        self._add_stage_timing(
+                            result_timing_metas[item["result_idx"]],
+                            "batch_obs_ms",
+                            batch_obs_share_ms,
+                        )
+
+                    waypoint_t0 = time.perf_counter()
+                    try:
                         with torch.no_grad():
                             wp_outputs = self.policy.net(
                                 mode="waypoint",
@@ -343,6 +861,44 @@ class SimulatorPeekOracleProvider(OracleProvider):
                                 observations=batch,
                                 in_train=False,
                             )
+                    except Exception:
+                        waypoint_elapsed_ms = (
+                            time.perf_counter() - waypoint_t0
+                        ) * 1000.0
+                        waypoint_share_ms = (
+                            waypoint_elapsed_ms / len(chunk_items)
+                            if len(chunk_items) > 0
+                            else 0.0
+                        )
+                        for item in chunk_items:
+                            self._add_stage_timing(
+                                result_timing_metas[item["result_idx"]],
+                                "waypoint_ms",
+                                waypoint_share_ms,
+                            )
+                            results[item["result_idx"]] = self._failed_result(
+                                item["spec"],
+                                reason="provider_forward_failed",
+                                meta=self._clone_stage_timing_meta(
+                                    result_timing_metas[item["result_idx"]]
+                                ),
+                            )
+                            batch_result_indices.add(int(item["result_idx"]))
+                        continue
+                    waypoint_elapsed_ms = (
+                        time.perf_counter() - waypoint_t0
+                    ) * 1000.0
+                    waypoint_share_ms = waypoint_elapsed_ms / len(chunk_items)
+                    for item in chunk_items:
+                        self._add_stage_timing(
+                            result_timing_metas[item["result_idx"]],
+                            "waypoint_ms",
+                            waypoint_share_ms,
+                        )
+
+                    panorama_t0 = time.perf_counter()
+                    try:
+                        with torch.no_grad():
                             vp_inputs = self._vp_feature_variable(wp_outputs)
                             vp_inputs.update({"mode": "panorama"})
                             pano_embeds, pano_masks = self.policy.net(**vp_inputs)
@@ -350,13 +906,39 @@ class SimulatorPeekOracleProvider(OracleProvider):
                                 pano_embeds * pano_masks.unsqueeze(2), 1
                             ) / torch.sum(pano_masks, 1, keepdim=True)
                     except Exception:
+                        panorama_elapsed_ms = (
+                            time.perf_counter() - panorama_t0
+                        ) * 1000.0
+                        panorama_share_ms = (
+                            panorama_elapsed_ms / len(chunk_items)
+                            if len(chunk_items) > 0
+                            else 0.0
+                        )
                         for item in chunk_items:
+                            self._add_stage_timing(
+                                result_timing_metas[item["result_idx"]],
+                                "panorama_ms",
+                                panorama_share_ms,
+                            )
                             results[item["result_idx"]] = self._failed_result(
                                 item["spec"],
                                 reason="provider_forward_failed",
+                                meta=self._clone_stage_timing_meta(
+                                    result_timing_metas[item["result_idx"]]
+                                ),
                             )
                             batch_result_indices.add(int(item["result_idx"]))
                         continue
+                    panorama_elapsed_ms = (
+                        time.perf_counter() - panorama_t0
+                    ) * 1000.0
+                    panorama_share_ms = panorama_elapsed_ms / len(chunk_items)
+                    for item in chunk_items:
+                        self._add_stage_timing(
+                            result_timing_metas[item["result_idx"]],
+                            "panorama_ms",
+                            panorama_share_ms,
+                        )
 
                     for local_idx, item in enumerate(chunk_items):
                         spec = item["spec"]
@@ -377,6 +959,9 @@ class SimulatorPeekOracleProvider(OracleProvider):
                             cache_hit=False,
                             cache_key=None,
                             latency_ms=0.0,
+                            meta=self._clone_stage_timing_meta(
+                                result_timing_metas[item["result_idx"]]
+                            ),
                         )
                         batch_result_indices.add(int(item["result_idx"]))
 
@@ -385,6 +970,9 @@ class SimulatorPeekOracleProvider(OracleProvider):
                     results[result_idx] = self._failed_result(
                         spec,
                         reason="provider_query_failed",
+                        meta=self._clone_stage_timing_meta(
+                            result_timing_metas[result_idx]
+                        ),
                     )
 
             batch_elapsed_ms = (time.perf_counter() - t0) * 1000.0

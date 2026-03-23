@@ -3,7 +3,7 @@ import random
 import sys
 import importlib
 from contextlib import contextmanager
-from typing import List, Optional, Type, Union
+from typing import List, Optional, Tuple, Type, Union
 
 import habitat
 from habitat import logger
@@ -324,12 +324,54 @@ def make_env_fn(config: Config, env_class: Type[Union[Env, RLEnv]]):
     return env
 
 
+def _normalize_scene_name(scene: str) -> str:
+    return os.path.splitext(os.path.basename(str(scene)))[0]
+
+
+def get_dataset_scenes_to_load(config: Config) -> List[str]:
+    _sync_task_config_for_habitat_core(config)
+    dataset = make_dataset(config.TASK_CONFIG.DATASET.TYPE)
+    scenes = _ensure_content_scenes(config)
+    if "*" in scenes:
+        scenes = dataset.get_scenes_to_load(config.TASK_CONFIG.DATASET)
+    return [_normalize_scene_name(scene) for scene in scenes]
+
+
+def split_static_scene_pools(
+    all_scenes: List[str],
+    slow_scenes: List[str],
+) -> Tuple[List[str], List[str], List[str]]:
+    slow_targets = []
+    seen_targets = set()
+    for scene in slow_scenes:
+        name = _normalize_scene_name(scene)
+        if name not in seen_targets:
+            slow_targets.append(name)
+            seen_targets.add(name)
+
+    available = []
+    seen_available = set()
+    for scene in all_scenes:
+        name = _normalize_scene_name(scene)
+        if name not in seen_available:
+            available.append(name)
+            seen_available.add(name)
+
+    available_set = set(available)
+    selected_slow = [scene for scene in slow_targets if scene in available_set]
+    missing = [scene for scene in slow_targets if scene not in available_set]
+    selected_slow_set = set(selected_slow)
+    selected_fast = [scene for scene in available if scene not in selected_slow_set]
+    return selected_fast, selected_slow, missing
+
+
 def construct_envs(
     config: Config,
     env_class: Type[Union[Env, RLEnv]],
     workers_ignore_signals: bool = False,
     auto_reset_done: bool = True,
     episodes_allowed: Optional[List[str]] = None,
+    content_scenes_override: Optional[List[str]] = None,
 ) -> VectorEnv:
     r"""Create VectorEnv object with specified config and env class type.
     To allow better performance, dataset are split into small ones for
@@ -359,10 +401,14 @@ def construct_envs(
 
     configs = []
     env_classes = [env_class for _ in range(num_envs)]
-    dataset = make_dataset(config.TASK_CONFIG.DATASET.TYPE)
-    scenes = _ensure_content_scenes(config)
-    if "*" in scenes:
-        scenes = dataset.get_scenes_to_load(config.TASK_CONFIG.DATASET)
+    if content_scenes_override is not None:
+        scenes = [_normalize_scene_name(scene) for scene in content_scenes_override]
+    else:
+        dataset = make_dataset(config.TASK_CONFIG.DATASET.TYPE)
+        scenes = _ensure_content_scenes(config)
+        if "*" in scenes:
+            scenes = dataset.get_scenes_to_load(config.TASK_CONFIG.DATASET)
+        scenes = [_normalize_scene_name(scene) for scene in scenes]
     logger.info(f"SPLTI: {config.TASK_CONFIG.DATASET.SPLIT}, NUMBER OF SCENES: {len(scenes)}")
 
     if num_envs > 1:

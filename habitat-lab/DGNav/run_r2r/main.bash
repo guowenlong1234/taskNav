@@ -47,6 +47,7 @@ usage() {
 可用 preset:
   A1  batch Oracle eval, streaming_refill + cache + batch_query
   A2  serial Oracle eval, streaming_refill + cache
+  A3  batch Oracle eval, streaming_refill + cache + batch_query, full val_unseen
   T1  Oracle train, streaming_refill + cache + batch_query + Oracle-FT
 
 默认对齐口径:
@@ -58,6 +59,9 @@ usage() {
     streaming_refill 打开
     NUM_ENVIRONMENTS=4
     fixed500 val_unseen
+  - A3:
+    与 A1 相同
+    full val_unseen
   - T1:
     best_nav 同口径训练超参
     从 best_nav 预训练底座开始
@@ -96,8 +100,28 @@ checkpoint_folder="${CHECKPOINT_FOLDER:-data/logs/checkpoints/}"
 video_dir="${VIDEO_DIR:-data/logs/video/}"
 log_dir="${LOG_DIR:-data/logs/running_log/}"
 
+ensure_trailing_slash() {
+      local path="$1"
+      if [[ -z "${path}" ]]; then
+            printf "%s" "${path}"
+            return
+      fi
+      if [[ "${path}" == */ ]]; then
+            printf "%s" "${path}"
+      else
+            printf "%s/" "${path}"
+      fi
+}
+
+results_dir="$(ensure_trailing_slash "${results_dir}")"
+tensorboard_dir="$(ensure_trailing_slash "${tensorboard_dir}")"
+checkpoint_folder="$(ensure_trailing_slash "${checkpoint_folder}")"
+video_dir="$(ensure_trailing_slash "${video_dir}")"
+log_dir="$(ensure_trailing_slash "${log_dir}")"
+
 release_ckpt_iter18600="${dgnav_dir}/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter18600.pth"
-best_nav_pretrain_base="/home/gwl/project/DGNav_new/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s/ckpts/model_step_22500.pt"
+best_nav_pretrain_base="/home/gwl/project/DGNav_new/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s/ckpts/model_step_97500.pt"
+oracle_train_resume_ckpt="${dgnav_dir}/data/logs/checkpoints/oracle_train_stream_batch_cache_ft/ckpt.iter4900.pth"
 fixed500_file="run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt"
 fixed500_file_path="${dgnav_dir}/${fixed500_file}"
 oracle_stack="run_r2r/r2r_oracle.yaml"
@@ -112,10 +136,11 @@ required_paths=()
 
 case "${preset}" in
       A1)
-            exp_name="batch_oracle_eval_stream_cache"
+            exp_name="oracle_train_stream_batch_cache_ft"
             preset_master_port="4851"
             preset_opts=(
-                  "EVAL.CKPT_PATH_DIR" "${release_ckpt_iter18600}"
+                  "EVAL.CKPT_PATH_DIR" "/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_train_stream_batch_cache_ft"
+                  # "EVAL.CKPT_PATH_DIR" "${release_ckpt_iter18600}"
                   "EVAL.EPISODE_ID_FILE" "${fixed500_file}"
                   "EVAL.ENV_REFILL_POLICY" "streaming_refill"
                   "IL.back_algo" "control"
@@ -128,6 +153,24 @@ case "${preset}" in
                   "MODEL.ORACLE_FT.enable" "False"
             )
             required_paths+=("${release_ckpt_iter18600}" "${fixed500_file_path}")
+            ;;
+      A3)
+            exp_name="oracle_train_stream_batch_cache_ft_full_unseen"
+            preset_master_port="4853"
+            preset_opts=(
+                  "EVAL.CKPT_PATH_DIR" "/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_all_pool"
+                  # "EVAL.CKPT_PATH_DIR" "${release_ckpt_iter18600}"
+                  "EVAL.ENV_REFILL_POLICY" "streaming_refill"
+                  "IL.back_algo" "control"
+                  "ORACLE.enable" "True"
+                  "ORACLE.enable_in_eval" "True"
+                  "ORACLE.apply_mode" "soft"
+                  "ORACLE.soft_alpha" "0.25"
+                  "ORACLE.cache_enable" "True"
+                  "ORACLE.batch_query_enable" "True"
+                  "MODEL.ORACLE_FT.enable" "False"
+            )
+            required_paths+=("${release_ckpt_iter18600}")
             ;;
       A2)
             exp_name="serial_oracle_eval_stream_cache"
@@ -149,9 +192,9 @@ case "${preset}" in
             ;;
       T1)
             run_type="train"
-            exp_name="oracle_train_stream_batch_cache_ft"
+            exp_name="oracle_all_pool"
             preset_master_port="4861"
-            preset_num_environments="4"
+            preset_num_environments="6"
             preset_opts=(
                   "IL.iters" "20000"
                   "IL.log_every" "100"
@@ -159,9 +202,16 @@ case "${preset}" in
                   "IL.sample_ratio" "0.75"
                   "IL.decay_interval" "3000"
                   "IL.waypoint_aug" "True"
-                  "IL.load_from_ckpt" "False"
-                  "IL.is_requeue" "False"
+                  "IL.load_from_ckpt" "True"
+                  "IL.is_requeue" "True"
+                  "IL.ckpt_to_load" "/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_all_pool"
                   "IL.TRAIN_ENV_REFILL_POLICY" "streaming_refill"
+                  "IL.TRAIN_STATIC_SCENE_POOLS_ENABLE" "True"
+                  "IL.TRAIN_SLOW_SCENES" "['gTV8FGcVJC9','VzqfbhrpDEA']"
+                  "IL.TRAIN_FAST_POOL_NUM_ENVS" "4"
+                  "IL.TRAIN_SLOW_POOL_NUM_ENVS" "2"
+                  "IL.TRAIN_POOL_FAST_ITERS" "24"
+                  "IL.TRAIN_POOL_SLOW_ITERS" "2"
                   "MODEL.pretrained_path" "${best_nav_pretrain_base}"
                   "ORACLE.enable" "True"
                   "ORACLE.enable_in_train" "True"
@@ -176,7 +226,7 @@ case "${preset}" in
                   "MODEL.ORACLE_FT.enable" "True"
                   "MODEL.ORACLE_FT.train_scope" "baseline_plus_oracle_adapter"
             )
-            required_paths+=("${best_nav_pretrain_base}")
+            required_paths+=("${best_nav_pretrain_base}" "${oracle_train_resume_ckpt}")
             ;;
       *)
             echo "[main.bash] Unknown preset: ${preset}" >&2

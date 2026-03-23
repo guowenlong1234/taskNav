@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional, Tuple, List, Union
 import copy
 import math
 import random
+import time
 import habitat
 import numpy as np
 from habitat import Config, Dataset
@@ -14,6 +15,10 @@ from habitat_extensions.utils import generate_video, heading_from_quaternion, na
 from scipy.spatial.transform import Rotation as R
 import cv2
 import os
+
+ORACLE_ENV_DIAG_BATCH_PEEK_SLOW_MS = 250.0
+ORACLE_ENV_DIAG_STEP_SLOW_MS = 75.0
+ORACLE_ENV_DIAG_BASELINE_EVERY = 20
 
 
 def quat_from_heading(heading, elevation=0):
@@ -53,6 +58,8 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         self.video_dir = config.VIDEO_DIR
         self.video_frames = []
         self.plan_frames = []
+        self._oracle_batch_diag_counter = 0
+        self._oracle_step_diag_counter = 0
 
     @property
     def original_action_space(self):
@@ -223,8 +230,10 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         self,
         queries: List[Dict[str, Any]],
         keep_agent_at_new_pose: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         sim = self._env.sim
+        batch_t0 = time.perf_counter()
+        snapshot_t0 = time.perf_counter()
         init_state = sim.get_agent_state()
         init_episode_over = bool(self._env.episode_over)
         init_elapsed_steps = getattr(self._env, "_elapsed_steps", None)
@@ -232,7 +241,9 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         init_is_stop_called = bool(getattr(task, "is_stop_called", False))
         init_is_episode_active = getattr(task, "_is_episode_active", None)
         measure_state_snapshot = self._snapshot_task_measure_states()
+        snapshot_state_ms = (time.perf_counter() - snapshot_t0) * 1000.0
         results: List[Dict[str, Any]] = []
+        query_records: List[Dict[str, Any]] = []
 
         try:
             for query_index, query in enumerate(list(queries)):
@@ -240,37 +251,65 @@ class VLNCEDaggerEnv(habitat.RLEnv):
                 position = list(query.get("position", []))
                 heading_rad = float(query.get("heading_rad", 0.0))
                 elevation_rad = float(query.get("elevation_rad", 0.0))
+                obs = {}
+                ok = False
+                reason = None
+                per_query_get_observation_ms = 0.0
+                per_query_set_agent_state_ms = 0.0
+                query_init_state = sim.get_agent_state()
                 try:
-                    obs = self.get_oracle_pano_obs_at(
-                        position=position,
-                        heading_rad=heading_rad,
-                        elevation_rad=elevation_rad,
-                        keep_agent_at_new_pose=keep_agent_at_new_pose,
-                        strict=False,
-                    )
-                    ok = isinstance(obs, dict) and len(obs) > 0
-                    results.append(
-                        {
-                            "ok": ok,
-                            "obs": obs if ok else None,
-                            "reason": None if ok else "peek_failed",
-                            "query_index": result_query_index,
-                            "position": position,
-                            "heading_rad": heading_rad,
-                        }
-                    )
+                    if sim.is_navigable(position):
+                        rotation = quat_from_heading(heading_rad, elevation_rad)
+                        t_get_observation = time.perf_counter()
+                        obs = self.get_observation_at(
+                            position,
+                            rotation,
+                            keep_agent_at_new_pose,
+                        )
+                        per_query_get_observation_ms = (
+                            time.perf_counter() - t_get_observation
+                        ) * 1000.0
+                        ok = isinstance(obs, dict) and len(obs) > 0
+                        if not ok:
+                            reason = "peek_failed"
+                    else:
+                        reason = "peek_failed"
                 except Exception as e:
-                    results.append(
-                        {
-                            "ok": False,
-                            "obs": None,
-                            "reason": str(e),
-                            "query_index": result_query_index,
-                            "position": position,
-                            "heading_rad": heading_rad,
-                        }
-                    )
+                    obs = {}
+                    ok = False
+                    reason = str(e)
+                finally:
+                    if not keep_agent_at_new_pose:
+                        t_set_state = time.perf_counter()
+                        sim.set_agent_state(
+                            query_init_state.position,
+                            query_init_state.rotation,
+                        )
+                        per_query_set_agent_state_ms = (
+                            time.perf_counter() - t_set_state
+                        ) * 1000.0
+
+                results.append(
+                    {
+                        "ok": ok,
+                        "obs": obs if ok else None,
+                        "reason": reason if not ok else None,
+                        "query_index": result_query_index,
+                        "position": position,
+                        "heading_rad": heading_rad,
+                    }
+                )
+                query_records.append(
+                    {
+                        "query_index": result_query_index,
+                        "ok": ok,
+                        "reason": reason if not ok else None,
+                        "per_query_get_observation_ms": per_query_get_observation_ms,
+                        "per_query_set_agent_state_ms": per_query_set_agent_state_ms,
+                    }
+                )
         finally:
+            restore_t0 = time.perf_counter()
             # Batch peek is defined as a no-side-effect RPC; always restore the
             # entry pose unless the caller explicitly asks to keep the final pose.
             if not keep_agent_at_new_pose:
@@ -284,8 +323,57 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             if task is not None and hasattr(task, "_is_episode_active"):
                 task._is_episode_active = init_is_episode_active
             self._restore_task_measure_states(measure_state_snapshot)
+            restore_state_ms = (time.perf_counter() - restore_t0) * 1000.0
 
-        return results
+        diag = None
+        if len(queries) > 0:
+            self._oracle_batch_diag_counter += 1
+            failed_queries = sum(0 if item["ok"] else 1 for item in query_records)
+            batch_total_ms = (time.perf_counter() - batch_t0) * 1000.0
+            slow_or_failed = (
+                batch_total_ms >= ORACLE_ENV_DIAG_BATCH_PEEK_SLOW_MS
+                or failed_queries > 0
+            )
+            baseline_sample = (
+                self._oracle_batch_diag_counter % ORACLE_ENV_DIAG_BASELINE_EVERY == 0
+            )
+            should_log = slow_or_failed or baseline_sample
+            if should_log:
+                get_times = [
+                    record["per_query_get_observation_ms"]
+                    for record in query_records
+                ]
+                set_times = [
+                    record["per_query_set_agent_state_ms"]
+                    for record in query_records
+                ]
+                if failed_queries > 0:
+                    log_mode = "failed"
+                elif slow_or_failed:
+                    log_mode = "slow"
+                else:
+                    log_mode = "baseline"
+                diag = {
+                    "kind": "batch_peek",
+                    "log_mode": log_mode,
+                    "should_log": True,
+                    "counter": int(self._oracle_batch_diag_counter),
+                    "scene_id": str(self._env.current_episode.scene_id),
+                    "episode_id": str(self._env.current_episode.episode_id),
+                    "queries": len(query_records),
+                    "batch_total_ms": float(batch_total_ms),
+                    "snapshot_state_ms": float(snapshot_state_ms),
+                    "restore_state_ms": float(restore_state_ms),
+                    "avg_get_observation_ms": float(np.mean(get_times)) if len(get_times) > 0 else 0.0,
+                    "max_get_observation_ms": float(np.max(get_times)) if len(get_times) > 0 else 0.0,
+                    "avg_set_agent_state_ms": float(np.mean(set_times)) if len(set_times) > 0 else 0.0,
+                    "max_set_agent_state_ms": float(np.max(set_times)) if len(set_times) > 0 else 0.0,
+                    "failed_queries": int(failed_queries),
+                }
+                if log_mode in {"slow", "failed"}:
+                    diag["query_records"] = query_records
+
+        return {"items": results, "diag": diag}
 
     def get_cand_real_pos(self, forward, angle):
         '''get cand real_pos by executing action'''
@@ -618,36 +706,54 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             action = action["action"]
 
         act = action['act']
+        step_t0 = time.perf_counter()
+        backtrack_ms = 0.0
+        obs_front_ms = 0.0
+        forward_to_ghost_ms = 0.0
+        obs_ghost_ms = 0.0
+        stop_step_ms = 0.0
 
         if act == 4: # high to low
             if self.video_option:
                 self.get_plan_frame(vis_info)
 
             # 1. back to front node
+            phase_t0 = time.perf_counter()
             if action['back_path'] is None:
                 self.teleport(action['front_pos'])
             else:
                 self.multi_step_control(action['back_path'], action['tryout'], vis_info)
+            backtrack_ms = (time.perf_counter() - phase_t0) * 1000.0
             agent_state = self._env.sim.get_agent_state()
+            phase_t0 = time.perf_counter()
             observations = self.get_observation_at(agent_state.position, agent_state.rotation)
+            obs_front_ms = (time.perf_counter() - phase_t0) * 1000.0
 
             # 2. forward to ghost node
+            phase_t0 = time.perf_counter()
             self.single_step_control(action['ghost_pos'], action['tryout'], vis_info)
+            forward_to_ghost_ms = (time.perf_counter() - phase_t0) * 1000.0
             agent_state = self._env.sim.get_agent_state()
+            phase_t0 = time.perf_counter()
             observations = self.get_observation_at(agent_state.position, agent_state.rotation)
+            obs_ghost_ms = (time.perf_counter() - phase_t0) * 1000.0
 
         elif act == 0:   # stop
             if self.video_option:
                 self.get_plan_frame(vis_info)
 
             # 1. back to stop node
+            phase_t0 = time.perf_counter()
             if action['back_path'] is None:
                 self.teleport(action['stop_pos'])
             else:
                 self.multi_step_control(action['back_path'], action['tryout'], vis_info)
+            backtrack_ms = (time.perf_counter() - phase_t0) * 1000.0
 
             # 2. stop
+            phase_t0 = time.perf_counter()
             observations = self._env.step(act)
+            stop_step_ms = (time.perf_counter() - phase_t0) * 1000.0
             if self.video_option:
                 info = self.get_info(observations)
                 self.video_frames.append(
@@ -662,9 +768,42 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         else:
             raise NotImplementedError                
 
+        postprocess_t0 = time.perf_counter()
         reward = self.get_reward(observations)
         done = self.get_done(observations)
         info = self.get_info(observations)
+        postprocess_ms = (time.perf_counter() - postprocess_t0) * 1000.0
+        step_total_ms = (time.perf_counter() - step_t0) * 1000.0
+        self._oracle_step_diag_counter += 1
+        slow = step_total_ms >= ORACLE_ENV_DIAG_STEP_SLOW_MS
+        baseline_sample = (
+            self._oracle_step_diag_counter % ORACLE_ENV_DIAG_BASELINE_EVERY == 0
+        )
+        if (slow or baseline_sample) and isinstance(info, dict):
+            info["_oracle_env_diag"] = {
+                "kind": "env_step",
+                "log_mode": "slow" if slow else "baseline",
+                "should_log": True,
+                "counter": int(self._oracle_step_diag_counter),
+                "scene_id": str(self._env.current_episode.scene_id),
+                "episode_id": str(self._env.current_episode.episode_id),
+                "act": int(act),
+                "step_total_ms": float(step_total_ms),
+                "postprocess_ms": float(postprocess_ms),
+                "backtrack_ms": float(backtrack_ms),
+            }
+            if act == 4:
+                info["_oracle_env_diag"].update(
+                    {
+                        "obs_front_ms": float(obs_front_ms),
+                        "forward_to_ghost_ms": float(forward_to_ghost_ms),
+                        "obs_ghost_ms": float(obs_ghost_ms),
+                    }
+                )
+            else:
+                info["_oracle_env_diag"].update(
+                    {"stop_step_ms": float(stop_step_ms)}
+                )
 
         if self.video_option and done:
             # if 0 < info["spl"] <= 0.6:  #TODO backtrack

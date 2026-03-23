@@ -10,6 +10,8 @@ __pycache__/
 .env
 .venv/
 
+./dino_wm
+
 # DGNav large data and generated artifacts
 /habitat-lab/DGNav/pretrain_src/datasets/
 /habitat-lab/DGNav/pretrain_src/datasets

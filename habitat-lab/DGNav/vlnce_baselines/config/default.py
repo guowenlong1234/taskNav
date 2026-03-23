@@ -93,6 +93,12 @@ _C.IL.ghost_aug = 0.0
 _C.IL.back_algo = "teleport"
 _C.IL.tryout = True
 _C.IL.TRAIN_ENV_REFILL_POLICY = "legacy_batch"
+_C.IL.TRAIN_STATIC_SCENE_POOLS_ENABLE = False
+_C.IL.TRAIN_SLOW_SCENES = []
+_C.IL.TRAIN_FAST_POOL_NUM_ENVS = 0
+_C.IL.TRAIN_SLOW_POOL_NUM_ENVS = 0
+_C.IL.TRAIN_POOL_FAST_ITERS = 10
+_C.IL.TRAIN_POOL_SLOW_ITERS = 1
 # it True, start training from the saved epoch
 # loc_noise configuration (fixed, dynamic, random are parallel, priority: dynamic > random > fixed)
 _C.IL.loc_noise = 0.5  # Fixed loc_noise value (used when both dynamic and random are disabled)
@@ -204,8 +210,8 @@ _C.ORACLE.navigability_search_radius = 1.0
 _C.ORACLE.navigability_num_samples = 16
 _C.ORACLE.navigability_y_lock = True
 _C.ORACLE.cache_enable = True
-_C.ORACLE.cache_radius = 0.25
-_C.ORACLE.cache_max_items_per_scene = 4096
+_C.ORACLE.cache_radius = 0.35
+_C.ORACLE.cache_max_items_per_scene = 8192
 _C.ORACLE.batch_query_enable = True
 _C.ORACLE.batch_query_adaptive = True
 _C.ORACLE.batch_query_micro_size = -1

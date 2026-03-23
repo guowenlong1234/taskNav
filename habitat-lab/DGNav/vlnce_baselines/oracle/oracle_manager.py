@@ -8,7 +8,7 @@ import numpy as np
 
 from .buffered_writer import BufferedLineWriter
 from .cache import OracleSpatialCache
-from .providers import SimulatorPeekOracleProvider
+from .providers import ORACLE_STAGE_TIMING_KEYS, SimulatorPeekOracleProvider
 from .types import OracleFeatureResult, OracleQuerySpec
 from vlnce_baselines.models.graph_utils import GraphMap, calculate_vp_rel_pos_fts
 
@@ -549,6 +549,15 @@ class OracleExperimentManager:
             "provider_avg_batch_size": 0.0,
             "intra_episode_cache_hit_pct": 0.0,
             "cross_episode_cache_hit_pct": 0.0,
+            "oracle_scope_total_ms": 0.0,
+            "oracle_selected_ghost_cnt": 0,
+            "oracle_provider_query_cnt": 0,
+            "oracle_cache_hit_cnt": 0,
+            "oracle_env_peek_ms": 0.0,
+            "oracle_tokenize_ms": 0.0,
+            "oracle_batch_obs_ms": 0.0,
+            "oracle_waypoint_ms": 0.0,
+            "oracle_panorama_ms": 0.0,
         }
 
     @staticmethod
@@ -592,6 +601,15 @@ class OracleExperimentManager:
             "batched_provider_call_cnt",
             "provider_batch_size_sum",
             "skipped_cnt",
+            "oracle_scope_total_ms",
+            "oracle_selected_ghost_cnt",
+            "oracle_provider_query_cnt",
+            "oracle_cache_hit_cnt",
+            "oracle_env_peek_ms",
+            "oracle_tokenize_ms",
+            "oracle_batch_obs_ms",
+            "oracle_waypoint_ms",
+            "oracle_panorama_ms",
         ):
             dst[key] += src.get(key, 0)
 
@@ -985,6 +1003,7 @@ class OracleExperimentManager:
                     stats["query_cnt"] += 1
                     stats["latency_ms_sum"] += result.latency_ms
                     stats["cache_hit_cnt"] += 1
+                    stats["oracle_cache_hit_cnt"] += 1
                     if is_intra_episode_cache_hit:
                         stats["intra_episode_cache_hit_cnt"] += 1
                     else:
@@ -1152,10 +1171,14 @@ class OracleExperimentManager:
 
                 stats["query_cnt"] += 1
                 stats["provider_miss_cnt"] += 1
+                stats["oracle_provider_query_cnt"] += 1
                 stats["latency_ms_sum"] += float(result.latency_ms)
                 stats["provider_latency_ms_sum"] += float(
                     provider_latency_share if used_batched_provider else result.latency_ms
                 )
+                result_meta = result.meta if result.meta is not None else {}
+                for key in ORACLE_STAGE_TIMING_KEYS:
+                    stats[f"oracle_{key}"] += float(result_meta.get(key, 0.0))
 
                 if result.ok and result.embed is not None:
                     stats["success_cnt"] += 1
