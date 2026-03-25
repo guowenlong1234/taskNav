@@ -60,6 +60,13 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         self.plan_frames = []
         self._oracle_batch_diag_counter = 0
         self._oracle_step_diag_counter = 0
+        collect_cfg = getattr(config, "COLLECT", None)
+        self.collect_enabled = bool(getattr(collect_cfg, "enable", False))
+        self.collect_rgb_uuid = str(
+            getattr(getattr(collect_cfg, "image_sensor", None), "uuid", "collect_rgb")
+        )
+        self._collect_trace_counter = 0
+        self._collect_episode_trace: List[Dict[str, Any]] = []
 
     @property
     def original_action_space(self):
@@ -567,6 +574,8 @@ class VLNCEDaggerEnv(habitat.RLEnv):
     
     def reset(self):
         observations = self._env.reset()
+        self._collect_trace_counter = 0
+        self._collect_episode_trace = []
         if self.video_option:
             info = self.get_info(observations)
             self.video_frames = [
@@ -575,7 +584,68 @@ class VLNCEDaggerEnv(habitat.RLEnv):
                     info,
                 )
             ]
+        if self.collect_enabled:
+            self._append_collect_trace_event(
+                act=-1,
+                observations=observations,
+                initial=True,
+            )
         return observations
+
+    def _get_collect_front_rgb(self):
+        agent_state = self._env.sim.get_agent_state()
+        obs = self._env.sim.get_observations_at(
+            agent_state.position,
+            agent_state.rotation,
+            True,
+        )
+        rgb = obs.get(self.collect_rgb_uuid, None)
+        if rgb is None:
+            rgb = obs.get("rgb", None)
+        if rgb is None:
+            return None
+        return np.asarray(rgb).copy()
+
+    def _append_collect_trace_event(
+        self,
+        act,
+        observations=None,
+        *,
+        terminal: bool = False,
+        initial: bool = False,
+    ) -> None:
+        if not self.collect_enabled:
+            return
+
+        rgb = None
+        if isinstance(observations, dict):
+            rgb = observations.get(self.collect_rgb_uuid, None)
+            if rgb is None:
+                rgb = observations.get("rgb", None)
+        if rgb is None:
+            rgb = self._get_collect_front_rgb()
+        else:
+            rgb = np.asarray(rgb).copy()
+
+        pos, _ = self.get_pos_ori()
+        info = self.get_agent_info()
+        record = {
+            "step_id": int(self._collect_trace_counter),
+            "action": int(act) if act is not None else -1,
+            "position": np.asarray(pos).copy(),
+            "heading": float(info["heading"]),
+            "rgb": rgb,
+            "collided": bool(getattr(self._env.sim, "previous_step_collided", False)),
+            "terminal": bool(terminal),
+            "initial": bool(initial),
+        }
+        self._collect_episode_trace.append(dict(record))
+        self._collect_trace_counter += 1
+
+    def consume_collect_episode_trace(self):
+        trace = list(self._collect_episode_trace)
+        self._collect_episode_trace = []
+        return trace
 
     # def wrap_act(self, act, ang, dis, cand_wp, action_wp, oracle_wp, start_p, start_h):
     def wrap_act(self, act, vis_info):
@@ -596,6 +666,7 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             self._env._task.measurements.update_measures(
                 episode=self._env.current_episode, action=act, task=self._env.task 
             )
+        self._append_collect_trace_event(act, observations)
         return observations
 
     def turn(self, ang, vis_info):    
@@ -754,6 +825,11 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             phase_t0 = time.perf_counter()
             observations = self._env.step(act)
             stop_step_ms = (time.perf_counter() - phase_t0) * 1000.0
+            self._append_collect_trace_event(
+                act,
+                observations,
+                terminal=True,
+            )
             if self.video_option:
                 info = self.get_info(observations)
                 self.video_frames.append(
@@ -838,6 +914,47 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             self.plan_frames = []
 
         return observations, reward, done, info
+
+    def collect_run_reference_path(
+        self,
+        reference_path: List[List[float]],
+        tryout: bool = True,
+        max_primitive_steps: int = 400,
+    ):
+        for waypoint in reference_path:
+            if len(self._collect_episode_trace) >= int(max_primitive_steps):
+                break
+            target_pos = np.asarray(waypoint, dtype=np.float32)
+            current_pos = self._env.sim.get_agent_state().position
+            if np.linalg.norm(target_pos - current_pos) < 1e-4:
+                continue
+            self.single_step_control(target_pos, tryout, vis_info=None)
+        observations = self._env.step(HabitatSimActions.STOP)
+        self._append_collect_trace_event(
+            HabitatSimActions.STOP,
+            observations,
+            terminal=True,
+        )
+        reward = self.get_reward(observations)
+        done = self.get_done(observations)
+        info = self.get_info(observations)
+        return observations, reward, done, info
+
+    def collect_run_reference_path_and_consume_trace(
+        self,
+        reference_path: List[List[float]],
+        tryout: bool = True,
+        max_primitive_steps: int = 400,
+    ):
+        call_result = self.collect_run_reference_path(
+            reference_path=reference_path,
+            tryout=tryout,
+            max_primitive_steps=max_primitive_steps,
+        )
+        return {
+            "call_result": call_result,
+            "trace": self.consume_collect_episode_trace(),
+        }
 
 @baseline_registry.register_env(name="VLNCEInferenceEnv")
 class VLNCEInferenceEnv(habitat.RLEnv):
