@@ -716,6 +716,7 @@ class ETP(Net):
             cand_img_idxes = []
             cand_angles = []
             cand_distances = []
+            cand_scores = []
 
             #对于每一个环境
             for j in range(batch_size):
@@ -742,6 +743,9 @@ class ETP(Net):
 
                 #把离散距离 bin 转成真实距离值
                 cand_distances.append( ((distance_idxes + 1)*0.25).tolist() )
+                cand_scores.append(
+                    batch_x_norm[j, angle_idxes, distance_idxes].detach().cpu().tolist()
+                )
                 # for img idxes
                 #先把 angle bin 映射成视角编号
                 img_idxes = 12 - (angle_idxes.cpu().numpy()+5) // 10        # Counter-clockwise
@@ -767,6 +771,7 @@ class ETP(Net):
                 'cand_img_idxes': cand_img_idxes,   # [K]，对应路点的视觉图片索引
                 'cand_angles': cand_angles,         # [K]，对应路点的逆时针角度（弧度值）
                 'cand_distances': cand_distances,   # [K]，对应路点的真实距离（m）
+                'cand_scores': cand_scores,         # [K]，对应路点的 softmax 概率分数
 
                 'pano_rgb': pano_rgb,               # B x 12 x 512，全景照片的特征向量
                 'pano_depth': pano_depth,           # B x 12 x 128，全景照片的维度向量

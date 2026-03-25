@@ -1,0 +1,43 @@
+BASE_TASK_CONFIG_PATH: run_rxr/rxr_collect_teacher_task.yaml
+SIMULATOR_GPU_IDS: [0]
+TORCH_GPU_ID: 0
+TORCH_GPU_IDS: [0]
+GPU_NUMBERS: 1
+NUM_ENVIRONMENTS: 4
+LOG_DIR: data/logs/running_log
+LOG_FILE: collect_teacher.log
+VIDEO_OPTION: []
+
+COLLECTOR:
+  enable: True
+  output_dir: /home/gwl/project/dataset/rxr_teacher_collect/
+  source_splits: [train, val_seen, val_unseen]
+  image:
+    uuid: collect_rgb
+    width: 320
+    height: 240
+    hfov: 90
+  geometry:
+    turn_angle: 15
+    forward_step_size: 0.25
+    allow_sliding: False
+  trace:
+    max_primitive_steps: 400
+    min_frames_after_filter: 68
+  filter_static:
+    pos_eps: 1.0e-3
+    yaw_eps: 1.0e-3
+    run_k: 3
+  dataset:
+    roles: [guide]
+    languages: ['*']
+  teacher:
+    tryout: True
+  target_counts:
+    train: -1
+    test: -1
+  prefilter:
+    min_estimated_steps: 68
+  runtime:
+    seed: 0
+    log_every_rollouts: 50

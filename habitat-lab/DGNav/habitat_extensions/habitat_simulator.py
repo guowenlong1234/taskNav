@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 import habitat_sim
+import magnum as mn
 
 from habitat_sim.simulator import MutableMapping, MutableMapping_T
 from habitat.sims.habitat_simulator.habitat_simulator import (
@@ -138,6 +139,10 @@ class Simulator(HabitatSim):
                     "normalize_depth",
                     "type",
                     "width",
+                },
+                trans_dict={
+                    "position": lambda value: mn.Vector3(value),
+                    "orientation": lambda value: mn.Vector3(value),
                 },
             )
             sim_sensor_cfg.uuid = sensor.uuid

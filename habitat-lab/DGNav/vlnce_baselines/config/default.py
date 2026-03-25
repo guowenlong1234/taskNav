@@ -43,6 +43,7 @@ _C.EVAL.LANGUAGES = ["en-US", "en-IN"]
 _C.EVAL.SAMPLE = False
 _C.EVAL.SAVE_RESULTS = True
 _C.EVAL.CKPT_PATH_DIR = ""
+_C.EVAL.CKPT_PATH_LIST = []
 _C.EVAL.fast_eval = False
 _C.EVAL.EVAL_NONLEARNING = False
 _C.EVAL.ENV_REFILL_POLICY = "legacy_batch"
@@ -65,19 +66,79 @@ _C.INFERENCE.NONLEARNING.AGENT = "RandomAgent"
 _C.INFERENCE.FORMAT = "rxr"  # either 'rxr' or 'r2r'
 _C.INFERENCE.EPISODE_COUNT = -1
 # -----------------------------------------------------------------------------
-# COLLECT CONFIG
+# STANDALONE TEACHER COLLECTOR CONFIG
+# -----------------------------------------------------------------------------
+_C.COLLECTOR = CN()
+_C.COLLECTOR.enable = False
+_C.COLLECTOR.output_dir = "/home/gwl/project/dataset/rxr_teacher_collect/"
+_C.COLLECTOR.source_splits = ["train", "val_seen", "val_unseen"]
+
+_C.COLLECTOR.image = CN()
+_C.COLLECTOR.image.uuid = "collect_rgb"
+_C.COLLECTOR.image.width = 320
+_C.COLLECTOR.image.height = 240
+_C.COLLECTOR.image.hfov = 90
+
+_C.COLLECTOR.geometry = CN()
+_C.COLLECTOR.geometry.turn_angle = 15
+_C.COLLECTOR.geometry.forward_step_size = 0.25
+_C.COLLECTOR.geometry.allow_sliding = False
+
+_C.COLLECTOR.trace = CN()
+_C.COLLECTOR.trace.max_primitive_steps = 400
+_C.COLLECTOR.trace.min_frames_after_filter = 68
+
+_C.COLLECTOR.filter_static = CN()
+_C.COLLECTOR.filter_static.pos_eps = 1e-3
+_C.COLLECTOR.filter_static.yaw_eps = 1e-3
+_C.COLLECTOR.filter_static.run_k = 3
+
+_C.COLLECTOR.dataset = CN()
+_C.COLLECTOR.dataset.roles = ["guide"]
+_C.COLLECTOR.dataset.languages = ["*"]
+
+_C.COLLECTOR.teacher = CN()
+_C.COLLECTOR.teacher.tryout = True
+
+_C.COLLECTOR.target_counts = CN()
+_C.COLLECTOR.target_counts.train = -1
+_C.COLLECTOR.target_counts.test = -1
+
+_C.COLLECTOR.prefilter = CN()
+_C.COLLECTOR.prefilter.min_estimated_steps = -1
+
+_C.COLLECTOR.runtime = CN()
+_C.COLLECTOR.runtime.seed = 0
+_C.COLLECTOR.runtime.log_every_rollouts = 50
+
+# -----------------------------------------------------------------------------
+# LEGACY COLLECT PLACEHOLDER
 # -----------------------------------------------------------------------------
 _C.COLLECT = CN()
 _C.COLLECT.enable = False
-_C.COLLECT.output_dir = "data/logs/ghost_wm_collect/"
-_C.COLLECT.flush_every_n_samples = 50
+_C.COLLECT.profile = "deprecated"
 _C.COLLECT.collect_visual_debug = False
-_C.COLLECT.save_debug_meta = True
-_C.COLLECT.max_episodes = -1
-_C.COLLECT.max_samples = -1
-_C.COLLECT.collect_target_supervision = True
-_C.COLLECT.feature_dtype = "float16"
-_C.COLLECT.debug_dir = "data/logs/ghost_wm_collect/debug/"
+_C.COLLECT.collect_target_supervision = False
+_C.COLLECT.seed = 0
+_C.COLLECT.episode_source = CN()
+_C.COLLECT.episode_source.splits = []
+_C.COLLECT.image_sensor = CN()
+_C.COLLECT.image_sensor.uuid = "collect_rgb"
+_C.COLLECT.image_sensor.width = 320
+_C.COLLECT.image_sensor.height = 240
+_C.COLLECT.image_sensor.hfov = 90
+_C.COLLECT.trace = CN()
+_C.COLLECT.trace.max_primitive_steps = 400
+_C.COLLECT.trace.max_decision_steps = 64
+_C.COLLECT.trace.min_frames_after_filter = 68
+_C.COLLECT.filter_static = CN()
+_C.COLLECT.filter_static.pos_eps = 1e-3
+_C.COLLECT.filter_static.yaw_eps = 1e-3
+_C.COLLECT.filter_static.run_k = 3
+_C.COLLECT.diagnostic = CN()
+_C.COLLECT.diagnostic.enable = False
+_C.COLLECT.diagnostic.straight_forward_steps = 8
+_C.COLLECT.diagnostic.spin_turn_steps = 8
 # -----------------------------------------------------------------------------
 # IMITATION LEARNING CONFIG
 # -----------------------------------------------------------------------------

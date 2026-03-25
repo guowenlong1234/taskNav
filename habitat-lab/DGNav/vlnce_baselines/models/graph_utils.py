@@ -169,6 +169,8 @@ class GraphMap(object):
         self.graph_step = 0
         self.last_added_ghost_ids = []
         self.step_added_ghost_ids = {}
+        self.last_cand_match_records = []
+        self.step_cand_match_records = {}
         self.ghost_parent_real_node = {}
         self.oracle_last_scope_ids = []
         self.oracle_last_written_ids = []
@@ -481,6 +483,7 @@ class GraphMap(object):
         
         self.graph_step = step_id
         new_ghost_ids = []
+        cand_match_records = []
 
         # 1. connect prev_vp
         self.graph_nx.add_node(cur_vp)
@@ -510,6 +513,16 @@ class GraphMap(object):
             if localized_nvp is not None :
                 dis = calc_position_distance(cur_pos, self.node_pos[localized_nvp])
                 self.graph_nx.add_edge(cur_vp, localized_nvp, weight=dis)
+                cand_match_records.append(
+                    {
+                        "cand_index": int(i),
+                        "cand_vp": cvp,
+                        "front_vp": cur_vp,
+                        "target_kind": "node",
+                        "target_id": localized_nvp,
+                        "is_new_ghost": False,
+                    }
+                )
             # cand not overlap with node, create/update ghost
             else:
                 if self.merge_ghost:    #允许把相近的 ghost 合并
@@ -526,6 +539,16 @@ class GraphMap(object):
                         new_ghost_ids.append(gvp)
                         if self.has_real_pos:   #如果保存真实位置，还把真实位置记下来
                             self.ghost_real_pos[gvp] = [cand_real_pos[i]]
+                        cand_match_records.append(
+                            {
+                                "cand_index": int(i),
+                                "cand_vp": cvp,
+                                "front_vp": cur_vp,
+                                "target_kind": "ghost",
+                                "target_id": gvp,
+                                "is_new_ghost": True,
+                            }
+                        )
                     # update ghost
                     else:   #如果不是一个新的ghost，就合并进去，并且更新合并之后的各种信息
                         gvp = localized_gvp
@@ -536,6 +559,16 @@ class GraphMap(object):
                         self.ghost_fronts[gvp].append(cur_vp)
                         if self.has_real_pos:
                             self.ghost_real_pos[gvp].append(cand_real_pos[i])
+                        cand_match_records.append(
+                            {
+                                "cand_index": int(i),
+                                "cand_vp": cvp,
+                                "front_vp": cur_vp,
+                                "target_kind": "ghost",
+                                "target_id": gvp,
+                                "is_new_ghost": False,
+                            }
+                        )
                 else:
                     gvp = f'g{str(self.ghost_cnt)}'
                     self.ghost_cnt += 1
@@ -547,9 +580,21 @@ class GraphMap(object):
                     new_ghost_ids.append(gvp)
                     if self.has_real_pos:
                         self.ghost_real_pos[gvp] = [cand_real_pos[i]]
+                    cand_match_records.append(
+                        {
+                            "cand_index": int(i),
+                            "cand_vp": cvp,
+                            "front_vp": cur_vp,
+                            "target_kind": "ghost",
+                            "target_id": gvp,
+                            "is_new_ghost": True,
+                        }
+                    )
 
         self.last_added_ghost_ids = list(new_ghost_ids)
         self.step_added_ghost_ids[step_id] = list(new_ghost_ids)
+        self.last_cand_match_records = list(cand_match_records)
+        self.step_cand_match_records[step_id] = list(cand_match_records)
         
         self.ghost_aug_pos = deepcopy(self.ghost_mean_pos)  #ghost_mean_pos存的是每个 ghost 的“平均位置”#self.ghost_aug_pos前实际拿来参与后续图计算的 ghost 位置
         if self.ghost_aug != 0: #如过有扰动，就在平均位置上加上一些扰动，如果没有扰动，就直接使用当前的平均位置    
@@ -561,6 +606,7 @@ class GraphMap(object):
 
         self.shortest_path = dict(nx.all_pairs_dijkstra_path(self.graph_nx))    #任意两个节点之间“最短路径经过哪些节点”
         self.shortest_dist = dict(nx.all_pairs_dijkstra_path_length(self.graph_nx)) #任意两个节点之间“最短路径总长度”
+        return cand_match_records
 
     def front_to_ghost_dist(self, ghost_vp):
         # assume the nearest front

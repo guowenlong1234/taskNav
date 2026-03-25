@@ -13,7 +13,7 @@
 
 给定：
 
-- 从节点 `2 -> 1` 移动过程中的最近历史
+- 进入当前节点之前的最近 pre-arrival 视觉历史
 - 当前真实节点 `1` 的全景观测
 - 新生成 ghost 节点 `0` 的查询条件
 - `ghost_prior` 和 `waypoint_score`
@@ -34,7 +34,7 @@
 
 ```python
 sample = {
-    # 从节点 2 移动到节点 1 过程中的历史
+    # 到达当前节点前的 recent pre-arrival 历史
     "hist_visual":        Tensor[K, P, D_v],
     "hist_motion":        Tensor[K, D_m],
     "hist_action":        Tensor[K] | Tensor[K, A] | list,
@@ -70,6 +70,421 @@ V1 中的数据样本单位固定定义为：
 
 - 每个 ghost 对应一个样本
 - 如果同一个当前节点 `1` 后面存在多个 ghost，则使用同一个 `hist_visual / hist_motion / curr_pano` 上下文，沿样本维分别展开多个 `ghost_query / ghost_meta / target_ghost_pano`
+
+### 当前 collect 实际落盘结构
+
+需要明确区分两层概念：
+
+- **最终训练样本结构**
+- **当前 collect 阶段实际落盘的原始数据集结构**
+
+当前工程中，collect 阶段**已经不会直接写最终的 per-ghost 训练样本**，而是写一份可复用的原始数据集，供后续离线训练入口做预处理。
+
+当前实际写盘的 `.pt` shard 顶层结构为：
+
+```python
+{
+    "samples": [episode_record, ...],
+    "count": int,
+    "shard_id": int,
+}
+```
+
+其中每个 `episode_record` 结构为：
+
+```python
+episode_record = {
+    "record_kind": "episode_record",
+    "episode_id": str,
+    "scene_id": str,
+    "node_records": List[node_record],
+}
+```
+
+每个 `node_record` 结构为：
+
+```python
+node_record = {
+    "slot_id": int,
+    "node_index": int,
+    "step_index": int,
+    "done": bool,
+    "position": List[float],          # 当前节点绝对位置
+    "heading": float,                 # 当前节点朝向
+    "curr_pano": Tensor[12, 196, 384],
+    "trace": List[trace_step],
+    "trace_len": int,
+    "ghost_count": int,
+    "node_count": int,
+    "ghost_records": List[ghost_record],
+}
+```
+
+其中 `trace_step` 的当前实际写盘结构为：
+
+```python
+trace_step = {
+    "step_id": int,
+    "action": int | str | Tensor,
+    "position": List[float],
+    "heading": float,
+    "collided": bool,
+    "dino_patch": Tensor[196, 384],   # 若该 step 有 front 图像
+}
+```
+
+每个 `ghost_record` 的当前实际写盘结构为：
+
+```python
+ghost_record = {
+    "ghost_vp_id": str,
+    "cand_index": int,
+    "is_new_ghost": bool,
+    "ghost_query": Tensor[5],
+    "ghost_meta": Tensor[2],
+    "ghost_mean_pos": List[float],
+    "waypoint_score_raw": float,
+    "obs_count": int,
+    "unique_front_count": int,
+    "target_query_pos": List[float] | None,
+    "target_query_pos_strategy": str | None,
+    "target_source_member_index": int | None,
+    "target_source_front_vp_id": str | None,
+    "target_heading_front": float | None,
+    "target_resolve_reason": str | None,
+    "target_peek_ok": bool | None,
+    "target_peek_reason": str | None,
+    "target_conf_mask": int,
+    "target_ghost_pano": Tensor[12, 196, 384] | None,
+}
+```
+
+也就是说，当前 collect 原始数据集已经稳定保存了：
+
+- 到达当前节点之前的整段稠密 `trace`
+- 当前节点 `curr_pano`
+- 当前节点下每个 ghost 的：
+  - `ghost_query`
+  - `ghost_meta`
+  - `target_ghost_pano`
+  - `target_conf_mask`
+  - target 解析与 peek 调试元数据
+
+这份数据集当前的定位是：
+
+- **原始可复用数据集**
+- 不是最终训练直接读取的扁平化样本集
+
+### 当前原始数据集 vs 最终训练样本：字段完备性
+
+按照当前设计，离线训练最终要吃的目标字段是：
+
+```python
+sample = {
+    "hist_visual": Tensor[K, 196, 384],
+    "hist_motion": Tensor[K, 5],
+    "hist_action": Tensor[K] | Tensor[K, A] | list,
+    "curr_pano": Tensor[12, 196, 384],
+    "ghost_query": Tensor[5],
+    "ghost_meta": Tensor[2],
+    "target_ghost_pano": Tensor[12, 196, 384],
+    "target_conf_mask": Tensor[1],
+    ...
+}
+```
+
+从当前 collect 原始数据集来看，可以分成三类：
+
+#### A. 已经直接具备的字段
+
+这些字段已经直接存盘，无需再从环境重采：
+
+- `curr_pano`
+- `ghost_query`
+- `ghost_meta`
+- `target_ghost_pano`
+- `target_conf_mask`
+- `ghost_vp_id`
+- `obs_count`
+- `unique_front_count`
+- `waypoint_score_raw`
+- `episode_id`
+- `scene_id`
+
+#### B. 已经具备原始材料，但需要在离线训练入口预处理时再组装的字段
+
+这些字段当前**没有以最终训练字段名直接落盘**，但构造它们所需的原始材料已经全部保存：
+
+- `hist_visual`
+  - 可由 `node_record.trace[*].dino_patch` 按历史采样规则选出
+- `hist_motion`
+  - 可由被选中的历史 `trace_step.position / heading` 与当前节点 `position / heading` 重新计算
+- `hist_action`
+  - 可由 `trace_step.action` 直接抽取
+- `hist_abs_pose`
+  - 可由被选中的历史 `trace_step.position / heading` 组装
+- `curr_abs_pose`
+  - 可由 `node_record.position / heading` 组装
+- `tgt_abs_pose`
+  - 可由 `ghost_record.target_query_pos / target_heading_front` 组装
+
+也就是说，**当前 collect 原始数据集已经拥有离线预处理生成最终训练样本所需的核心原始材料**。
+
+#### C. 当前没有直接稳定存下，但如果后续确实需要，建议补充的字段
+
+这些字段并不阻塞当前离线训练，但如果未来要做更强的数据回溯、图对齐或下游分析，建议再补：
+
+- `scan_id`
+  - 当前实际落盘的是 `scene_id`
+  - 如果训练侧只需要场景标识，`scene_id` 已可替代
+  - 若想严格对齐文档中的 `scan_id`，建议在 collect 写盘时额外补一份 `scan_id = scene_id` 或做一次 scene token 提取
+
+- `node_id_cur`
+  - 当前落盘的是 `node_index` 和当前节点绝对位姿
+  - 若必须保留图中的逻辑节点 id，建议在 collect 中额外保存 `cur_vp`
+
+- `node_id_src`
+  - 当前可以从 trace 起点位姿间接恢复“上一段执行来自哪里”，但没有显式逻辑 id
+  - 若必须保留图中的源节点 id，建议在 collect 中额外保存 `prev_vp`
+
+- `node_id_tgt`
+  - 当前 target supervision 默认以 `target_query_pos` / `ghost_mean_pos` 作为连续位姿监督
+  - 并不天然对应一个稳定的实体 node id
+  - V1 中可以继续允许该字段为 `None`
+  - 如果以后确实要绑定实体节点，需要单独引入 continuous target 到 real node 的对齐规则
+
+因此，当前阶段的准确结论是：
+
+- **当前原始数据集已经具备离线训练所需的核心原始字段**
+- **最终训练样本仍然需要在离线训练入口做一次预处理组装**
+- **真正还没有直接落盘、且可能需要额外补采的，主要是图逻辑 id 类字段，而不是训练输入主字段**
+
+### 离线训练入口：从当前原始数据集生成最终 `sample`
+
+由于当前 collect 阶段默认写入的是：
+
+- `episode_record`
+- `node_record`
+- `ghost_record`
+
+而不是最终扁平化的 per-ghost 训练样本，因此离线训练入口必须显式承担一次“样本预处理 / 扁平化”工作。
+
+V1 对这一步的职责划分固定为：
+
+- collect 阶段：只负责环境交互、特征采集、监督采集和调试 sidecar 保存
+- 离线训练入口：负责从原始数据集组装出最终训练 sample
+
+#### 1. 输入与输出
+
+离线训练入口读取的输入固定为：
+
+- episode-level shard（`shard_xxxxxx.pt`）
+- 可选的 debug sidecar（`debug/index.jsonl + assets/...`）
+
+其中：
+
+- 训练必须依赖 episode-level shard
+- debug sidecar 只在需要可视化检查时使用
+
+离线训练入口输出的目标固定为：
+
+```python
+sample = {
+    "hist_visual": Tensor[K, 196, 384],
+    "hist_motion": Tensor[K, 5],
+    "hist_action": Tensor[K] | Tensor[K, A] | list,
+    "curr_pano": Tensor[12, 196, 384],
+    "ghost_query": Tensor[5],
+    "ghost_meta": Tensor[2],
+    "target_ghost_pano": Tensor[12, 196, 384],
+    "target_conf_mask": Tensor[1],
+    "episode_id": str | int,
+    "scan_id": str | int,
+    "ghost_vp_id": str,
+    "node_id_src": str | int | None,
+    "node_id_cur": str | int | None,
+    "node_id_tgt": str | int | None,
+    "hist_abs_pose": Tensor[K, 3],
+    "curr_abs_pose": Tensor[3],
+    "tgt_abs_pose": Tensor[3],
+    "obs_count": int,
+    "unique_front_count": int,
+    "waypoint_score_raw": float,
+}
+```
+
+#### 2. 预处理的基本遍历顺序
+
+离线训练入口推荐按下面这条顺序遍历原始数据：
+
+1. 逐个读取 shard  
+2. 对每个 `episode_record` 遍历 `node_records`
+3. 对每个 `node_record` 遍历 `ghost_records`
+4. 对每个 ghost 构造一条最终训练 sample
+
+因此，最终的训练样本单位保持不变：
+
+- **每个 ghost 对应一条 sample**
+
+#### 3. `hist_visual / hist_motion / hist_action` 的组装
+
+这一步是离线训练入口的核心工作。
+
+当前原始数据集已经提供：
+
+- `node_record.trace[*].dino_patch`
+- `node_record.trace[*].position`
+- `node_record.trace[*].heading`
+- `node_record.trace[*].action`
+
+因此，离线训练入口在构造一条 ghost sample 时，应先从当前 `node_record.trace` 生成一条过滤后的候选轨迹：
+
+```python
+trace_valid = filter(trace)
+```
+
+其中 `filter(trace)` 至少完成：
+
+- 去掉几乎无位姿变化的帧
+- 去掉重复碰撞 / 几乎静止的低信息量帧
+
+之后按文档中的历史采样规则，从 `trace_valid` 中选出 3 个历史点：
+
+- `fixed-step`
+- 或 `distance-based`
+
+这两种模式都在离线训练入口完成，不在 collect 阶段固化。
+
+一旦历史索引确定：
+
+- `hist_visual`
+  - 取对应 3 个 `trace_step.dino_patch`
+- `hist_action`
+  - 取对应 3 个历史片段的动作摘要或原始动作表示
+- `hist_abs_pose`
+  - 由对应 3 个历史点的 `position / heading` 组装
+
+`hist_motion` 则固定按选中的 3 帧历史重新计算：
+
+```python
+hist_motion[0] = transition_repr(f0 -> f1)
+hist_motion[1] = transition_repr(f1 -> f2)
+hist_motion[2] = transition_repr(f2 -> curr)
+```
+
+其中：
+
+```python
+transition_repr(a -> b) = [r, sin(bearing), cos(bearing), sin(delta_heading), cos(delta_heading)]
+```
+
+这一步不依赖 collect 阶段额外存新字段，因为当前 `trace` 中的：
+
+- `position`
+- `heading`
+- `action`
+
+已经足够。
+
+#### 4. 其余字段如何直接映射
+
+对于当前 sample，其余字段推荐按下面方式直接从 `node_record / ghost_record` 映射：
+
+- `curr_pano = node_record.curr_pano`
+- `ghost_query = ghost_record.ghost_query`
+- `ghost_meta = ghost_record.ghost_meta`
+- `target_ghost_pano = ghost_record.target_ghost_pano`
+- `target_conf_mask = ghost_record.target_conf_mask`
+- `episode_id = episode_record.episode_id`
+- `scan_id = episode_record.scene_id` 或从 `scene_id` 进一步抽取 scan token
+- `ghost_vp_id = ghost_record.ghost_vp_id`
+- `obs_count = ghost_record.obs_count`
+- `unique_front_count = ghost_record.unique_front_count`
+- `waypoint_score_raw = ghost_record.waypoint_score_raw`
+
+位姿字段则推荐按下面方式组装：
+
+- `curr_abs_pose = [node_record.position_x, node_record.position_y, node_record.heading]`
+- `tgt_abs_pose = [target_query_pos_x, target_query_pos_y, target_heading_front]`
+
+如果 `target_query_pos` 或 `target_heading_front` 缺失，则：
+
+- 样本保留
+- 但应将 `target_conf_mask = 0`
+
+#### 5. 推荐的样本过滤规则
+
+离线训练入口在生成最终 sample 时，建议同时做一层样本过滤。
+
+推荐至少支持以下规则：
+
+- 若 `target_conf_mask == 0`
+  - 可以选择直接过滤
+  - 或保留作无效样本分析
+
+- 若 `trace_valid` 不足以采出 3 帧历史
+  - 直接过滤
+  - 或打上 `short_trace` 标记
+
+- 若 `curr_pano` / `target_ghost_pano` shape 异常
+  - 直接过滤
+
+因此，离线训练入口建议同时输出：
+
+- `valid_samples`
+- `filtered_samples`
+- 以及过滤原因统计
+
+#### 6. debug sidecar 在预处理阶段的作用
+
+当前 collect 已经支持在：
+
+```text
+output_dir/debug/
+```
+
+下保存 node-level debug sidecar。
+
+离线训练入口在生成最终 sample 时，可以选择性读取：
+
+- `debug/index.jsonl`
+- `node_meta.json`
+- `trace/front_*.png`
+- `curr_pano/view_*.png`
+- `ghosts/<ghost_vp_id>/target/view_*.png`
+- `top_down_map_arrays.npz`
+- `top_down_preview.png`
+
+然后生成真正的样本级 debug 输出：
+
+- `hist_visual` 对应的 3 张关键图
+- `curr_pano` 12 张图
+- `target_ghost_pano` 12 张图
+- 与这条最终 sample 一一对应的 top-down 标注图
+
+因此，V1 的职责边界在这里明确固定为：
+
+- collect 阶段保存 **原始 sidecar**
+- 离线训练入口根据最终历史采样规则生成 **样本级 debug 图**
+
+#### 7. 当前阶段对开发任务的结论
+
+基于当前 collect 的实际落盘结构，V1 对后续离线训练入口的结论是：
+
+- collect 原始数据集已经具备生成最终训练 sample 所需的核心原始字段
+- 训练入口应负责：
+  - `trace -> trace_valid`
+  - 历史采样
+  - `hist_visual / hist_motion / hist_action` 组装
+  - 最终 per-ghost sample 扁平化
+- 可视化 debug 也应在这一阶段进一步生成样本级视图
+
+也就是说，当前 collect 阶段的开发目标已经达成：
+
+- **形成可复用的原始数据集文件**
+- **形成可用于质检的 debug sidecar**
+
+后续不应再把训练样本扁平化或 `K` 历史采样规则塞回 collect 阶段，而应统一放在离线训练入口预处理部分完成。
 
 ### V1 数据采集字段总表
 
@@ -116,7 +531,7 @@ V1 最终采用的默认策略是：
 
 这样设计的目的有两个：
 
-- 保留整段 `2 -> 1` 执行过程中的全部中间观测，方便后续修改 `K` 或历史采样规则时无需重新采集 episode
+- 保留每个 node 到达前这段 arrival trace 的全部中间观测，方便后续在离线预处理中跨多个 node_record 拼 recent pre-arrival window，而无需重新采集 episode
 - 尽量将 DINO 编码改成到达节点后的批量处理，以减少频繁环境交互下逐帧编码带来的额外开销
 
 并且由于这些 target pano 的采集不参与当前 step 的 planner 决策，因此：
@@ -1974,9 +2389,9 @@ V * P
 - 默认采用内存缓冲后批量写盘，起始建议 `flush_every_n_samples = 50`
 - 大体积 patch 特征默认以 `float16` 存储
 
-## `2 -> 1` 移动历史的定义与采样策略
+## 进入当前节点前的 recent history 定义与采样策略
 
-这一节专门定义 `hist_visual` 和 `hist_motion` 是如何从节点 `2 -> 1` 的执行过程中构造出来的。
+这一节专门定义 `hist_visual` 和 `hist_motion` 是如何从“进入当前节点之前的 recent pre-arrival 执行历史”中构造出来的。
 
 这部分必须单独写清楚，因为对于本任务来说，历史帧的采样方式不是一个无关紧要的实现细节，而会直接决定模型最终能不能学到有用的空间动态信息。
 
@@ -2003,15 +2418,22 @@ DINO-WM 的默认设置不是直接使用连续原始帧，而是采用带 `fram
 从当前仓库中的 DINO-WM 代码可以看到：
 
 - 训练默认配置是 `num_hist=3`、`frameskip=5`
+- README 中给出的训练示例也显式使用 `frameskip=5 num_hist=3`
 - 轨迹切片时，观测按 `start:end:frameskip` 下采样
 - 动作则把这 `frameskip` 步之间的原始动作拼接起来
 
 也就是说，DINO-WM 的历史输入本质上是“固定时间步长下采样的稀疏观测”，而不是连续逐帧历史。
 
+需要特别说明的是：
+
+- 当前没有看到 DINO-WM 论文或代码给出一个通用的“最小空间距离阈值”，例如统一要求 `>= 0.5m` 或 `>= 1.0m`
+- DINO-WM 给出的直接先验更接近“时间下采样尺度”，即默认使用 `frameskip=5`、`num_hist=3` 的稀疏时间窗口
+
 这一点对当前任务的启发是：
 
 - `hist_visual` 应当显式避免过密采样
 - 应当把“足够大的时间 / 空间间隔”视为历史定义中的一等公民
+- 但在当前 VLN 任务里，仅复用 `frameskip=5` 的时间规则还不够，因为原始 `trace` 中包含大量原地转向和小修正步
 
 ### 当前 VLN 环境中的执行粒度
 
@@ -2034,23 +2456,89 @@ DINO-WM 的默认设置不是直接使用连续原始帧，而是采用带 `fram
 - `fixed-step` 作为补充方案
 - `distance-based` 作为对照方案
 
+### 基于当前 collect 数据的 trace 统计
+
+基于当前无视频版本原始数据集：
+
+- `data/logs/ghost_wm_collect`
+
+对其中的 `node_record.trace` 进行统计后，可得到下面这些结论：
+
+- 总 `node_records` 数量：`565`
+- 平均每段 `trace` 长度：约 `9.20` 帧
+- 中位数 `trace` 长度：`10` 帧
+- `p25 / p75`：`7 / 13`
+- `p95`：`16`
+- 最大 `trace` 长度：`20`
+
+其中还要注意：
+
+- 有 `100` 条 `trace` 长度为 `0`
+- 这基本对应每个 episode 的起始节点，因此后续离线预处理时，`trace_len < 3` 的 node 默认不能直接生成最终训练样本
+
+如果进一步看低层执行的空间进展：
+
+- 单步位移均值约为 `0.112m`
+- 单步位移中位数为 `0m`
+- 单步位移 `p75` 约为 `0.25m`
+
+这说明原始 `trace` 中存在大量：
+
+- 原地转向
+- 小幅修正
+- 低位移 tryout / 避障步
+
+因此，不能把“step 间隔”直接等价理解为“空间间隔”。
+
+如果直接在**原始 `trace`** 上做最简单的 `K = 3` 均匀采样（首帧 / 中间帧 / 末帧），则相邻两帧之间的统计大致为：
+
+- 平均步数间隔：约 `5.11 step`
+- 中位数步数间隔：`5`
+- 平均路径间隔：约 `0.57m`
+- 中位数路径间隔：`0.50m`
+
+更关键的是，在满足 `trace_len >= 3` 的有效 node 上：
+
+- 约 `35.3%` 的相邻关键帧路径距离为 `0`
+- 约 `39.0%` 的相邻关键帧路径距离 `< 0.25m`
+- 约 `48.7%` 的相邻关键帧路径距离 `< 0.5m`
+- 只有约 `29.9%` 的相邻关键帧路径距离 `>= 1.0m`
+
+这意味着：
+
+- 若直接对原始 `trace` 做均匀 `K = 3` 抽样，得到的历史帧仍然会明显偏近
+- 很多相邻关键帧之间的差异主要来自原地转向，而不是足够大的空间变化
+- 对 patch-level latent prediction 来说，这种过近历史会让任务更接近“局部补全 / 近邻外推”，而不是我们真正想学的条件空间预测
+
+因此，基于当前 collect 数据的实际统计，V1 明确不建议：
+
+- 直接在未过滤的原始 `trace` 上做均匀 `K = 3` 历史采样
+
 ### 历史必须满足的全局约束
 
 无论采用哪套采样方案，V1 都要求满足以下约束。
 
-#### 1. 历史严格来自 `2 -> 1` 执行过程
+#### 1. 历史来自“进入当前节点前”的 recent pre-arrival window
 
-`hist_visual` 和 `hist_motion` 只能来自以下这一段执行：
+V1 现在不再把历史严格限定为单条 `2 -> 1` 边上的执行，而是定义为：
 
-- 起点：agent 离开上一个真实节点 `2` 之后
-- 终点：agent 抵达当前真实节点 `1` 并准备采集 `curr_pano` 之前
+- 终点：必须止于当前真实节点 `1` 抵达之前
+- 起点：可以从更早的前序执行中继续向前回溯
+- 约束：整个历史窗口必须始终位于 `curr_pano` 之前，不能包含到达节点 `1` 之后的任何观测
 
 也就是说：
 
 - `curr_pano` 对应的是“已经到达节点 `1` 之后”的全景
-- `hist_visual` 对应的是“到达节点 `1` 之前”的中间执行历史
+- `hist_visual` 对应的是“到达节点 `1` 之前”的 recent pre-arrival 历史
+- 这个历史窗口允许跨过单条 `2 -> 1` 的边界，但不允许越过“到达当前节点”这一时间边界
 
-两者不能混用。
+因此，V1 的历史定义现在更准确地说是：
+
+- recent trajectory-conditioned history
+
+而不再是严格的：
+
+- edge-conditioned `2 -> 1` history
 
 #### 2. 不把 `curr_pano` 的任何视角复写进历史
 
@@ -2096,7 +2584,7 @@ hist_visual[2] = 最晚的历史帧
 
 为了同时支持两套采样方案，离线数据采集阶段不应一开始就只保存最终的 3 帧历史，而应该先缓存一条“稠密执行轨迹”，再从这条轨迹上二次采样。
 
-推荐在每次 `2 -> 1` 的执行过程中，构造如下中间缓存：
+collect 阶段仍然推荐在每次单段 arrival 执行过程中，构造如下中间缓存：
 
 ```python
 trace = [
@@ -2564,7 +3052,7 @@ hist_visual = [trace_valid[i0], trace_valid[i1], trace_valid[i2]]
 
 #### 短轨迹回退规则
 
-很多 `2 -> 1` 的局部执行轨迹可能并没有长到支持严格的 `5, 5` 回溯。
+很多单段 arrival trace 本身并没有长到支持严格的 `5, 5` 回溯。
 
 因此需要定义回退策略。
 
@@ -2681,7 +3169,7 @@ i0 < i1 < i2
 
 #### 短路径回退规则
 
-如果该段 `2 -> 1` 执行本身非常短，导致总剩余距离：
+如果当前用于构造 recent pre-arrival window 的有效历史本身非常短，导致总剩余距离：
 
 ```python
 L = r_0 < 1.25
@@ -2785,7 +3273,7 @@ sample_debug = {
     "hist_indices": Tensor[K],          # 最终选中的候选帧索引
     "hist_remaining_dists": Tensor[K],  # 仅对 distance-based 有意义
     "hist_step_stride": int,            # 仅对 fixed-step 有意义
-    "hist_total_exec_len": float,       # 本段 2->1 执行总长度
+    "hist_total_exec_len": float,       # 当前 recent pre-arrival window 的总执行长度
     "hist_short_fallback": bool,        # 是否触发短轨迹回退
 }
 ```
@@ -2798,13 +3286,17 @@ sample_debug = {
 
 ### V1 历史采样阶段性结论
 
-当前文档对 `2 -> 1` 历史的阶段性决定如下：
+当前文档对 pre-arrival recent history 的阶段性决定如下：
 
 - V1 不使用连续相邻三帧作为历史
 - `hist_visual` 的视角模式保留为 `single_view | tri_view | pano12` 三档接口
 - 第一版历史视觉的实际开发目标是 `single_view`，`tri_view` 和 `pano12` 只保留接口
-- 所有历史都必须先从 `2 -> 1` 执行过程构造稠密轨迹，再做二次采样
+- collect 阶段仍按单段 arrival trace 落盘，但离线预处理允许跨多个 `node_record.trace` 向前拼接 recent pre-arrival window
+- 第一版默认不在原始 `trace` 上直接均匀抽 `K = 3`，而是先构造过滤后的 `trace_valid`
+- `trace_valid` 至少要去掉“平移 `< 0.25m` 且航向变化 `< 15°`”的近重复帧
+- 如果后续实验发现历史仍然偏近，优先继续加强 `trace_valid`，而不是直接增大 `K`
 - `fixed-step` 采用 `s = 5` 的 DINO-WM 风格稀疏采样，作为补充方案
 - `distance-based` 采用目标剩余距离 `[1.25, 0.75, 0.25]` 的局部空间采样，作为对照方案
+- 在当前任务里，更推荐先在 `trace_valid` 上使用 `distance-based`，因为它对原地转向和小修正更鲁棒
 - 两种方案都必须共享同一条过滤后的 `trace_valid`
 - 最终 `hist_motion` 始终基于被选中的三帧历史重新计算

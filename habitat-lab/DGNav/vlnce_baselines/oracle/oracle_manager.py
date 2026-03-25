@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import json
 import math
 import os
@@ -11,6 +11,135 @@ from .cache import OracleSpatialCache
 from .providers import ORACLE_STAGE_TIMING_KEYS, SimulatorPeekOracleProvider
 from .types import OracleFeatureResult, OracleQuerySpec
 from vlnce_baselines.models.graph_utils import GraphMap, calculate_vp_rel_pos_fts
+
+
+def select_nearest_oracle_member(members, target_pos):
+    if len(members) == 0:
+        return None
+    target = np.asarray(target_pos)
+    return min(
+        members,
+        key=lambda member: np.linalg.norm(
+            np.asarray(member["real_pos"]) - target
+        ),
+    )
+
+
+def resolve_oracle_query_target(
+    config_oracle,
+    env_navigability_checker: Callable[[Tuple[float, ...]], bool],
+    gmap,
+    ghost_vp_id: str,
+):
+    base_strategy = str(getattr(config_oracle, "query_pos_strategy", "ghost_real_pos_mean"))
+    fallback_strategy = str(
+        getattr(config_oracle, "query_pos_fallback", "nearest_real_pos")
+    )
+    navigability_check = bool(getattr(config_oracle, "navigability_check", True))
+
+    try:
+        members = gmap.get_ghost_members(ghost_vp_id)
+    except ValueError:
+        return None, "resolve_member_binding_failed"
+
+    if len(members) == 0:
+        return None, "resolve_member_binding_failed"
+
+    real_pos_mean = tuple(
+        np.mean(
+            np.asarray([member["real_pos"] for member in members], dtype=np.float32),
+            axis=0,
+        ).tolist()
+    )
+
+    def _is_ok(candidate_pos):
+        return (not navigability_check) or bool(
+            env_navigability_checker(tuple(np.asarray(candidate_pos).tolist()))
+        )
+
+    def _build_target(query_pos, pos_strategy):
+        source_member = select_nearest_oracle_member(members, query_pos)
+        if source_member is None:
+            return None, "resolve_member_binding_failed"
+
+        source_front_vp_id = source_member["front_vp_id"]
+        if source_front_vp_id is None or source_front_vp_id not in gmap.node_pos:
+            return None, "resolve_bound_front_failed"
+
+        return {
+            "query_pos": tuple(np.asarray(query_pos).tolist()),
+            "query_pos_strategy": pos_strategy,
+            "source_member_index": int(source_member["index"]),
+            "source_member_real_pos": tuple(
+                np.asarray(source_member["real_pos"]).tolist()
+            ),
+            "source_front_vp_id": source_front_vp_id,
+        }, None
+
+    if _is_ok(real_pos_mean):
+        return _build_target(real_pos_mean, base_strategy)
+
+    if fallback_strategy == "nearest_real_pos":
+        sorted_members = sorted(
+            members,
+            key=lambda member: np.linalg.norm(
+                np.asarray(member["real_pos"]) - np.asarray(real_pos_mean)
+            ),
+        )
+        for member in sorted_members:
+            candidate = tuple(np.asarray(member["real_pos"]).tolist())
+            if _is_ok(candidate):
+                source_front_vp_id = member["front_vp_id"]
+                if source_front_vp_id is None or source_front_vp_id not in gmap.node_pos:
+                    return None, "resolve_bound_front_failed"
+                return {
+                    "query_pos": candidate,
+                    "query_pos_strategy": fallback_strategy,
+                    "source_member_index": int(member["index"]),
+                    "source_member_real_pos": tuple(
+                        np.asarray(member["real_pos"]).tolist()
+                    ),
+                    "source_front_vp_id": source_front_vp_id,
+                }, None
+
+    elif fallback_strategy == "ghost_mean_pos":
+        candidate = tuple(np.asarray(gmap.ghost_mean_pos[ghost_vp_id]).tolist())
+        if _is_ok(candidate):
+            return _build_target(candidate, fallback_strategy)
+
+    return None, "resolve_query_pos_failed"
+
+
+def resolve_oracle_query_heading(config_oracle, query_pos, front_pos) -> float:
+    strategy = str(
+        getattr(config_oracle, "query_heading_strategy", "face_frontier")
+    ).lower()
+
+    if strategy == "face_frontier":
+        src_pos = np.asarray(query_pos)
+        dst_pos = np.asarray(front_pos)
+    elif strategy == "travel_dir":
+        src_pos = np.asarray(front_pos)
+        dst_pos = np.asarray(query_pos)
+    elif strategy == "multi_heading_pool":
+        raise NotImplementedError(
+            "ORACLE.query_heading_strategy=multi_heading_pool is not "
+            "implemented in the current oracle provider path."
+        )
+    else:
+        raise ValueError(
+            "Unsupported ORACLE.query_heading_strategy="
+            f"{getattr(config_oracle, 'query_heading_strategy', None)!r}"
+        )
+
+    query_heading_rad, _, _ = calculate_vp_rel_pos_fts(
+        src_pos,
+        dst_pos,
+        base_heading=0.0,
+        base_elevation=0.0,
+        to_clock=False,
+    )
+    return float(query_heading_rad)
 
 class OracleExperimentManager:
     def __init__(self,
@@ -209,120 +338,27 @@ class OracleExperimentManager:
 
     @staticmethod
     def _select_nearest_member(members, target_pos):
-        if len(members) == 0:
-            return None
-        target = np.asarray(target_pos)
-        return min(
-            members,
-            key=lambda member: np.linalg.norm(
-                np.asarray(member["real_pos"]) - target
-            ),
-        )
+        return select_nearest_oracle_member(members, target_pos)
 
     def _resolve_query_target(self, env_index: int, gmap, ghost_vp_id: str, real_pos_mean):
-        base_strategy = self.config_oracle.query_pos_strategy   #读取主策略
-        fallback_strategy = self.config_oracle.query_pos_fallback   #读取回退策略
-        try:
-            members = gmap.get_ghost_members(ghost_vp_id)
-        except ValueError:
-            return None, "resolve_member_binding_failed"
-
-        if len(members) == 0:
-            return None, "resolve_member_binding_failed"
-
-        def _build_target(query_pos, pos_strategy):
-            source_member = self._select_nearest_member(members, query_pos)
-            if source_member is None:
-                return None, "resolve_member_binding_failed"
-
-            source_front_vp_id = source_member["front_vp_id"]
-            if source_front_vp_id is None or source_front_vp_id not in gmap.node_pos:
-                return None, "resolve_bound_front_failed"
-
-            return {
-                "query_pos": tuple(np.asarray(query_pos).tolist()),
-                "query_pos_strategy": pos_strategy,
-                "source_member_index": int(source_member["index"]),
-                "source_member_real_pos": tuple(
-                    np.asarray(source_member["real_pos"]).tolist()
-                ),
-                "source_front_vp_id": source_front_vp_id,
-            }, None
-
-        query_pos = tuple(np.asarray(real_pos_mean).tolist())
-        if (not self.config_oracle.navigability_check) or self._is_navigable(
-            env_index, query_pos
-        ):
-            return _build_target(query_pos, base_strategy)
-
-        if fallback_strategy == "nearest_real_pos":
-            sorted_members = sorted(
-                members,
-                key=lambda member: np.linalg.norm(
-                    np.asarray(member["real_pos"]) - np.asarray(real_pos_mean)
-                ),
-            )
-            for member in sorted_members:
-                candidate = tuple(np.asarray(member["real_pos"]).tolist())
-                if (not self.config_oracle.navigability_check) or self._is_navigable(
-                    env_index, candidate
-                ):
-                    source_front_vp_id = member["front_vp_id"]
-                    if source_front_vp_id is None or source_front_vp_id not in gmap.node_pos:
-                        return None, "resolve_bound_front_failed"
-                    return {
-                        "query_pos": candidate,
-                        "query_pos_strategy": fallback_strategy,
-                        "source_member_index": int(member["index"]),
-                        "source_member_real_pos": tuple(
-                            np.asarray(member["real_pos"]).tolist()
-                        ),
-                        "source_front_vp_id": source_front_vp_id,
-                    }, None
-
-        elif fallback_strategy == "ghost_mean_pos":
-            candidate = tuple(np.asarray(gmap.ghost_mean_pos[ghost_vp_id]).tolist())
-            if (not self.config_oracle.navigability_check) or self._is_navigable(
-                env_index, candidate
-            ):
-                return _build_target(candidate, fallback_strategy)
-
-        return None, "resolve_query_pos_failed"   #如果回退和主策略都失败了，返回None
+        del real_pos_mean
+        return resolve_oracle_query_target(
+            self.config_oracle,
+            lambda pos: self._is_navigable(env_index, pos),
+            gmap,
+            ghost_vp_id,
+        )
 
     def _resolve_query_heading(
         self,
         query_pos,
         front_pos,
     ) -> float:
-        strategy = str(
-            getattr(self.config_oracle, "query_heading_strategy", "face_frontier")
-        ).lower()
-
-        if strategy == "face_frontier":
-            src_pos = np.asarray(query_pos)
-            dst_pos = np.asarray(front_pos)
-        elif strategy == "travel_dir":
-            src_pos = np.asarray(front_pos)
-            dst_pos = np.asarray(query_pos)
-        elif strategy == "multi_heading_pool":
-            raise NotImplementedError(
-                "ORACLE.query_heading_strategy=multi_heading_pool is not "
-                "implemented in the current oracle provider path."
-            )
-        else:
-            raise ValueError(
-                "Unsupported ORACLE.query_heading_strategy="
-                f"{self.config_oracle.query_heading_strategy!r}"
-            )
-
-        query_heading_rad, _, _ = calculate_vp_rel_pos_fts(
-            src_pos,
-            dst_pos,
-            base_heading=0.0,
-            base_elevation=0.0,
-            to_clock=False,
+        return resolve_oracle_query_heading(
+            self.config_oracle,
+            query_pos,
+            front_pos,
         )
-        return float(query_heading_rad)
 
     def _should_query_ghost(
         self,

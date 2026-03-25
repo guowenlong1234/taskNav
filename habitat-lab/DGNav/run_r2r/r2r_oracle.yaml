@@ -68,6 +68,7 @@ EVAL:
   SPLIT: val_unseen
   EPISODE_COUNT: -1
   CKPT_PATH_DIR: ""
+  CKPT_PATH_LIST: []
   fast_eval: False
   ENV_REFILL_POLICY: legacy_batch
   EPISODE_ID_FILE: ""
@@ -165,7 +166,7 @@ ORACLE:
   query_pos_strategy: ghost_real_pos_mean
   query_pos_fallback: nearest_real_pos
   query_heading_strategy: face_frontier
-  target_ghost_scope: all
+  target_ghost_scope: local_frontier
   enable_in_train: True
   enable_in_eval: True
   apply_mode: soft

@@ -1,6 +1,7 @@
 import json
 import jsonlines
 import os
+import re
 import sys
 import time
 import warnings
@@ -745,7 +746,7 @@ class BaseVLNCETrainer(BaseILTrainer):
                     json.dump(aggregated_stats, f, indent=4)
 
             logger.info(f"Episodes evaluated: {total}")
-            checkpoint_num = checkpoint_index + 1
+            checkpoint_num = max(int(checkpoint_index), 0)
             for k, v in aggregated_stats.items():
                 logger.info(f"Average episode {k}: {v:.6f}")
                 writer.add_scalar(f"eval_{k}/{split}", v, checkpoint_num)
@@ -882,6 +883,39 @@ class BaseVLNCETrainer(BaseILTrainer):
 
         return filtered_trajectories
 
+    def _resolve_eval_checkpoint_path(self, ckpt_item: str) -> str:
+        raw_item = str(ckpt_item).strip()
+        if not raw_item:
+            raise ValueError("EVAL.CKPT_PATH_LIST contains an empty entry")
+
+        candidate = os.path.expanduser(raw_item)
+        if not os.path.isabs(candidate):
+            ckpt_root = str(
+                getattr(self.config.EVAL, "CKPT_PATH_DIR", "") or ""
+            ).strip()
+            if ckpt_root:
+                ckpt_root = os.path.expanduser(ckpt_root)
+                if os.path.isfile(ckpt_root):
+                    ckpt_root = os.path.dirname(ckpt_root)
+                candidate = os.path.join(ckpt_root, candidate)
+
+        candidate = os.path.abspath(candidate)
+        if not os.path.isfile(candidate):
+            raise FileNotFoundError(
+                "Eval checkpoint list item not found: "
+                f"{raw_item!r} -> {candidate}"
+            )
+        return candidate
+
+    def _get_eval_checkpoint_paths(self) -> List[str]:
+        ckpt_items = list(getattr(self.config.EVAL, "CKPT_PATH_LIST", []))
+        if not ckpt_items:
+            return []
+        return [
+            self._resolve_eval_checkpoint_path(ckpt_item)
+            for ckpt_item in ckpt_items
+        ]
+
     def eval(self):
         r"""Main method of trainer evaluation. Calls _eval_checkpoint() that
         is specified in Trainer class that inherits from BaseRLTrainer
@@ -963,19 +997,25 @@ class BaseVLNCETrainer(BaseILTrainer):
             self.config.freeze()
         self.traj = self.collect_val_traj()
         self.traj = self._apply_eval_episode_subset(self.traj)
+        eval_ckpt_list = self._get_eval_checkpoint_paths()
 
         with TensorboardWriter(
             self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
         ) as writer:
-            if os.path.isfile(self.config.EVAL.CKPT_PATH_DIR):
-                # evaluate singe checkpoint
-                # proposed_index = get_checkpoint_id(
-                #     self.config.EVAL.CKPT_PATH_DIR
-                # )
-                # if proposed_index is not None:
-                #     ckpt_idx = proposed_index
-                # else:
-                #     ckpt_idx = 0
+            if eval_ckpt_list:
+                total_ckpts = len(eval_ckpt_list)
+                for ckpt_idx, current_ckpt in enumerate(eval_ckpt_list, start=1):
+                    if self.local_rank < 1:
+                        logger.info(
+                            f"=======current_ckpt[{ckpt_idx}/{total_ckpts}]: {current_ckpt}======="
+                        )
+                    self._eval_checkpoint(
+                        checkpoint_path=current_ckpt,
+                        writer=writer,
+                        checkpoint_index=self.get_ckpt_id(current_ckpt),
+                    )
+            elif os.path.isfile(self.config.EVAL.CKPT_PATH_DIR):
+                # evaluate single checkpoint
                 self._eval_checkpoint(
                     self.config.EVAL.CKPT_PATH_DIR,
                     writer,
@@ -1001,10 +1041,18 @@ class BaseVLNCETrainer(BaseILTrainer):
                     )
 
     def get_ckpt_id(self, ckpt_path):
-        ckpt_path = os.path.basename(ckpt_path)
-        ckpt_id = ckpt_path.split('.')[1].replace('iter', '')
-        ckpt_id = int(ckpt_id) // self.config.IL.log_every - 1
-        return ckpt_id
+        ckpt_name = os.path.basename(str(ckpt_path))
+        match = re.search(r"(?:iter|step_?)(\d+)", ckpt_name)
+        if match is not None:
+            return int(match.group(1))
+
+        ckpt_id = get_checkpoint_id(ckpt_name)
+        if ckpt_id is not None:
+            return int(ckpt_id)
+
+        raise ValueError(
+            f"Unable to extract checkpoint iteration from path: {ckpt_path}"
+        )
 
     def inference(self) -> None:
         r"""Runs inference on a single checkpoint, creating a path predictions file."""

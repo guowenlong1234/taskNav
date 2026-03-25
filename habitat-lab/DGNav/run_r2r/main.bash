@@ -45,20 +45,22 @@ usage() {
   <preset> 选择实验配置块。
 
 可用 preset:
-  A1  batch Oracle eval, streaming_refill + cache + batch_query
+  A1  batch Oracle eval, streaming_refill + cache + batch_query, full val_unseen
   A2  serial Oracle eval, streaming_refill + cache
   A3  batch Oracle eval, streaming_refill + cache + batch_query, full val_unseen
   T1  Oracle train, streaming_refill + cache + batch_query + Oracle-FT
-  collect  Ghost-WM 数据采集模式
 
 默认对齐口径:
-  - A1/A2:
-    ckpt.iter18600
+  - A1:
+    预填 top-15 full-val ckpt shortlist
     Oracle 打开
     soft 注入 alpha=0.25
     cache 打开
     streaming_refill 打开
     NUM_ENVIRONMENTS=4
+    full val_unseen
+  - A2:
+    与 A1 相同
     fixed500 val_unseen
   - A3:
     与 A1 相同
@@ -71,7 +73,6 @@ usage() {
     TRAIN_ENV_REFILL_POLICY=streaming_refill
     NUM_ENVIRONMENTS=6
     IL.log_every=100（每 100 iter 保存一次 ckpt）
-
 命令行覆盖:
   直接在 preset 后面追加 run.py 支持的 KEY VALUE 覆盖，例如:
     bash habitat-lab/DGNav/run_r2r/main.bash A1 \
@@ -114,6 +115,21 @@ ensure_trailing_slash() {
       fi
 }
 
+to_python_list_literal() {
+      local out="["
+      local first=1
+      local item=""
+      for item in "$@"; do
+            if (( first == 0 )); then
+                  out+=", "
+            fi
+            out+="'${item}'"
+            first=0
+      done
+      out+="]"
+      printf "%s" "${out}"
+}
+
 results_dir="$(ensure_trailing_slash "${results_dir}")"
 tensorboard_dir="$(ensure_trailing_slash "${tensorboard_dir}")"
 checkpoint_folder="$(ensure_trailing_slash "${checkpoint_folder}")"
@@ -126,24 +142,37 @@ oracle_train_resume_ckpt="${dgnav_dir}/data/logs/checkpoints/oracle_train_stream
 fixed500_file="run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt"
 fixed500_file_path="${dgnav_dir}/${fixed500_file}"
 oracle_stack="run_r2r/r2r_oracle.yaml"
-collect_stack="run_r2r/collect.yaml"
 
 run_type="eval"
 exp_name=""
 exp_config="${oracle_stack}"
 preset_master_port=""
-preset_num_environments="4"
+preset_num_environments="8"
 preset_opts=()
 required_paths=()
 
 case "${preset}" in
       A1)
-            exp_name="oracle_train_stream_batch_cache_ft"
+            a1_ckpt_dir="/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_all_pool2"
+            a1_ckpt_list=(
+                  "ckpt.iter15400.pth"
+                  "ckpt.iter15500.pth"
+                  "ckpt.iter16100.pth"
+                  "ckpt.iter16200.pth"
+                  "ckpt.iter16300.pth"
+                  "ckpt.iter18100.pth"
+                  "ckpt.iter18200.pth"
+                  "ckpt.iter18300.pth"
+                  "ckpt.iter18900.pth"
+                  "ckpt.iter19000.pth"
+                  "ckpt.iter19100.pth"
+            )
+            a1_ckpt_list_literal="$(to_python_list_literal "${a1_ckpt_list[@]}")"
+            exp_name="oracle_all_pool2_full_selected"
             preset_master_port="4851"
             preset_opts=(
-                  "EVAL.CKPT_PATH_DIR" "/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_train_stream_batch_cache_ft"
-                  # "EVAL.CKPT_PATH_DIR" "${release_ckpt_iter18600}"
-                  "EVAL.EPISODE_ID_FILE" "${fixed500_file}"
+                  "EVAL.CKPT_PATH_DIR" "${a1_ckpt_dir}"
+                  "EVAL.CKPT_PATH_LIST" "${a1_ckpt_list_literal}"
                   "EVAL.ENV_REFILL_POLICY" "streaming_refill"
                   "IL.back_algo" "control"
                   "ORACLE.enable" "True"
@@ -154,7 +183,9 @@ case "${preset}" in
                   "ORACLE.batch_query_enable" "True"
                   "MODEL.ORACLE_FT.enable" "False"
             )
-            required_paths+=("${release_ckpt_iter18600}" "${fixed500_file_path}")
+            for a1_ckpt_name in "${a1_ckpt_list[@]}"; do
+                  required_paths+=("${a1_ckpt_dir}/${a1_ckpt_name}")
+            done
             ;;
       A3)
             exp_name="oracle_train_stream_batch_cache_ft_full_unseen"
@@ -229,22 +260,6 @@ case "${preset}" in
                   "MODEL.ORACLE_FT.train_scope" "baseline_plus_oracle_adapter"
             )
             required_paths+=("${best_nav_pretrain_base}" "${oracle_train_resume_ckpt}")
-            ;;
-      collect)
-            run_type="collect"
-            exp_name="ghost_wm_collect"
-            exp_config="${collect_stack}"
-            preset_master_port="4871"
-            preset_num_environments="4"
-            preset_opts=(
-                  "COLLECT.enable" "True"
-                  "COLLECT.output_dir" "data/logs/ghost_wm_collect/"
-                  "COLLECT.flush_every_n_samples" "50"
-                  "COLLECT.collect_visual_debug" "False"
-                  "COLLECT.save_debug_meta" "True"
-                  "COLLECT.collect_target_supervision" "True"
-                  "COLLECT.feature_dtype" "float16"
-            )
             ;;
       *)
             echo "[main.bash] Unknown preset: ${preset}" >&2

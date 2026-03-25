@@ -1,0 +1,201 @@
+{
+  "collect_dir": "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect",
+  "debug_collect_dir": "/tmp/ghost_collect_debug_smoke2/collect/ghost_wm_collect",
+  "checks": {
+    "structure": {
+      "shards": 2,
+      "episode_records": 100,
+      "node_records": 565,
+      "curr_pano_ok": 565,
+      "trace_steps": 5196,
+      "ghost_records": 2138,
+      "ghost_count_mismatch_nodes": 516,
+      "target_conf_ok": 2138,
+      "trace_steps_with_patch": 5196,
+      "hard_issue_count": 0,
+      "hard_issue_types": {},
+      "hard_issue_examples": [],
+      "ghost_count_semantics": {
+        "meaning": "pre-step gmap ghost snapshot size captured in collect_ghost_snapshots, not len(node_record.ghost_records)",
+        "mismatch_nodes": 516,
+        "total_nodes": 565,
+        "examples": [
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "4716",
+            0,
+            4,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "4716",
+            1,
+            8,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "4716",
+            2,
+            10,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "4716",
+            3,
+            10,
+            4
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "4716",
+            4,
+            10,
+            4
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "2914",
+            0,
+            3,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "2914",
+            1,
+            4,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "2914",
+            2,
+            4,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "2914",
+            3,
+            5,
+            2
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "2914",
+            4,
+            6,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "2914",
+            5,
+            5,
+            0
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "570",
+            0,
+            3,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "570",
+            2,
+            5,
+            4
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "570",
+            3,
+            6,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "570",
+            4,
+            8,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "570",
+            5,
+            11,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "3480",
+            0,
+            4,
+            5
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "3480",
+            1,
+            5,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "3480",
+            2,
+            6,
+            3
+          ],
+          [
+            "/home/gwl/project/DGNav_new/habitat-lab/DGNav/data/logs/ghost_wm_collect/shard_000000.pt",
+            "3480",
+            3,
+            7,
+            3
+          ]
+        ]
+      }
+    },
+    "geometry": {
+      "ghost_query_max_abs": 1.0728836059570312e-06,
+      "ghost_query_mean_abs": 8.124641133520205e-08,
+      "ghost_prior_max_abs": 2.8840957067011175e-08,
+      "ghost_prior_mean_abs": 1.1228314262984634e-08,
+      "waypoint_max_abs": 0.0,
+      "waypoint_mean_abs": 0.0,
+      "target_heading_max_abs": 0.0,
+      "target_heading_mean_abs": 0.0,
+      "target_heading_coverage": 2138,
+      "target_query_pos_strategy": {
+        "ghost_real_pos_mean": 2120,
+        "nearest_real_pos": 18
+      },
+      "target_peek_reason": {},
+      "target_resolve_reason": {}
+    },
+    "feature_image": {
+      "status": "ok",
+      "debug_bundles": 6,
+      "curr_views": 72,
+      "trace_views": 48,
+      "target_views": 228,
+      "curr_mean_patch_cos": 1.0,
+      "trace_mean_patch_cos": 0.999999518195788,
+      "target_mean_patch_cos": 1.0,
+      "curr_min_patch_cos": 1.0,
+      "trace_min_patch_cos": 0.9999987483024597,
+      "target_min_patch_cos": 1.0,
+      "curr_max_abs": 0.0077724456787109375,
+      "trace_max_abs": 0.04588127136230469,
+      "target_max_abs": 0.0078105926513671875,
+      "missing_bundle_refs": []
+    }
+  }
+}

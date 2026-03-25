@@ -41,12 +41,27 @@ from vlnce_baselines.common.env_utils import (
     split_static_scene_pools,
 )
 from vlnce_baselines.common.logging_utils import emit_file_only
+from vlnce_baselines.common.collect_debug_sidecar import CollectDebugSidecarWriter
+from vlnce_baselines.common.dino_patch_encoder import CollectDinoPatchEncoder
+from vlnce_baselines.common.rae_traj_collect import (
+    RaeTrajectoryWriter,
+    evaluate_diag_orders,
+)
 from vlnce_baselines.common.utils import extract_instruction_tokens
-from vlnce_baselines.models.graph_utils import GraphMap, MAX_DIST
+from vlnce_baselines.models.graph_utils import (
+    GraphMap,
+    MAX_DIST,
+    calculate_vp_rel_pos_fts,
+    heading_from_quaternion,
+)
 from vlnce_baselines.utils import reduce_loss
 from vlnce_baselines.oracle.buffered_writer import BufferedLineWriter
 from vlnce_baselines.oracle.types import OracleFeatureResult,OracleQuerySpec
-from vlnce_baselines.oracle.oracle_manager import OracleExperimentManager
+from vlnce_baselines.oracle.oracle_manager import (
+    OracleExperimentManager,
+    resolve_oracle_query_heading,
+    resolve_oracle_query_target,
+)
 from .utils import get_camera_orientations12
 from .utils import (
     length2mask, dir_angle_feature_with_ele,
@@ -152,6 +167,7 @@ class RLTrainer(BaseVLNCETrainer):
         self._oracle_log_buffer_metrics = {}
         self._eval_runtime_stats = None
         self._active_oracle_manager = None
+        self._train_oracle_managers = {}
         self.fast_envs = None
         self.slow_envs = None
         self._train_static_scene_pool_active = False
@@ -1046,7 +1062,11 @@ class RLTrainer(BaseVLNCETrainer):
         return oracle_manager
 
     def _build_initial_stream_slot_state(
-        self, observations: List[Dict], mode: str, envs=None
+        self,
+        observations: List[Dict],
+        mode: str,
+        envs=None,
+        existing_manager: Optional[OracleExperimentManager] = None,
     ):
         envs = self.envs if envs is None else envs
         observations = self._tokenize_observations(observations)
@@ -1065,7 +1085,12 @@ class RLTrainer(BaseVLNCETrainer):
                 ep_id = str(ep.episode_id)
                 if ep_id not in self.episode_start_times:
                     self.episode_start_times[ep_id] = time.time()
-        oracle_manager = self._build_oracle_manager(mode=mode, slot_ids=slot_ids, envs=envs)
+        oracle_manager = self._build_oracle_manager(
+            mode=mode,
+            slot_ids=slot_ids,
+            existing_manager=existing_manager,
+            envs=envs,
+        )
         return (
             observations,
             gmaps,
@@ -1548,6 +1573,325 @@ class RLTrainer(BaseVLNCETrainer):
             if self.config.EVAL.SAVE_RESULTS:
                 os.makedirs(self.config.RESULTS_DIR, exist_ok=True)
 
+    def _collect_samples_from_step(
+        self,
+        *,
+        observations: List[Dict],
+        infos: List[Dict],
+        dones: List[bool],
+        gmaps: List[GraphMap],
+        slot_ids: List[int],
+        slot_episode_steps: List[int],
+        episode_buffers: Dict[str, Dict[str, Any]],
+        arrival_traces: List[List[Dict[str, Any]]],
+        step_context: Dict[str, Any],
+        current_infos: Optional[List[Dict[str, Any]]] = None,
+        debug_writer: Optional[CollectDebugSidecarWriter] = None,
+        envs=None,
+    ) -> Dict[str, int]:
+        del infos
+        envs = self.envs if envs is None else envs
+        current_eps = envs.current_episodes()
+        patch_encoder = self._get_collect_patch_encoder()
+        node_records = 0
+        trace_steps = 0
+        debug_bundles = 0
+
+        for i, ep in enumerate(current_eps):
+            episode_id = str(ep.episode_id)
+            if episode_id not in episode_buffers:
+                episode_buffers[episode_id] = self._make_collect_episode_record(
+                    episode_id,
+                    str(ep.scene_id),
+                )
+
+            trace = arrival_traces[i]
+            pano_views = self._extract_collect_pano_rgb_views(observations[i])
+            front_images = [
+                step["rgb"] for step in trace if step.get("rgb", None) is not None
+            ]
+            image_batch = front_images + pano_views
+            encoded = (
+                patch_encoder.encode_rgb_images(image_batch)
+                if image_batch
+                else torch.empty(0, 196, 384)
+            )
+
+            front_count = len(front_images)
+            trace_feats = encoded[:front_count]
+            pano_feats = encoded[front_count : front_count + 12]
+
+            encoded_trace = []
+            feat_cursor = 0
+            for step in trace:
+                trace_record = {
+                    "step_id": int(step["step_id"]),
+                    "action": step["action"],
+                    "position": np.asarray(step["position"]).tolist(),
+                    "heading": float(step["heading"]),
+                    "collided": bool(step["collided"]),
+                }
+                if step.get("rgb", None) is not None:
+                    trace_record["dino_patch"] = trace_feats[feat_cursor]
+                    feat_cursor += 1
+                encoded_trace.append(trace_record)
+
+            cur_pos = np.asarray(step_context["cur_pos"][i])
+            cur_ori = np.asarray(step_context["cur_ori"][i])
+            heading_cur = float(heading_from_quaternion(cur_ori))
+
+            ghost_records: List[Dict[str, Any]] = []
+            cand_match_records = step_context["cand_match_records"][i]
+            cand_scores = step_context["cand_scores"][i]
+            collect_ghost_snapshot = step_context["collect_ghost_snapshots"][i]
+            collect_target_resolutions = step_context["collect_target_resolutions"][i]
+            for match_record in cand_match_records:
+                if match_record["target_kind"] != "ghost":
+                    continue
+
+                ghost_vp_id = str(match_record["target_id"])
+                cand_index = int(match_record["cand_index"])
+                ghost_snapshot = collect_ghost_snapshot.get(ghost_vp_id, None)
+                if ghost_snapshot is None:
+                    continue
+
+                ghost_mean_pos = np.asarray(ghost_snapshot["ghost_mean_pos"])
+                obs_count = int(ghost_snapshot["obs_count"])
+                unique_front_count = int(len(set(ghost_snapshot["ghost_fronts"])))
+                ghost_query, bearing, target_heading_front = self._build_collect_ghost_query(
+                    cur_pos,
+                    cur_ori,
+                    ghost_mean_pos,
+                )
+                waypoint_score_raw = float(cand_scores[cand_index]) if cand_index < len(cand_scores) else 0.0
+                ghost_prior = self._compute_collect_ghost_prior(
+                    obs_count,
+                    unique_front_count,
+                )
+                ghost_meta = torch.tensor(
+                    [ghost_prior, waypoint_score_raw],
+                    dtype=torch.float32,
+                )
+                target_resolution = collect_target_resolutions.get(
+                    ghost_vp_id,
+                    {
+                        "resolve_ok": False,
+                        "resolve_reason": "resolve_missing",
+                    },
+                )
+                ghost_records.append(
+                    {
+                        "ghost_vp_id": ghost_vp_id,
+                        "cand_index": cand_index,
+                        "is_new_ghost": bool(match_record["is_new_ghost"]),
+                        "ghost_query": ghost_query,
+                        "ghost_meta": ghost_meta,
+                        "ghost_mean_pos": ghost_mean_pos.tolist(),
+                        "waypoint_score_raw": waypoint_score_raw,
+                        "obs_count": obs_count,
+                        "unique_front_count": unique_front_count,
+                        "target_query_pos": target_resolution.get("query_pos"),
+                        "target_query_pos_strategy": target_resolution.get(
+                            "query_pos_strategy"
+                        ),
+                        "target_source_member_index": target_resolution.get(
+                            "source_member_index"
+                        ),
+                        "target_source_front_vp_id": target_resolution.get(
+                            "source_front_vp_id"
+                        ),
+                        "target_heading_front": target_resolution.get(
+                            "query_heading_rad",
+                            target_heading_front,
+                        ),
+                        "target_resolve_reason": target_resolution.get(
+                            "resolve_reason"
+                        ),
+                        "target_resolve_ok": bool(
+                            target_resolution.get("resolve_ok", False)
+                        ),
+                        "bearing": bearing,
+                        "target_conf_mask": 0,
+                    }
+                )
+
+            target_raw_images: Dict[str, List[np.ndarray]] = {}
+            if bool(getattr(self.config.COLLECT, "collect_target_supervision", True)):
+                target_raw_images = self._collect_target_panos_for_slot(
+                    env_index=i,
+                    ghost_records=ghost_records,
+                    envs=envs,
+                )
+
+            for ghost_record in ghost_records:
+                ghost_record.pop("target_resolve_ok", None)
+
+            node_record = {
+                "slot_id": int(slot_ids[i]),
+                "node_index": len(episode_buffers[episode_id]["node_records"]),
+                "step_index": int(slot_episode_steps[i]),
+                "done": bool(dones[i]),
+                "position": cur_pos.tolist(),
+                "heading": heading_cur,
+                "curr_pano": pano_feats,
+                "trace": encoded_trace,
+                "trace_len": int(len(encoded_trace)),
+                # This is the full pre-step ghost snapshot size from gmap, not the
+                # number of collectable ghost_records written for this node.
+                "ghost_count": int(len(collect_ghost_snapshot)),
+                "node_count": int(len(gmaps[i].node_pos)),
+                "ghost_records": ghost_records,
+            }
+            episode_buffers[episode_id]["node_records"].append(node_record)
+            node_records += 1
+            trace_steps += len(encoded_trace)
+
+            if debug_writer is not None:
+                trace_meta = []
+                trace_rgb = []
+                front_image_cursor = 0
+                for step in trace:
+                    trace_meta.append(
+                        {
+                            "step_id": int(step["step_id"]),
+                            "action": step["action"],
+                            "position": np.asarray(step["position"]).tolist(),
+                            "heading": float(step["heading"]),
+                            "collided": bool(step["collided"]),
+                        }
+                    )
+                    if step.get("rgb", None) is not None:
+                        trace_rgb.append(np.asarray(step["rgb"]).copy())
+                        front_image_cursor += 1
+
+                current_info = (
+                    None if current_infos is None else current_infos[i]
+                )
+                topdown_info = None
+                if isinstance(current_info, dict):
+                    topdown_info = current_info.get("top_down_map_vlnce")
+                    if topdown_info is None:
+                        topdown_info = current_info.get("top_down_map")
+
+                target_positions = [
+                    np.asarray(g["target_query_pos"])
+                    for g in ghost_records
+                    if g.get("target_query_pos") is not None
+                ]
+                vis_info = self._build_collect_debug_vis_info(
+                    node_positions=[
+                        np.asarray(pos)
+                        for pos in gmaps[i].node_pos.values()
+                    ],
+                    ghost_positions=[
+                        np.asarray(snapshot["ghost_mean_pos"])
+                        for snapshot in collect_ghost_snapshot.values()
+                    ],
+                    target_positions=target_positions,
+                )
+                node_meta = {
+                    "episode_id": episode_id,
+                    "scene_id": str(ep.scene_id),
+                    "slot_id": int(slot_ids[i]),
+                    "node_index": int(node_record["node_index"]),
+                    "step_index": int(node_record["step_index"]),
+                    "position": cur_pos.tolist(),
+                    "heading": heading_cur,
+                    "trace_steps": trace_meta,
+                    "ghost_records": [
+                        {
+                            "ghost_vp_id": g["ghost_vp_id"],
+                            "ghost_mean_pos": g["ghost_mean_pos"],
+                            "ghost_query": g["ghost_query"],
+                            "ghost_meta": g["ghost_meta"],
+                            "target_query_pos": g.get("target_query_pos"),
+                            "target_source_front_vp_id": g.get(
+                                "target_source_front_vp_id"
+                            ),
+                            "target_heading_front": g.get(
+                                "target_heading_front"
+                            ),
+                            "target_conf_mask": g.get("target_conf_mask"),
+                            "target_resolve_reason": g.get(
+                                "target_resolve_reason"
+                            ),
+                            "target_peek_reason": g.get("target_peek_reason"),
+                        }
+                        for g in ghost_records
+                    ],
+                    "graph_node_positions": [
+                        np.asarray(pos).tolist()
+                        for pos in gmaps[i].node_pos.values()
+                    ],
+                    "graph_ghost_positions": [
+                        np.asarray(snapshot["ghost_mean_pos"]).tolist()
+                        for snapshot in collect_ghost_snapshot.values()
+                    ],
+                }
+                debug_writer.append_node_bundle(
+                    episode_id=episode_id,
+                    scene_id=str(ep.scene_id),
+                    node_index=int(node_record["node_index"]),
+                    step_index=int(node_record["step_index"]),
+                    slot_id=int(slot_ids[i]),
+                    trace_images=trace_rgb,
+                    curr_pano_images=[np.asarray(x).copy() for x in pano_views],
+                    ghost_target_images=target_raw_images,
+                    node_meta=node_meta,
+                    topdown_info=topdown_info,
+                    topdown_vis_info=vis_info,
+                )
+                debug_bundles += 1
+
+        return {
+            "node_records": int(node_records),
+            "trace_steps": int(trace_steps),
+            "debug_bundles": int(debug_bundles),
+        }
+
+    def _reset_collect_stream_slot(
+        self,
+        env_index: int,
+        observations: List[Dict],
+        gmaps: List[GraphMap],
+        prev_vp: List[Optional[str]],
+        slot_ids: List[int],
+        slot_txt_masks: List[torch.Tensor],
+        slot_txt_embeds: List[torch.Tensor],
+        slot_episode_steps: List[int],
+        active_episode_ids: Set[str],
+        completed_episode_ids: Set[str],
+        oracle_manager=None,
+        envs=None,
+    ) -> Optional[str]:
+        envs = self.envs if envs is None else envs
+        #先 reset 某个环境拿到新观测，再把这个观测从“环境原始输出”转换成“模型可直接使用的编码后观测”
+        obs_i = self._normalize_reset_at_output(envs.reset_at(env_index))
+        obs_i = self._tokenize_observations([obs_i])[0]
+
+        observations[env_index] = obs_i
+        gmaps[env_index] = self._make_stream_graph_map("eval")
+        prev_vp[env_index] = None
+        slot_episode_steps[env_index] = 0
+        txt_mask, txt_embed = self._encode_text_from_observation(obs_i)
+        slot_txt_masks[env_index] = txt_mask
+        slot_txt_embeds[env_index] = txt_embed
+
+        slot_id = int(slot_ids[env_index])
+        current_ep = envs.current_episodes()[env_index]
+        new_ep_id = str(current_ep.episode_id)
+        if new_ep_id in completed_episode_ids or new_ep_id in active_episode_ids:
+            return None
+
+        if oracle_manager is not None:
+            oracle_manager.one_episode_reset(
+                slot_id=slot_id,
+                scene_id=current_ep.scene_id,
+                episode_id=current_ep.episode_id,
+                active_env_index=env_index,
+            )
+        return new_ep_id
+
     def save_checkpoint(self, iteration: int):
         if getattr(self.config.ORACLE.trace, "flush_on_checkpoint", True):
             self._flush_oracle_log_buffers()
@@ -1796,7 +2140,27 @@ class RLTrainer(BaseVLNCETrainer):
         pool_config.freeze()
         return pool_config
 
+    def _clear_train_oracle_managers(self, flush: bool = True) -> None:
+        seen = set()
+        for manager in self._train_oracle_managers.values():
+            if manager is None:
+                continue
+            manager_id = id(manager)
+            if manager_id in seen:
+                continue
+            seen.add(manager_id)
+            if flush:
+                try:
+                    self._flush_oracle_log_buffers(manager)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to flush train oracle manager buffers: {e}"
+                    )
+        self._train_oracle_managers = {}
+        self._active_oracle_manager = None
+
     def _close_train_env_pools(self) -> None:
+        self._clear_train_oracle_managers(flush=True)
         seen = set()
         for env in (self.slow_envs, self.fast_envs, self.envs):
             if env is None:
@@ -1813,6 +2177,355 @@ class RLTrainer(BaseVLNCETrainer):
         self.fast_envs = None
         self.slow_envs = None
         self._train_static_scene_pool_active = False
+
+    @staticmethod
+    def _collect_env_call_info(call_result) -> Optional[Dict[str, Any]]:
+        if isinstance(call_result, (list, tuple)) and len(call_result) >= 4:
+            info = call_result[3]
+            return info if isinstance(info, dict) else None
+        if isinstance(call_result, dict):
+            return call_result
+        return None
+
+    def _collect_diag_report_ok(self, report: Dict[str, Any]) -> bool:
+        chosen = report.get("reports", {}).get(report.get("chosen_order"), {})
+        return (
+            float(chosen.get("straight_major_motion", 0.0)) > 0.10
+            and float(chosen.get("straight_minor_motion", 1e9))
+            < float(chosen.get("straight_major_motion", 0.0))
+            and float(chosen.get("spin_yaw_motion", 0.0)) > 0.20
+        )
+
+    def _run_collect_diagnostics(
+        self,
+        writer: RaeTrajectoryWriter,
+        diag_candidates,
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self.config.COLLECT.diagnostic, "enable", True)):
+            return {"chosen_order": "xz", "reports": {}}
+
+        diag_candidates = list(diag_candidates)
+        if len(diag_candidates) == 0:
+            raise RuntimeError("No diagnostic episodes available for collect")
+
+        last_report = None
+        for meta in diag_candidates[:5]:
+            group_config = self._build_collect_group_config(
+                source_split=meta.source_split,
+                episode_ids=[int(meta.episode_id)],
+                num_envs=1,
+                enable_oracle=False,
+            )
+            self._prepare_collect_envs(group_config, need_policy=False)
+            self.envs.reset()
+            self.envs.call_at(
+                0,
+                "collect_run_diagnostic",
+                {
+                    "kind": "straight_diag",
+                    "forward_steps": int(
+                        self.config.COLLECT.diagnostic.straight_forward_steps
+                    ),
+                    "turn_steps": int(self.config.COLLECT.diagnostic.spin_turn_steps),
+                },
+            )
+            straight_trace = self.envs.call_at(0, "consume_collect_episode_trace")
+            self._normalize_reset_at_output(self.envs.reset_at(0))
+            self.envs.call_at(
+                0,
+                "collect_run_diagnostic",
+                {
+                    "kind": "spin_diag",
+                    "forward_steps": int(
+                        self.config.COLLECT.diagnostic.straight_forward_steps
+                    ),
+                    "turn_steps": int(self.config.COLLECT.diagnostic.spin_turn_steps),
+                },
+            )
+            spin_trace = self.envs.call_at(0, "consume_collect_episode_trace")
+            report = evaluate_diag_orders(straight_trace, spin_trace)
+            report["source_key"] = meta.source_key
+            last_report = report
+            if self._collect_diag_report_ok(report):
+                chosen_order = report["chosen_order"]
+                writer.write_diagnostic(
+                    "straight_diag",
+                    straight_trace,
+                    chosen_order,
+                    extra={"source_key": meta.source_key},
+                )
+                writer.write_diagnostic(
+                    "spin_diag",
+                    spin_trace,
+                    chosen_order,
+                    extra={"source_key": meta.source_key},
+                )
+                self._close_collect_envs()
+                return report
+            self._close_collect_envs()
+
+        raise RuntimeError(
+            f"Collect diagnostics failed to find a valid planar order. Last report={last_report}"
+        )
+
+    def _collect_teacher_group(
+        self,
+        *,
+        partition: str,
+        mode: str,
+        source_split: str,
+        metas,
+        planar_order: str,
+        remaining_target: int,
+        writer: RaeTrajectoryWriter,
+    ) -> int:
+        metas = list(metas)
+        if remaining_target <= 0 or len(metas) == 0:
+            return 0
+        meta_by_id = {str(meta.episode_id): meta for meta in metas}
+        group_config = self._build_collect_group_config(
+            source_split=source_split,
+            episode_ids=[int(meta.episode_id) for meta in metas],
+            num_envs=min(int(self._collect_base_config.NUM_ENVIRONMENTS), len(metas)),
+            enable_oracle=False,
+        )
+        self._prepare_collect_envs(group_config, need_policy=False)
+        self.envs.reset()
+
+        written = 0
+        completed_ids: Set[str] = set()
+
+        while self.envs.num_envs > 0 and written < remaining_target:
+            current_eps = list(self.envs.current_episodes())
+            pause_indices: List[int] = []
+            next_active_ids: Set[str] = set()
+
+            for env_index, ep in enumerate(current_eps):
+                meta = meta_by_id[str(ep.episode_id)]
+                call_result = self.envs.call_at(
+                    env_index,
+                    "collect_run_reference_path",
+                    {
+                        "reference_path": [list(x) for x in meta.reference_path],
+                        "tryout": bool(self.config.IL.tryout),
+                        "max_primitive_steps": int(
+                            self.config.COLLECT.trace.max_primitive_steps
+                        ),
+                    },
+                )
+                raw_trace = self.envs.call_at(
+                    env_index, "consume_collect_episode_trace"
+                )
+                result = writer.write_episode(
+                    partition=partition,
+                    mode=mode,
+                    meta=meta,
+                    raw_trace=raw_trace,
+                    planar_order=planar_order,
+                    success=self._collect_success_from_info(
+                        self._collect_env_call_info(call_result)
+                    ),
+                )
+                completed_ids.add(str(ep.episode_id))
+                if result.written:
+                    written += 1
+                    if self.pbar is not None:
+                        self.pbar.update(1)
+
+            for env_index in range(len(current_eps) - 1, -1, -1):
+                if written >= remaining_target:
+                    pause_indices.append(env_index)
+                    continue
+                self._normalize_reset_at_output(self.envs.reset_at(env_index))
+                new_ep_id = str(self.envs.current_episodes()[env_index].episode_id)
+                if new_ep_id in completed_ids or new_ep_id in next_active_ids:
+                    pause_indices.append(env_index)
+                else:
+                    next_active_ids.add(new_ep_id)
+
+            for env_index in sorted(set(pause_indices), reverse=True):
+                self.envs.pause_at(env_index)
+
+        self._close_collect_envs()
+        return written
+
+    def _collect_policy_group(
+        self,
+        *,
+        partition: str,
+        mode: str,
+        source_split: str,
+        metas,
+        planar_order: str,
+        remaining_target: int,
+        writer: RaeTrajectoryWriter,
+    ) -> int:
+        metas = list(metas)
+        if remaining_target <= 0 or len(metas) == 0:
+            return 0
+        meta_by_id = {str(meta.episode_id): meta for meta in metas}
+        group_config = self._build_collect_group_config(
+            source_split=source_split,
+            episode_ids=[int(meta.episode_id) for meta in metas],
+            num_envs=min(int(self._collect_base_config.NUM_ENVIRONMENTS), len(metas)),
+            enable_oracle=False,
+        )
+        self._prepare_collect_envs(group_config, need_policy=True)
+        self._oracle_log_buffer_metrics = {}
+        if hasattr(self.envs, "resume_all"):
+            self.envs.resume_all()
+
+        observations = list(self.envs.reset())
+        (
+            observations,
+            gmaps,
+            prev_vp,
+            slot_ids,
+            slot_txt_masks,
+            slot_txt_embeds,
+            slot_episode_steps,
+            oracle_manager,
+        ) = self._build_initial_stream_slot_state(observations, mode="eval")
+        self.gmaps = gmaps
+
+        written = 0
+        completed_ids: Set[str] = set()
+        active_ids = self._get_active_episode_ids()
+
+        while len(observations) > 0 and written < remaining_target:
+            step_out = self._rollout_step_core(
+                mode="eval",
+                observations=observations,
+                gmaps=gmaps,
+                prev_vp=prev_vp,
+                slot_ids=slot_ids,
+                slot_txt_masks=slot_txt_masks,
+                slot_txt_embeds=slot_txt_embeds,
+                slot_episode_steps=slot_episode_steps,
+                oracle_manager=oracle_manager,
+                envs=self.envs,
+                eval_action_selector=(
+                    "random_nav" if mode == "random_nav" else "argmax"
+                ),
+            )
+
+            observations = step_out["observations"]
+            infos = step_out["infos"]
+            dones = step_out["dones"]
+            gmaps = step_out["gmaps"]
+            prev_vp = step_out["prev_vp"]
+            for idx in range(len(observations)):
+                slot_episode_steps[idx] += 1
+            self.gmaps = gmaps
+
+            trace_lengths = [
+                int(self.envs.call_at(idx, "collect_trace_length"))
+                for idx in range(self.envs.num_envs)
+            ]
+            decision_done_envs = [
+                idx
+                for idx, step_count in enumerate(slot_episode_steps)
+                if step_count >= int(self.config.COLLECT.trace.max_decision_steps)
+            ]
+            budget_done_envs = [
+                idx
+                for idx, trace_len in enumerate(trace_lengths)
+                if trace_len >= int(self.config.COLLECT.trace.max_primitive_steps)
+            ]
+            done_envs = sorted(
+                set(
+                    [idx for idx, done in enumerate(dones) if done]
+                    + decision_done_envs
+                    + budget_done_envs
+                )
+            )
+            envs_to_pause: List[int] = []
+
+            for env_index in done_envs:
+                current_ep = self.envs.current_episodes()[env_index]
+                meta = meta_by_id[str(current_ep.episode_id)]
+                raw_trace = self.envs.call_at(
+                    env_index, "consume_collect_episode_trace"
+                )
+                result = writer.write_episode(
+                    partition=partition,
+                    mode=mode,
+                    meta=meta,
+                    raw_trace=raw_trace,
+                    planar_order=planar_order,
+                    success=(
+                        self._collect_success_from_info(infos[env_index])
+                        if dones[env_index]
+                        else None
+                    ),
+                )
+                completed_ids.add(str(current_ep.episode_id))
+                active_ids.discard(str(current_ep.episode_id))
+                if result.written:
+                    written += 1
+                    if self.pbar is not None:
+                        self.pbar.update(1)
+
+            for env_index in done_envs:
+                if written >= remaining_target:
+                    envs_to_pause.append(env_index)
+                    continue
+                new_ep_id = self._reset_collect_stream_slot(
+                    env_index,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    slot_ids,
+                    slot_txt_masks,
+                    slot_txt_embeds,
+                    slot_episode_steps,
+                    active_episode_ids=active_ids,
+                    completed_episode_ids=completed_ids,
+                    oracle_manager=oracle_manager,
+                )
+                if new_ep_id is None:
+                    envs_to_pause.append(env_index)
+                else:
+                    active_ids.add(new_ep_id)
+
+            if written >= remaining_target:
+                envs_to_pause.extend(
+                    [idx for idx in range(len(observations)) if idx not in envs_to_pause]
+                )
+
+            if len(envs_to_pause) > 0:
+                (
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state,
+                ) = self._pause_stream_slots(
+                    envs_to_pause,
+                    self.envs,
+                    observations,
+                    gmaps,
+                    prev_vp,
+                    extra_state={
+                        "slot_ids": slot_ids,
+                        "slot_txt_masks": slot_txt_masks,
+                        "slot_txt_embeds": slot_txt_embeds,
+                        "slot_episode_steps": slot_episode_steps,
+                    },
+                    oracle_manager=oracle_manager,
+                )
+                slot_ids = extra_state["slot_ids"]
+                slot_txt_masks = extra_state["slot_txt_masks"]
+                slot_txt_embeds = extra_state["slot_txt_embeds"]
+                slot_episode_steps = extra_state["slot_episode_steps"]
+                self.gmaps = gmaps
+                if oracle_manager is not None:
+                    oracle_manager.rebind_after_pause(slot_ids)
+                active_ids = self._get_active_episode_ids()
+
+        if getattr(self.config.ORACLE.trace, "flush_on_run_end", True):
+            self._flush_oracle_log_buffers(oracle_manager)
+        self._close_collect_envs()
+        return written
 
     @staticmethod
     def _get_train_pool_num_envs(env: Any) -> Optional[int]:
@@ -2787,6 +3500,11 @@ class RLTrainer(BaseVLNCETrainer):
             self._active_oracle_manager = None
             self._close_perf_timing_log()
             self._close_train_env_pools()
+
+    def collect(self):
+        raise NotImplementedError(
+            "Standalone teacher collection moved to collect_teacher.py."
+        )
         
     def _train_interval(self, interval, ml_weight, sample_ratio):
         #切换到训练模式
@@ -3053,7 +3771,7 @@ class RLTrainer(BaseVLNCETrainer):
 
             # loc_noise_history has been merged into stat_eps, no need to save separately
             logger.info(f"Episodes evaluated: {total}")
-            checkpoint_num = checkpoint_index + 1
+            checkpoint_num = max(int(checkpoint_index), 0)
             for k, v in aggregated_states.items():
                 logger.info(f"Average episode {k}: {v:.6f}")
                 writer.add_scalar(f"eval_{k}/{split}", v, checkpoint_num)
@@ -3212,13 +3930,14 @@ class RLTrainer(BaseVLNCETrainer):
         oracle_manager=None,
         sample_ratio: Optional[float] = None,
         envs=None,
+        eval_action_selector: str = "argmax",
     ) -> Dict[str, Any]:
         envs = self.envs if envs is None else envs
 
         if mode == "train":
             feedback = "sample"
         elif mode == "eval":
-            feedback = "argmax"
+            feedback = str(eval_action_selector)
         else:
             raise NotImplementedError(f"Unsupported stream mode: {mode}")
 
@@ -3290,6 +4009,9 @@ class RLTrainer(BaseVLNCETrainer):
             timing["env_call_at"] += time.perf_counter() - t_call_at
         else:
             cand_real_pos = [None] * envs.num_envs
+
+        cand_match_records = [[] for _ in range(envs.num_envs)]
+        arrival_traces = [[] for _ in range(envs.num_envs)]
 
         use_dynamic_loc_noise = getattr(
             self.config.IL, "use_dynamic_loc_noise", False
@@ -3430,7 +4152,7 @@ class RLTrainer(BaseVLNCETrainer):
                 if (use_dynamic_loc_noise or use_random_loc_noise)
                 else None
             )
-            gmaps[i].update_graph(
+            cand_match_records[i] = gmaps[i].update_graph(
                 prev_vp[i],
                 slot_episode_steps[i] + 1,
                 cur_vp[i],
@@ -3577,8 +4299,33 @@ class RLTrainer(BaseVLNCETrainer):
                 teacher_actions,
                 a_t,
             )
-        else:
+        elif feedback == "argmax":
             a_t = nav_logits.argmax(dim=-1)
+        elif feedback == "random_nav":
+            random_actions = []
+            gmap_masks = nav_inputs["gmap_masks"]
+            gmap_visited_masks = nav_inputs["gmap_visited_masks"]
+            for i in range(envs.num_envs):
+                valid_mask = gmap_masks[i] & (~gmap_visited_masks[i])
+                valid_indices = [
+                    int(idx)
+                    for idx in torch.nonzero(valid_mask, as_tuple=False).view(-1).tolist()
+                    if int(idx) > 0
+                    and int(idx) < len(nav_inputs["gmap_vp_ids"][i])
+                ]
+                if len(valid_indices) == 0:
+                    random_actions.append(0)
+                else:
+                    random_actions.append(random.choice(valid_indices))
+            a_t = torch.as_tensor(
+                random_actions,
+                dtype=torch.long,
+                device=nav_logits.device,
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported feedback policy={feedback!r}"
+            )
         cpu_a_t = a_t.cpu().numpy()
 
         env_actions = []
@@ -3700,6 +4447,20 @@ class RLTrainer(BaseVLNCETrainer):
             "loss_contribution": loss_contribution,
             "actions_issued": actions_issued,
             "timing": timing,
+            "arrival_traces": arrival_traces,
+            "cur_vp": cur_vp,
+            "cur_pos": cur_pos,
+            "cur_ori": cur_ori,
+            "cand_vp": cand_vp,
+            "cand_pos": cand_pos,
+            "cand_real_pos": cand_real_pos,
+            "cand_angles": wp_outputs["cand_angles"],
+            "cand_distances": wp_outputs["cand_distances"],
+            "cand_scores": wp_outputs.get(
+                "cand_scores",
+                [[] for _ in range(envs.num_envs)],
+            ),
+            "cand_match_records": cand_match_records,
         }
 
     def _rollout_eval_streaming(self, eps_to_eval: int) -> None:
@@ -3904,7 +4665,7 @@ class RLTrainer(BaseVLNCETrainer):
     ) -> torch.Tensor:
         envs = self.envs if envs is None else envs
         pool_name = "default" if pool_name is None else str(pool_name)
-        oracle_manager = None
+        oracle_manager = self._train_oracle_managers.get(pool_name)
         observations = list(envs.reset())
         previous_envs = self.envs
         self.envs = envs
@@ -3923,7 +4684,9 @@ class RLTrainer(BaseVLNCETrainer):
                 observations,
                 mode="train",
                 envs=envs,
+                existing_manager=oracle_manager,
             )
+            self._train_oracle_managers[pool_name] = oracle_manager
             self.gmaps = gmaps
 
             initial_active_envs = len(observations)
