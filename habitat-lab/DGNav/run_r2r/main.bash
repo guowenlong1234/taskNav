@@ -138,7 +138,6 @@ log_dir="$(ensure_trailing_slash "${log_dir}")"
 
 release_ckpt_iter18600="${dgnav_dir}/data/logs/checkpoints/release_r2r_dino_best_nav/ckpt.iter18600.pth"
 best_nav_pretrain_base="/home/gwl/project/DGNav_new/habitat-lab/DGNav/pretrained/r2r_ce/mlm.sap_habitat_depth_dinov2s/ckpts/model_step_97500.pt"
-oracle_train_resume_ckpt="${dgnav_dir}/data/logs/checkpoints/oracle_train_stream_batch_cache_ft/ckpt.iter4900.pth"
 fixed500_file="run_r2r/episode_subsets/r2r_val_unseen_fixed500.txt"
 fixed500_file_path="${dgnav_dir}/${fixed500_file}"
 oracle_stack="run_r2r/r2r_oracle.yaml"
@@ -225,11 +224,11 @@ case "${preset}" in
             ;;
       T1)
             run_type="train"
-            exp_name="oracle_all_pool2"
+            exp_name="oracle_all_learn"
             preset_master_port="4861"
-            preset_num_environments="6"
+            preset_num_environments="4"
             preset_opts=(
-                  "IL.iters" "20000"
+                  "IL.iters" "30000"
                   "IL.log_every" "100"
                   "IL.lr" "1e-5"
                   "IL.sample_ratio" "0.75"
@@ -237,29 +236,27 @@ case "${preset}" in
                   "IL.waypoint_aug" "True"
                   "IL.load_from_ckpt" "False"
                   "IL.is_requeue" "False"
-                  "IL.ckpt_to_load" "/home/gwl/project/DGNav_new_clean33_train_main/habitat-lab/DGNav/data/logs/checkpoints/oracle_all_pool"
+                  "IL.ckpt_to_load" ""
                   "IL.TRAIN_ENV_REFILL_POLICY" "streaming_refill"
-                  "IL.TRAIN_STATIC_SCENE_POOLS_ENABLE" "True"
-                  "IL.TRAIN_SLOW_SCENES" "['gTV8FGcVJC9','VzqfbhrpDEA']"
-                  "IL.TRAIN_FAST_POOL_NUM_ENVS" "4"
-                  "IL.TRAIN_SLOW_POOL_NUM_ENVS" "2"
-                  "IL.TRAIN_POOL_FAST_ITERS" "24"
-                  "IL.TRAIN_POOL_SLOW_ITERS" "2"
+                  "IL.TRAIN_STATIC_SCENE_POOLS_ENABLE" "False"
                   "MODEL.pretrained_path" "${best_nav_pretrain_base}"
                   "ORACLE.enable" "True"
                   "ORACLE.enable_in_train" "True"
                   "ORACLE.enable_in_eval" "True"
+                  "ORACLE.target_ghost_scope" "local_frontier"
                   "ORACLE.apply_mode" "soft"
-                  "ORACLE.soft_alpha" "0.25"
+                  "ORACLE.soft_alpha" "0.2"
                   "ORACLE.cache_enable" "True"
                   "ORACLE.batch_query_enable" "True"
                   "ORACLE.trace.enable" "False"
                   "ORACLE.scope_trace_enable" "False"
                   "ORACLE.scope_summary_enable" "False"
                   "MODEL.ORACLE_FT.enable" "True"
+                  "MODEL.ORACLE_FT.learnable_fusion_alpha" "True"
+                  "MODEL.ORACLE_FT.fusion_alpha_init" "0.2"
                   "MODEL.ORACLE_FT.train_scope" "baseline_plus_oracle_adapter"
             )
-            required_paths+=("${best_nav_pretrain_base}" "${oracle_train_resume_ckpt}")
+            required_paths+=("${best_nav_pretrain_base}")
             ;;
       *)
             echo "[main.bash] Unknown preset: ${preset}" >&2

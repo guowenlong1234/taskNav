@@ -70,6 +70,7 @@ def _safe_config_dump(config: Config) -> str:
 
 
 def _sort_candidates(candidates: Iterable[CollectionEpisode]) -> List[CollectionEpisode]:
+    #把候选采集轨迹 candidates 排序，得到一个固定、可复现的处理顺序。
     return sorted(
         list(candidates),
         key=lambda item: (
@@ -109,6 +110,11 @@ class DatasetAdapter(ABC):
         raise NotImplementedError
 
 
+#DatasetAdapter 这个抽象基类要求子类实现这些方法：
+# load_candidates()
+# dedup_key()
+# output_partition()
+# is_collectable()
 class RxRGuideDatasetAdapter(DatasetAdapter):
     def __init__(
         self,
@@ -121,34 +127,34 @@ class RxRGuideDatasetAdapter(DatasetAdapter):
         step_size: float,
         min_estimated_steps: int,
     ) -> None:
-        self.data_path_template = str(data_path_template)
-        self.source_splits = [str(split) for split in source_splits]
-        self.roles = [str(role) for role in roles]
-        self.languages = [str(language) for language in languages]
-        self.turn_angle_deg = float(turn_angle_deg)
-        self.step_size = float(step_size)
-        self.min_estimated_steps = int(min_estimated_steps)
-        self.stats = {
-            "loaded": 0,
-            "deduped": 0,
-            "missing_gt": 0,
-            "filtered_short": 0,
+        self.data_path_template = str(data_path_template)               #数据集文件路径模板
+        self.source_splits = [str(split) for split in source_splits]    #要读取哪些数据划分
+        self.roles = [str(role) for role in roles]                      #要读取哪些角色的数据
+        self.languages = [str(language) for language in languages]      #要保留哪些语言
+        self.turn_angle_deg = float(turn_angle_deg)                     #估算轨迹步数时使用的转向步长
+        self.step_size = float(step_size)                               #估算轨迹步数时使用的前进一步长度
+        self.min_estimated_steps = int(min_estimated_steps)             #最小估计步数阈值
+        self.stats = {          #采样预处理阶段的计数器
+            "loaded": 0,        #loaded: 读进来的原始 episode 数
+            "deduped": 0,       #deduped: 因为重复轨迹被去掉的数量
+            "missing_gt": 0,    #缺少 goals 或 reference_path 这类 GT 信息的数量
+            "filtered_short": 0,#因为估计步数太短被过滤掉的数量
         }
 
     def dedup_key(self, episode: Dict[str, Any], *, split: str, role: str) -> str:
         trajectory_id = episode.get("trajectory_id")
-        scene_id = str(episode.get("scene_id", ""))
+        scene_id = str(episode.get("scene_id", "")) #获取场景id和轨迹id
         if trajectory_id not in (None, ""):
-            return f"{scene_id}::{trajectory_id}"
-        reference_path = episode.get("reference_path", [])
+            return f"{scene_id}::{trajectory_id}"   #用trajectory_id来去重
+        reference_path = episode.get("reference_path", [])  #如果没有trajectory_id，就获取参考路径和轨迹点。
         normalized = []
         for point in reference_path:
             if len(point) < 3:
-                continue
+                continue    #立刻结束这一次循环，进入下一个循环
             normalized.append(
                 f"{float(point[0]):.3f},{float(point[1]):.3f},{float(point[2]):.3f}"
-            )
-        return f"{split}::{role}::{scene_id}::{'|'.join(normalized)}"
+            )   #保留三位小数，添加到normalized
+        return f"{split}::{role}::{scene_id}::{'|'.join(normalized)}"#'|'.join(normalized)把这个字符串列表，用 | 连接成一个大字符串。用字符串进行去重
 
     def output_partition(self, source_split: str) -> str:
         split = str(source_split)
@@ -159,134 +165,150 @@ class RxRGuideDatasetAdapter(DatasetAdapter):
         raise ValueError(f"Unsupported RxR source split={split!r}")
 
     def is_collectable(self, episode: Dict[str, Any]) -> bool:
-        goals = episode.get("goals")
-        reference_path = episode.get("reference_path")
+        goals = episode.get("goals")    #获取GT
+        reference_path = episode.get("reference_path")  #获取路径
+        #goals 必须是个 list且不能为空，reference_path 也必须是个 list而且不能为空
         return bool(isinstance(goals, list) and len(goals) > 0) and bool(
             isinstance(reference_path, list) and len(reference_path) > 0
         )
 
     def _language_allowed(self, language: Optional[str]) -> bool:
-        if "*" in self.languages:
+        if "*" in self.languages:   #如果配置文件允许所有语言，直接返回true
             return True
-        return language in set(self.languages)
+        return language in set(self.languages)  #如果配置文件有要求，在里面就返回true
 
-    def load_candidates(self) -> List[CollectionEpisode]:
-        seen_dedup_keys: Set[str] = set()
-        candidates: List[CollectionEpisode] = []
-        for split in self.source_splits:
-            for role in self.roles:
-                path = self.data_path_template.format(split=split, role=role)
+    def load_candidates(self) -> List[CollectionEpisode]:   #返回一个列表、要收集的episode
+        seen_dedup_keys: Set[str] = set()                   #变量名，表示“已经见过的去重 key”: Set[str]类型标注，说明它是一个字符串集合。= set()实际初始化成一个空集合
+        candidates: List[CollectionEpisode] = []            #一个episode类的数组
+        for split in self.source_splits:        #对于每一个数据集划分
+            for role in self.roles:             #对每一个角色遍历
+
+                path = self.data_path_template.format(split=split, role=role)   #对路径.format(split=split, role=role)就是把字符串里的 {split}、{role} 替换成实际值
                 if not os.path.exists(path):
-                    raise FileNotFoundError(f"Missing RxR dataset file: {path}")
-                with gzip.open(path, "rt", encoding="utf-8") as file_obj:
-                    payload = json.load(file_obj)
-                for episode in payload["episodes"]:
-                    self.stats["loaded"] += 1
-                    if not self.is_collectable(episode):
-                        self.stats["missing_gt"] += 1
-                        continue
+                    raise FileNotFoundError(f"Missing RxR dataset file: {path}")    #没找到RxR数据路径
+                with gzip.open(path, "rt", encoding="utf-8") as file_obj:   #打开rt文件
+                    payload = json.load(file_obj)   #取出文件内容，解析成字典、列表
 
+                for episode in payload["episodes"]: #对每个episode字段
+                    self.stats["loaded"] += 1       #加载数量加一
+                    if not self.is_collectable(episode):    #判断是否可以收集，可以收集的标准是有GT，并且有参考路径
+                        self.stats["missing_gt"] += 1   #不符合就失败次数加一
+                        continue
+                        
+                    #获取指令和语言
                     instruction = episode.get("instruction", {})
                     language = instruction.get("language")
+
                     if not self._language_allowed(language):
                         continue
-
+                    
+                    #返回一个为一去重标志
                     dedup_key = self.dedup_key(episode, split=split, role=role)
-                    if dedup_key in seen_dedup_keys:
-                        self.stats["deduped"] += 1
+                    if dedup_key in seen_dedup_keys:    #如果已经采集过了
+                        self.stats["deduped"] += 1      #重复数量加一
                         continue
                     seen_dedup_keys.add(dedup_key)
 
+                    #获取参考路径
                     reference_path = tuple(
                         tuple(float(value) for value in point[:3])
                         for point in episode.get("reference_path", [])
                         if len(point) >= 3
                     )
+                    #返回预估需要多少步
                     estimated_steps = estimate_reference_path_steps(
-                        reference_path,
+                        reference_path, 
                         step_size=self.step_size,
                         turn_angle_deg=self.turn_angle_deg,
                     )
-                    if estimated_steps < self.min_estimated_steps:
+                    if estimated_steps < self.min_estimated_steps:  #预估步小于最小步长，直接舍弃
                         self.stats["filtered_short"] += 1
                         continue
 
-                    episode_id = episode.get("episode_id")
+                    episode_id = episode.get("episode_id")  #获取id
                     scene_id = str(episode["scene_id"])
+
+                    #讲episode添加到数列中
                     candidates.append(
                         CollectionEpisode(
                             dataset_name="rxr",
-                            source_split=split,
-                            output_partition=self.output_partition(split),
-                            episode_id=episode_id,
+                            source_split=split,     #来自那个切分
+                            output_partition=self.output_partition(split),  #输出到那个切分
+                            episode_id=episode_id,  
                             source_key=f"{split}:{episode_id}",
                             scene_id=scene_id,
-                            scene_name=scene_name_from_scene_id(scene_id),
-                            reference_path=reference_path,
+                            scene_name=scene_name_from_scene_id(scene_id),  #从 scene_id 这个路径字符串里，提取出“场景名
+                            reference_path=reference_path,  #推荐路径
                             trajectory_id=episode.get("trajectory_id"),
                             instruction_id=instruction.get("instruction_id"),
                             language=language,
                             role=role,
-                            dedup_key=dedup_key,
+                            dedup_key=dedup_key,    #唯一身份识别码
                             estimated_steps=estimated_steps,
                         )
                     )
-        return candidates
+        return candidates   #返回所有可以采集的episode
 
 
 class TeacherRolloutRunner:
+    #采集核心类
     def __init__(
         self,
         *,
-        base_config: Config,
-        adapter: DatasetAdapter,
-        output_root: str,
+        base_config: Config,    #配置文件
+        adapter: DatasetAdapter,    #数据处理类
+        output_root: str,       #输出路径
     ) -> None:
+        
         self.base_config = base_config.clone()
         self.adapter = adapter
         self.output_root = os.path.abspath(output_root)
-        self.collector_cfg = self.base_config.COLLECTOR
-        self.mode = "teacher_refpath"
-        self.planar_order = "xz"
+        self.collector_cfg = self.base_config.COLLECTOR     #collector配置字段
+        self.mode = "teacher_refpath"   #教师路径
+        self.planar_order = "xz"        #3D 位置投影到哪个平面上做轨迹处理
         self.geometry = {
-            "hfov": int(self.collector_cfg.image.hfov),
-            "turn_angle": int(self.collector_cfg.geometry.turn_angle),
-            "forward_step_size": float(self.collector_cfg.geometry.forward_step_size),
+            "hfov": int(self.collector_cfg.image.hfov),     #相机水平视场角，单位度
+            "turn_angle": int(self.collector_cfg.geometry.turn_angle),  #每次离散转向动作的角度
+            "forward_step_size": float(self.collector_cfg.geometry.forward_step_size),  #每次 MOVE_FORWARD 前进的距离，单位米
         }
+
+        #轨迹过滤配置filter_cfg
         self.filter_cfg = TraceFilterConfig(
-            pos_eps=float(self.collector_cfg.filter_static.pos_eps),
-            yaw_eps=float(self.collector_cfg.filter_static.yaw_eps),
-            static_run_k=int(self.collector_cfg.filter_static.run_k),
-            min_frames_after_filter=int(
+            pos_eps=float(self.collector_cfg.filter_static.pos_eps),    #位置
+            yaw_eps=float(self.collector_cfg.filter_static.yaw_eps),    #角度
+            static_run_k=int(self.collector_cfg.filter_static.run_k),   #静止连续段长度阈值
+            min_frames_after_filter=int(    #允许保留的最小帧数
                 self.collector_cfg.trace.min_frames_after_filter
             ),
         )
-        self.runtime_stats = defaultdict(int)
+
+        self.runtime_stats = defaultdict(int)   #初始化一个计时器
+        #defaultdict(int) 和普通 dict 不同当你访问一个还不存在的 key 时，它会自动给你一个默认值 0
 
     def _write_config_snapshot(self) -> str:
-        os.makedirs(self.output_root, exist_ok=True)
-        path = os.path.join(self.output_root, "config_snapshot.yaml")
+        os.makedirs(self.output_root, exist_ok=True)    #创建文件夹
+        path = os.path.join(self.output_root, "config_snapshot.yaml")   #拼接路径
         with open(path, "w", encoding="utf-8") as file_obj:
-            file_obj.write(_safe_config_dump(self.base_config))
+            file_obj.write(_safe_config_dump(self.base_config)) #先保存一下这轮采集的配置，保存到config_snapshot.yaml
         return path
 
     def _resolve_targets(
         self, candidates: Sequence[CollectionEpisode]
     ) -> tuple[Dict[str, Dict[str, int]], Dict[str, bool], Dict[str, int]]:
         available = {"train": 0, "test": 0}
-        for candidate in candidates:
-            available[candidate.output_partition] += 1
+        for candidate in candidates:    #取出每一个路径
+            available[candidate.output_partition] += 1  #对应的切片计数加一
 
-        requested_targets = {
+        requested_targets = {   #存储要求的各个分桶数量
             "train": int(self.collector_cfg.target_counts.train),
             "test": int(self.collector_cfg.target_counts.test),
         }
-        targets = {
-            "train": {self.mode: requested_targets["train"]},
-            "test": {self.mode: requested_targets["test"]},
+        targets = {     #
+            "train": {self.mode: requested_targets["train"]},   #对train 目标是采多少条 teacher_refpath
+            "test": {self.mode: requested_targets["test"]},     #对test 目标是采多少条 teacher_refpath
         }
-        strict_targets = {"train": True, "test": True}
-        for partition in ("train", "test"):
+        strict_targets = {"train": True, "test": True}  #硬目标，必须精确满足
+        for partition in ("train", "test"): #对两个分区分别遍历
             requested = targets[partition][self.mode]
             if requested < 0:
                 targets[partition][self.mode] = int(available[partition])
@@ -296,6 +318,7 @@ class TeacherRolloutRunner:
                     f"Requested {requested} {partition} trajectories but only "
                     f"{available[partition]} candidates are available after filtering."
                 )
+            #targets 最终实际要执行的目标数量,strict_targets是不是硬性要求，requested_targets原始文件要求多少
         return targets, strict_targets, requested_targets
 
     def _build_env_config(
@@ -391,21 +414,21 @@ class TeacherRolloutRunner:
     def _collect_split(
         self,
         *,
-        partition: str,
-        source_split: str,
-        candidates: Sequence[CollectionEpisode],
-        remaining_target: int,
-        writer: CollectionWriter,
+        partition: str,     #分区名称
+        source_split: str,  #划分数据集
+        candidates: Sequence[CollectionEpisode],    #对应的episode数组
+        remaining_target: int,  #剩余数量
+        writer: CollectionWriter,   #写入类
     ) -> int:
-        if remaining_target <= 0 or len(candidates) == 0:
+        if remaining_target <= 0 or len(candidates) == 0:   #剩余为0或者达到目标
             return 0
 
-        candidates = _sort_candidates(candidates)
-        meta_by_id = {candidate.episode_key: candidate for candidate in candidates}
-        episode_ids = [candidate.episode_id for candidate in candidates]
-        scene_names = sorted({candidate.scene_name for candidate in candidates})
-        requested_envs = min(int(self.base_config.NUM_ENVIRONMENTS), len(candidates))
-        if len(scene_names) > 1:
+        candidates = _sort_candidates(candidates)   #重新排序，排成一个重复可复现的
+        meta_by_id = {candidate.episode_key: candidate for candidate in candidates} #一个字典{episode_key:candidate}
+        episode_ids = [candidate.episode_id for candidate in candidates]    #一个数组candidate
+        scene_names = sorted({candidate.scene_name for candidate in candidates})    #一个不重复的 scene 名字列表
+        requested_envs = min(int(self.base_config.NUM_ENVIRONMENTS), len(candidates))   #计算应该开多少环境
+        if len(scene_names) > 1:    #多与一个场景
             requested_envs = min(requested_envs, len(scene_names))
         requested_envs = min(requested_envs, remaining_target)
         num_envs = max(1, requested_envs)
@@ -579,38 +602,40 @@ class TeacherRolloutRunner:
             ]
 
     def run(self) -> Dict[str, Any]:
-        t0 = time.perf_counter()
-        config_snapshot_path = self._write_config_snapshot()
-        candidates = self.adapter.load_candidates()
-        targets, strict_targets, requested_targets = self._resolve_targets(candidates)
+        t0 = time.perf_counter()    #准备计时器
+        config_snapshot_path = self._write_config_snapshot()    #保存一份配置文件，并且返回输出路径
+        candidates = self.adapter.load_candidates()             #返回所有初步符合条件可以采集的episode
+        #targets 最终实际要执行的目标数量,strict_targets是不是硬性要求，requested_targets原始文件要求多少
+        targets, strict_targets, requested_targets = self._resolve_targets(candidates)  #            
         writer = CollectionWriter(
-            output_root=self.output_root,
-            filter_cfg=self.filter_cfg,
-            target_counts=targets,
-            profile_name="teacher_only",
-            planar_order=self.planar_order,
-            geometry=self.geometry,
+            output_root=self.output_root,   #输出路径
+            filter_cfg=self.filter_cfg,     #轨迹过滤配置filter_cfg
+            target_counts=targets,          #要采集的数量
+            profile_name="teacher_only",    #
+            planar_order=self.planar_order, #投影面
+            geometry=self.geometry,         #一些几何信息，相机视角宽度、单步骤距离和角度等
         )
 
         candidates_by_partition: Dict[str, Dict[str, List[CollectionEpisode]]] = {
             "train": defaultdict(list),
             "test": defaultdict(list),
         }
+        #对于每个待采集的轨迹
         for candidate in candidates:
             candidates_by_partition[candidate.output_partition][candidate.source_split].append(
                 candidate
-            )
+            )#把他放到各自的分区中
 
-        for partition in ("train", "test"):
-            remaining = int(targets[partition][self.mode])
+        for partition in ("train", "test"):#针对不同的分区
+            remaining = int(targets[partition][self.mode])  #获取这种类应该采集的数量
             for source_split in sorted(candidates_by_partition[partition].keys()):
-                if remaining <= 0:
+                if remaining <= 0:  #持续循环，直到剩余数量小于0
                     break
                 written = self._collect_split(
-                    partition=partition,
-                    source_split=source_split,
-                    candidates=candidates_by_partition[partition][source_split],
-                    remaining_target=remaining,
+                    partition=partition,    #分区名称
+                    source_split=source_split,  
+                    candidates=candidates_by_partition[partition][source_split],    #对应分区的episode
+                    remaining_target=remaining, #剩余数量
                     writer=writer,
                 )
                 remaining -= written

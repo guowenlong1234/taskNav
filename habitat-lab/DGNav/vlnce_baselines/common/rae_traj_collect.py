@@ -73,38 +73,40 @@ class PendingEpisodeWrite:
 
 
 def estimate_reference_path_steps(
-    reference_path: Sequence[Sequence[float]],
+    reference_path: Sequence[Sequence[float]],  #参考路径
     *,
-    step_size: float,
-    turn_angle_deg: float,
+    step_size: float,   #步长
+    turn_angle_deg: float,  #角度
 ) -> int:
+    #采集前做一个长度预估。但是只旋转不位移是不纳入统计的
     path = [
-        np.asarray(point, dtype=np.float32)
+        np.asarray(point, dtype=np.float32) #输入数据转成 NumPy 数组，不复制，array新建，会复制一个对象
         for point in reference_path
         if len(point) >= 3
     ]
+    # 点数不足3,直接返回2
     if len(path) < 2:
         return 2
 
     heading = 0.0
     primitive_steps = 1
-    turn_angle_deg = max(float(turn_angle_deg), 1.0)
-    step_size = max(float(step_size), 1e-6)
+    turn_angle_deg = max(float(turn_angle_deg), 1.0)    #角度最小为1度
+    step_size = max(float(step_size), 1e-6) #步长最小为1e-6
 
     for idx in range(1, len(path)):
-        delta = path[idx] - path[idx - 1]
-        planar = np.asarray([float(delta[0]), float(delta[2])], dtype=np.float32)
-        distance = float(np.linalg.norm(planar))
-        if distance < 1e-6:
+        delta = path[idx] - path[idx - 1]   #计算跟上一点之间的差距
+        planar = np.asarray([float(delta[0]), float(delta[2])], dtype=np.float32)   #把两个差值拼成一个数组
+        distance = float(np.linalg.norm(planar))    #计算距离
+        if distance < 1e-6: #差值太小，直接跳过，过滤
             continue
 
-        target_heading = math.atan2(-float(planar[0]), float(planar[1]))
-        turn_delta = abs(math.degrees(wrap_angle(target_heading - heading)))
-        primitive_steps += int(round(turn_delta / turn_angle_deg))
-        primitive_steps += int(distance // step_size)
-        heading = target_heading
+        target_heading = math.atan2(-float(planar[0]), float(planar[1]))    #计算角度变化
+        turn_delta = abs(math.degrees(wrap_angle(target_heading - heading)))    #变成角度
+        primitive_steps += int(round(turn_delta / turn_angle_deg))  #四舍五入走了多少角度步
+        primitive_steps += int(distance // step_size)   #取整，走了多少位移步
+        heading = target_heading    #更新朝向
 
-    return primitive_steps + 1
+    return primitive_steps + 1  #返回以供走了多少步骤
 
 
 def _frame_planar_position(frame: Dict[str, Any], planar_order: str) -> np.ndarray:

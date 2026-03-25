@@ -2598,7 +2598,7 @@ class RLTrainer(BaseVLNCETrainer):
     def _select_train_pool(self) -> Tuple[str, Any]:
         if not self._train_static_scene_pool_active or self.slow_envs is None:
             self._train_iteration_counter += 1
-            return "fast", self.envs
+            return "default", self.envs
 
         fast_iters = max(int(getattr(self.config.IL, "TRAIN_POOL_FAST_ITERS", 10)), 1)
         slow_iters = max(int(getattr(self.config.IL, "TRAIN_POOL_SLOW_ITERS", 1)), 1)
@@ -2813,6 +2813,7 @@ class RLTrainer(BaseVLNCETrainer):
             "[OracleFT] trainable summary: "
             f"rgb_projector={sum(self._match_rgb_projector(n) for n in trainable_names)}, "
             f"oracle_adapter={sum(('oracle_adapter' in n) for n in trainable_names)}, "
+            f"oracle_fusion_alpha={sum(('oracle_adapter.fusion_alpha_logit' in n) for n in trainable_names)}, "
             f"downstream_sample={sum(self._match_downstream_sample(n) for n in trainable_names)}, "
             f"dino_backbone={sum(self._match_dino_backbone(n) for n in trainable_names)}"
         )
@@ -3487,6 +3488,8 @@ class RLTrainer(BaseVLNCETrainer):
                         logs[k] = np.mean(v)
                         loss_str += f'{k}: {logs[k]:.3f}, '
                         writer.add_scalar(f'loss/{k}', logs[k], cur_iter)
+                        if k.startswith('oracle_ft/') or k.startswith('grad/'):
+                            writer.add_scalar(k, logs[k], cur_iter)
                     logger.info(loss_str)
                     self.save_checkpoint(cur_iter)
                     
@@ -3539,7 +3542,7 @@ class RLTrainer(BaseVLNCETrainer):
         try:
             #对于每一个循环
             for idx in pbar:
-                selected_pool_name = "fast"
+                selected_pool_name = "default"
                 selected_envs = self.envs
                 policy = self._get_train_env_refill_policy()
                 if policy == "streaming_refill":
@@ -3576,6 +3579,11 @@ class RLTrainer(BaseVLNCETrainer):
                 if self._oracle_ft_enabled():
                     self.logs['grad/oracle_adapter'].append(
                         self._compute_grad_norm(lambda name: "oracle_adapter" in name)
+                    )
+                    self.logs['grad/oracle_fusion_alpha'].append(
+                        self._compute_grad_norm(
+                            lambda name: "oracle_adapter.fusion_alpha_logit" in name
+                        )
                     )
                     self.logs['grad/rgb_projector'].append(
                         self._compute_grad_norm(self._match_rgb_projector)

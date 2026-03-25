@@ -88,6 +88,8 @@ class OracleResidualAdapter(nn.Module):
         use_ln: bool = True,
         identity_init: bool = True,
         gain_init: float = 1.0,
+        learnable_fusion_alpha: bool = False,
+        fusion_alpha_init: float = 0.25,
     ):
         super().__init__()
         if int(num_layers) < 1:
@@ -98,6 +100,7 @@ class OracleResidualAdapter(nn.Module):
         self.ln = nn.LayerNorm(dim) if use_ln else nn.Identity()
         self.identity_init = bool(identity_init)
         self.drop = nn.Dropout(dropout)
+        self.learnable_fusion_alpha = bool(learnable_fusion_alpha)
         activation = str(activation).lower()        #传进来的激活函数变成小写
         if activation == "gelu":
             self.act = nn.GELU()
@@ -115,6 +118,23 @@ class OracleResidualAdapter(nn.Module):
             layers.append(nn.Linear(hidden_dim, dim))
         self.layers = nn.ModuleList(layers)
         self.gain = nn.Parameter(torch.tensor(float(gain_init)))
+        if not 0.0 <= float(fusion_alpha_init) <= 1.0:
+            raise ValueError(
+                "OracleResidualAdapter fusion_alpha_init must be in [0, 1], "
+                f"got {fusion_alpha_init}"
+            )
+        if self.learnable_fusion_alpha:
+            alpha = min(max(float(fusion_alpha_init), 1e-4), 1.0 - 1e-4)
+            self.fusion_alpha_logit = nn.Parameter(
+                torch.tensor(math.log(alpha / (1.0 - alpha)), dtype=torch.float32)
+            )
+            self.register_buffer("fixed_fusion_alpha", None)
+        else:
+            self.fusion_alpha_logit = None
+            self.register_buffer(
+                "fixed_fusion_alpha",
+                torch.tensor(float(fusion_alpha_init), dtype=torch.float32),
+            )
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -135,6 +155,11 @@ class OracleResidualAdapter(nn.Module):
             if idx < len(self.layers) - 1:
                 x = self.drop(self.act(x))
         return oracle_raw + self.gain * x
+
+    def get_fusion_alpha(self):
+        if self.fusion_alpha_logit is not None:
+            return torch.sigmoid(self.fusion_alpha_logit)
+        return self.fixed_fusion_alpha
 
 
 class EffoNavDinoV2Encoder(nn.Module):
@@ -478,6 +503,10 @@ class ETP(Net):
                 use_ln=getattr(oracle_ft_cfg, "use_layer_norm", True),
                 identity_init=getattr(oracle_ft_cfg, "identity_init", True),
                 gain_init=getattr(oracle_ft_cfg, "gain_init", 1.0),
+                learnable_fusion_alpha=getattr(
+                    oracle_ft_cfg, "learnable_fusion_alpha", False
+                ),
+                fusion_alpha_init=getattr(oracle_ft_cfg, "fusion_alpha_init", 0.25),
             )
         else:
             self.oracle_adapter = None
@@ -809,18 +838,30 @@ class ETP(Net):
                 base = gmap_base_img_fts
                 if gmap_oracle_raw_fts is not None and gmap_oracle_masks is not None:
                     oracle_proj = self.oracle_adapter(gmap_oracle_raw_fts)
-                    fusion_alpha = getattr(
-                        self.model_config.ORACLE_FT, "fusion_alpha", 0.25
-                    )
                     if getattr(
                         self.model_config.ORACLE_FT,
-                        "use_config_soft_alpha",
-                        True,
+                        "learnable_fusion_alpha",
+                        False,
                     ):
-                        fusion_alpha = getattr(
-                            self.model_config, "ORACLE_SOFT_ALPHA", fusion_alpha
+                        fusion_alpha_tensor = self.oracle_adapter.get_fusion_alpha().to(
+                            device=base.device, dtype=base.dtype
                         )
-                    fused = base + fusion_alpha * (oracle_proj - base)
+                        fusion_alpha = float(fusion_alpha_tensor.detach().item())
+                        fused = base + fusion_alpha_tensor * (oracle_proj - base)
+                    else:
+                        fusion_alpha = getattr(
+                            self.model_config.ORACLE_FT, "fusion_alpha", 0.25
+                        )
+                        if getattr(
+                            self.model_config.ORACLE_FT,
+                            "use_config_soft_alpha",
+                            True,
+                        ):
+                            fusion_alpha = getattr(
+                                self.model_config, "ORACLE_SOFT_ALPHA", fusion_alpha
+                            )
+                        fusion_alpha = float(fusion_alpha)
+                        fused = base + fusion_alpha * (oracle_proj - base)
                     mask = gmap_oracle_masks.unsqueeze(-1).to(base.dtype)
                     gmap_img_fts = mask * fused + (1.0 - mask) * base
                     if getattr(
@@ -831,6 +872,7 @@ class ETP(Net):
                         )
                         oracle_ft_stats = {
                             "gain": float(self.oracle_adapter.gain.detach().item()),
+                            "fusion_alpha": fusion_alpha,
                             "base_norm": float(base.norm(dim=-1).mean().detach().item()),
                             "oracle_raw_norm": float(
                                 gmap_oracle_raw_fts.norm(dim=-1).mean().detach().item()
@@ -843,6 +885,10 @@ class ETP(Net):
                             ),
                             "oracle_mask_ratio": oracle_mask_ratio,
                         }
+                        if self.oracle_adapter.fusion_alpha_logit is not None:
+                            oracle_ft_stats["fusion_alpha_logit"] = float(
+                                self.oracle_adapter.fusion_alpha_logit.detach().item()
+                            )
                     else:
                         oracle_ft_stats = None
                 else:

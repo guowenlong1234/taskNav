@@ -51,6 +51,7 @@ def _resolve_languages(config) -> list:
 
 
 def main() -> None:
+    #获取参数列表
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--exp_name",
@@ -73,18 +74,23 @@ def main() -> None:
     args = parser.parse_args()
 
     config = _prepare_config(args.exp_name, args.exp_config, args.opts)
+
+    #检验配置开关，没开直接报错
     if not bool(getattr(config.COLLECTOR, "enable", False)):
         raise ValueError("COLLECTOR.enable must be True for teacher collection")
 
+    #设置随机数种子
     seed = int(getattr(config.COLLECTOR.runtime, "seed", 0))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    #68,轨迹最短帧数68帧
     min_estimated_steps = int(getattr(config.COLLECTOR.prefilter, "min_estimated_steps", -1))
     if min_estimated_steps < 0:
         min_estimated_steps = int(config.COLLECTOR.trace.min_frames_after_filter)
 
+    #的作用是把原始 RxR 数据集文件转换成“collector 能直接消费的候选 episode 列表
     adapter = RxRGuideDatasetAdapter(
         data_path_template=str(config.TASK_CONFIG.DATASET.DATA_PATH),
         source_splits=list(config.COLLECTOR.source_splits),
@@ -94,10 +100,12 @@ def main() -> None:
         step_size=float(config.COLLECTOR.geometry.forward_step_size),
         min_estimated_steps=min_estimated_steps,
     )
+
+    #怎么跑这些 episode 并写出数据
     runner = TeacherRolloutRunner(
-        base_config=config,
-        adapter=adapter,
-        output_root=str(config.COLLECTOR.output_dir),
+        base_config=config, #配置文件
+        adapter=adapter,    #格式调整器
+        output_root=str(config.COLLECTOR.output_dir),   #输出路径
     )
     runner.run()
 
